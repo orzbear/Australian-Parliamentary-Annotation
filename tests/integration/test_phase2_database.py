@@ -29,6 +29,11 @@ from hansard_annotator.db.queries import (
     inspect_turn,
     unlinked_interjections,
 )
+from hansard_annotator.db.review_export import (
+    EXPORT_COLUMNS,
+    ReviewExportOptions,
+    export_review_sample,
+)
 from hansard_annotator.product.cli import main as product_cli
 from hansard_annotator.product.loaders import (
     load_annotation_schema,
@@ -76,8 +81,12 @@ def database_url(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     command.downgrade(config, "base")
 
 
-def _fixture_run(tmp_path: Path, source_file: str = "2010/2010-02-02.xml") -> ValidatedRun:
-    run_dir = tmp_path / "phase2-fixture"
+def _fixture_run(
+    tmp_path: Path,
+    source_file: str = "2010/2010-02-02.xml",
+    run_id: str = "phase2-fixture",
+) -> ValidatedRun:
+    run_dir = tmp_path / run_id
     run_dir.mkdir()
     counts: dict[str, int] = {}
     for name, fields in EXPECTED_FIELDS.items():
@@ -130,7 +139,7 @@ def _fixture_run(tmp_path: Path, source_file: str = "2010/2010-02-02.xml") -> Va
     source_row = source_table.to_pylist()[0]
     counts["image_elements"] = 0
     manifest = {
-        "run_id": "phase2-fixture",
+        "run_id": run_id,
         "pipeline_version": "1.0.0",
         "git_commit": None,
         "input_inventory_sha256": "b" * 64,
@@ -218,6 +227,7 @@ def test_migration_schema_downgrade_and_upgrade(database_url: str) -> None:
     assert expected <= set(inspector.get_table_names())
     assert {
         "annotation_ready_turns",
+        "current_annotation_ready_turns",
         "turns_with_fragment_counts",
         "corpus_year_summary",
     } <= set(inspector.get_view_names())
@@ -694,3 +704,164 @@ def test_phase25_schema_unknown_taxonomy_and_cli(
     assert "postgresql://" not in output.out
     assert product_cli(["adapters", "show", "unsupported"]) == 1
     assert "unsupported adapter key" in capsys.readouterr().err
+
+
+def test_review_export_unicode_csv_and_database_read_only(
+    database_url: str, tmp_path: Path
+) -> None:
+    settings = DatabaseSettings(url=database_url, processed_data_root=Path("data/processed"))
+    import_validated_run(
+        settings,
+        _fixture_run(
+            tmp_path,
+            source_file="2016/2016-09-12.xml",
+            run_id="unicode-export-fixture",
+        ),
+    )
+    url = database_url.replace("postgresql+psycopg://", "postgresql://")
+    flynn_key = "9e975417ade94faa2770959f9e108b5ab7a4ba71b28674f4bdee183e545ac64a"
+    with psycopg.connect(url) as connection:
+        before = connection.execute(
+            """
+            SELECT (SELECT count(*) FROM preprocessing_runs),
+                   (SELECT count(*) FROM speaker_turns),
+                   (SELECT count(*) FROM speech_fragments)
+            """
+        ).fetchone()
+
+    target = tmp_path / "review" / "unicode.csv"
+    result = export_review_sample(
+        settings,
+        ReviewExportOptions(
+            output=target,
+            limit=100_000,
+            min_words=0,
+            seed=20260724,
+            excel_compatible=True,
+        ),
+    )
+    assert result["database_writes"] == 0
+    assert target.read_bytes().startswith(b"\xef\xbb\xbf")
+    with target.open(encoding="utf-8-sig", newline="") as source:
+        reader = csv.DictReader(source)
+        rows = list(reader)
+        assert tuple(reader.fieldnames or ()) == EXPORT_COLUMNS
+    assert rows
+    assert all(set(row) == set(EXPORT_COLUMNS) for row in rows)
+    assert all(len(row) == len(EXPORT_COLUMNS) for row in rows)
+    assert all(row["source_file"] != row["text_clean"] for row in rows)
+    assert all(row["is_orphan_continuation"] != "true" for row in rows)
+    assert all(
+        row["interrupted"] == ("true" if int(row["interruption_count"]) > 0 else "false")
+        for row in rows
+    )
+    flynn = next(row for row in rows if row["turn_key"] == flynn_key)
+    assert "CQ—projects" in flynn["text_clean"]
+    dash = flynn["text_clean"][flynn["text_clean"].index("CQ") + 2]
+    assert ord(dash) == 0x2014
+    assert any(row["procedural_hint"] == "unknown" for row in rows)
+    assert any(row["ceremonial_hint"] == "unknown" for row in rows)
+    decoded = target.read_text(encoding="utf-8-sig")
+    assert "Î“Ã‡" not in decoded
+    assert "ΓÇ" not in decoded
+    with psycopg.connect(url) as connection:
+        after = connection.execute(
+            """
+            SELECT (SELECT count(*) FROM preprocessing_runs),
+                   (SELECT count(*) FROM speaker_turns),
+                   (SELECT count(*) FROM speech_fragments)
+            """
+        ).fetchone()
+    assert after == before
+
+
+def test_review_export_sampling_orphans_and_path_safety(
+    database_url: str, tmp_path: Path
+) -> None:
+    settings = DatabaseSettings(url=database_url, processed_data_root=Path("data/processed"))
+    import_validated_run(settings, _fixture_run(tmp_path, run_id="sampling-fixture"))
+
+    first = tmp_path / "first.csv"
+    second = tmp_path / "second.csv"
+    different = tmp_path / "different.csv"
+    included = tmp_path / "included.csv"
+    export_review_sample(
+        settings,
+        ReviewExportOptions(output=first, limit=5, min_words=0, seed=100),
+    )
+    export_review_sample(
+        settings,
+        ReviewExportOptions(output=second, limit=5, min_words=0, seed=100),
+    )
+    export_review_sample(
+        settings,
+        ReviewExportOptions(output=different, limit=5, min_words=0, seed=101),
+    )
+    assert first.read_bytes() == second.read_bytes()
+    with first.open(encoding="utf-8", newline="") as source:
+        first_keys = [row["turn_key"] for row in csv.DictReader(source)]
+    with different.open(encoding="utf-8", newline="") as source:
+        different_keys = [row["turn_key"] for row in csv.DictReader(source)]
+    assert first_keys != different_keys
+
+    export_review_sample(
+        settings,
+        ReviewExportOptions(
+            output=included,
+            limit=100_000,
+            min_words=0,
+            seed=100,
+            include_orphans=True,
+        ),
+    )
+    with included.open(encoding="utf-8", newline="") as source:
+        included_rows = list(csv.DictReader(source))
+    assert any(row["is_orphan_continuation"] == "true" for row in included_rows)
+
+    repository_root = tmp_path / "repository"
+    for relative in (
+        Path("hansard_xml_files/review.csv"),
+        Path("data/processed/accepted/review.csv"),
+        Path("backups/review.csv"),
+    ):
+        with pytest.raises(ValueError, match="forbidden directory"):
+            export_review_sample(
+                settings,
+                ReviewExportOptions(output=repository_root / relative),
+                repository_root=repository_root,
+            )
+
+
+def test_annotation_ready_views_are_explicitly_current_run_aware(
+    database_url: str, tmp_path: Path
+) -> None:
+    settings = DatabaseSettings(url=database_url, processed_data_root=Path("data/processed"))
+    first = _fixture_run(tmp_path, run_id="historical-run")
+    second = _fixture_run(
+        tmp_path,
+        source_file="2016/2016-09-12.xml",
+        run_id="current-run",
+    )
+    import_validated_run(settings, first)
+    import_validated_run(settings, second)
+    url = database_url.replace("postgresql+psycopg://", "postgresql://")
+    with psycopg.connect(url, row_factory=dict_row) as connection:
+        historical = connection.execute(
+            """
+            SELECT run_name,preprocessing_run_id,pipeline_version,
+                   is_current_corpus_version,count(*) AS rows
+            FROM annotation_ready_turns
+            GROUP BY run_name,preprocessing_run_id,pipeline_version,
+                     is_current_corpus_version
+            ORDER BY run_name
+            """
+        ).fetchall()
+        current = connection.execute(
+            """
+            SELECT DISTINCT run_name,is_current_corpus_version
+            FROM current_annotation_ready_turns
+            """
+        ).fetchall()
+    assert {row["run_name"] for row in historical} == {"current-run", "historical-run"}
+    assert {row["is_current_corpus_version"] for row in historical} == {False, True}
+    assert current == [{"run_name": "current-run", "is_current_corpus_version": True}]

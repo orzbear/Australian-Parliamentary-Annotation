@@ -149,6 +149,23 @@ See [the Phase 2 schema mapping](docs/PHASE_2_SCHEMA_MAPPING.md) and
 [Phase 2 report](docs/PHASE_2_REPORT.md). PostgreSQL is the transactional source of
 truth for the processed corpus; immutable XML remains authoritative for original bytes.
 
+Export a deterministic, Unicode-safe review sample from the corpus's current
+preprocessing run:
+
+```powershell
+.\.venv\Scripts\python.exe -m hansard_annotator.db.cli export-review-sample `
+  --output data/review/turn_sample_utf8.csv `
+  --limit 30 --min-words 50 --max-words 1200 `
+  --seed 20260724 --excel-compatible
+```
+
+Exports exclude orphan continuations by default; `--include-orphans` opts in. Filters
+are available for year, date range, word count, interruption count, and the question
+time, procedural, and ceremonial preprocessing hints. Review exports are ignored by
+Git and cannot be written under raw XML, accepted processed-run, or backup directories.
+The hint fields are contextual preprocessing output, not gold or human labels; `NULL`
+is exported as `unknown`.
+
 ## Phase 2.5 product foundation
 
 After applying Alembic revision `20260724_02`, inspect and load product metadata:

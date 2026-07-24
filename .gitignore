@@ -25,10 +25,12 @@ postgres-data/
 # Generated research data, exports, reports, and temporary audit output.
 /data/generated/
 /data/processed/
+/data/review/
 /exports/
 /artifacts/
 /reports/generated/
 /tmp/
+/.tmp/
 *.parquet
 *.csv
 *.jsonl

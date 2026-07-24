@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -25,10 +26,18 @@ from hansard_annotator.db.queries import (
     sample_turns,
     unlinked_interjections,
 )
+from hansard_annotator.db.review_export import ReviewExportOptions, export_review_sample
 from hansard_annotator.db.validator import validate_run_directory
 from hansard_annotator.db.verification import database_sizes, verify_database
 
 DEFAULT_RUN = Path("data/processed/phase1-full-20260723-v4")
+
+
+def _date(value: str) -> date:
+    try:
+        return date.fromisoformat(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("expected an ISO date (YYYY-MM-DD)") from error
 
 
 def _json(value: Any) -> None:
@@ -63,6 +72,23 @@ def parser() -> argparse.ArgumentParser:
     sample = commands.add_parser("sample-turns")
     sample.add_argument("year", type=int)
     sample.add_argument("--limit", type=int, default=10)
+    export = commands.add_parser("export-review-sample")
+    export.add_argument("--output", type=Path, required=True)
+    export.add_argument("--limit", type=int, default=30)
+    export.add_argument("--min-words", type=int, default=50)
+    export.add_argument("--max-words", type=int)
+    export.add_argument("--seed", type=int)
+    export.add_argument("--excel-compatible", action="store_true")
+    export.add_argument("--include-orphans", action="store_true")
+    export.add_argument("--year", type=int)
+    export.add_argument("--date-from", type=_date)
+    export.add_argument("--date-to", type=_date)
+    export.add_argument(
+        "--question-time-hint", choices=("true", "false", "unknown")
+    )
+    export.add_argument("--procedural-hint", choices=("true", "false", "unknown"))
+    export.add_argument("--ceremonial-hint", choices=("true", "false", "unknown"))
+    export.add_argument("--min-interruptions", type=int, default=0)
     return result
 
 
@@ -129,6 +155,25 @@ def main(argv: list[str] | None = None) -> int:
                 settings.psycopg_url, row_factory=dict_row
             ) as connection:
                 _json(verify_database(connection, _accepted_run_id(connection), validated))
+            return 0
+        if arguments.command == "export-review-sample":
+            options = ReviewExportOptions(
+                output=arguments.output,
+                limit=arguments.limit,
+                min_words=arguments.min_words,
+                max_words=arguments.max_words,
+                seed=arguments.seed,
+                excel_compatible=arguments.excel_compatible,
+                include_orphans=arguments.include_orphans,
+                year=arguments.year,
+                date_from=arguments.date_from,
+                date_to=arguments.date_to,
+                question_time_hint=arguments.question_time_hint,
+                procedural_hint=arguments.procedural_hint,
+                ceremonial_hint=arguments.ceremonial_hint,
+                min_interruptions=arguments.min_interruptions,
+            )
+            _json(export_review_sample(settings, options))
             return 0
 
         engine = create_database_engine(settings)
