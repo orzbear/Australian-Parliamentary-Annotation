@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Synthetic malformed Phase 0 fixture. It is not copied from Hansard. -->
+<debates>
+  <major-heading>BROKEN SYNTHETIC DOCUMENT</major-heading>
+  <speech id="synthetic/malformed/1"
+          speakerid="synthetic/member/9"
+          speakername="Fault Example"
+          talktype="speech"
+          time="12:00"
+          approximate_wordcount="4"
+          approximate_duration="0"
+          url="https://example.invalid/synthetic/broken">
+    <p>This element is deliberately unclosed.
+</debates>
+

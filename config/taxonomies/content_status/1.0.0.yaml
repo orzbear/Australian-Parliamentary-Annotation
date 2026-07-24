@@ -1,0 +1,52 @@
+slug: content_status
+name: Content Status
+description: Distinguishes substantive policy from parliamentary procedure, ceremonial non-policy content and unclassifiable content.
+taxonomy_type: content_status
+language_code: en
+owner_scope: platform
+version: 1.0.0
+status: draft
+version_description: Initial owner-approved content-status categories.
+source_name: Project owner-approved Phase 2.5 specification
+source_url:
+attribution_text:
+licence_note: Project-authored taxonomy.
+labels:
+  - code: substantive_policy
+    label: Substantive policy
+    short_definition: Advances, criticises, explains, evaluates or discusses public policy, government action, legislation, political institutions or a substantive policy problem.
+    display_order: 1
+    is_active: true
+    is_analytical: true
+    is_fallback: false
+    requires_review: false
+  - code: procedural
+    label: Procedural
+    short_definition: Concerns parliamentary operation rather than substantive policy.
+    positive_examples: [Point of order, Speaker ruling, Calling a member, Division administration, Leave to move, Speaking-time arrangements, Routine tabling or scheduling without policy substance]
+    display_order: 2
+    is_active: true
+    is_analytical: false
+    is_fallback: false
+    requires_review: false
+  - code: ceremonial_nonpolicy
+    label: Ceremonial or non-policy
+    short_definition: Ceremonial, commemorative or social content lacking a substantive policy claim.
+    positive_examples: [Condolence remarks, Welcoming visitors, Swearing-in, Congratulations, Tributes, Hear hear, Commemorative remarks without policy argument]
+    display_order: 3
+    is_active: true
+    is_analytical: false
+    is_fallback: false
+    requires_review: false
+  - code: unclassifiable
+    label: Unclassifiable
+    short_definition: Insufficient information exists for a defensible classification.
+    inclusion_rules: [A reason is required., Use for corrupted or empty content, extremely short contextless text, unresolved reconstruction, or no defensible interpretation.]
+    exclusion_rules: [Do not use as a substitute for coder uncertainty.]
+    display_order: 4
+    is_active: true
+    is_analytical: false
+    is_fallback: true
+    requires_review: true
+    metadata:
+      reason_required: true

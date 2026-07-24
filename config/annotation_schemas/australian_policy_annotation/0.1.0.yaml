@@ -1,0 +1,84 @@
+slug: australian_policy_annotation
+name: Australian Policy Annotation
+description: Reusable initial schema for content status and Australian policy-domain coding.
+schema_type: policy_annotation
+version: 0.1.0
+status: draft
+version_description: Initial owner-approved policy annotation template without CAP.
+fields:
+  - field_key: content_status
+    label: Content status
+    help_text: Determine whether the turn contains substantive policy, procedure, ceremonial non-policy content, or is unclassifiable.
+    field_type: single_taxonomy
+    display_order: 1
+    required: true
+    taxonomy: {slug: content_status, version: 1.0.0}
+  - field_key: primary_australian_domain
+    label: Primary Australian domain
+    help_text: Select the dominant substantive Australian policy domain.
+    field_type: single_taxonomy
+    display_order: 2
+    required: false
+    taxonomy: {slug: australian_policy_domains, version: 0.1.0}
+    requirement_rules:
+      required_when:
+        taxonomy_code_equals: {field: content_status, value: substantive_policy}
+      null_unless:
+        taxonomy_code_equals: {field: content_status, value: substantive_policy}
+  - field_key: secondary_australian_domains
+    label: Secondary Australian domains
+    help_text: Select up to two substantive additional policy components; do not code passing references.
+    field_type: multiple_taxonomy
+    display_order: 3
+    required: false
+    taxonomy: {slug: australian_policy_domains, version: 0.1.0}
+    minimum_items: 0
+    maximum_items: 2
+    validation_rules:
+      unique_items: true
+      different_from_field: primary_australian_domain
+      excluded_codes: [AU_OTHER_REVIEW]
+    requirement_rules:
+      null_unless:
+        taxonomy_code_equals: {field: content_status, value: substantive_policy}
+  - field_key: specific_australian_issue
+    label: Specific Australian issue
+    help_text: Optionally record a specific issue such as AUKUS, Robodebt or the National Disability Insurance Scheme.
+    field_type: short_text
+    display_order: 4
+    required: false
+    requirement_rules:
+      null_unless:
+        taxonomy_code_equals: {field: content_status, value: substantive_policy}
+  - field_key: topic_uncertain
+    label: Topic uncertain
+    help_text: Record uncertainty in otherwise substantive policy coding; this is not a fallback status.
+    field_type: boolean
+    display_order: 5
+    required: true
+    validation_rules:
+      default: false
+  - field_key: fallback_explanation
+    label: Fallback explanation
+    help_text: Explain why no analytical Australian domain applies.
+    field_type: long_text
+    display_order: 6
+    required: false
+    requirement_rules:
+      required_when:
+        taxonomy_code_equals: {field: primary_australian_domain, value: AU_OTHER_REVIEW}
+  - field_key: unclassifiable_reason
+    label: Unclassifiable reason
+    help_text: Explain why there is insufficient information for a defensible classification.
+    field_type: long_text
+    display_order: 7
+    required: false
+    requirement_rules:
+      required_when:
+        taxonomy_code_equals: {field: content_status, value: unclassifiable}
+  - field_key: annotation_notes
+    label: Annotation notes
+    help_text: Optional coder notes.
+    field_type: long_text
+    display_order: 8
+    required: false

@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Synthetic Phase 0 fixture. It is not copied from Hansard. -->
+<debates>
+  <major-heading id="synthetic/2010/major/1">QUESTIONS WITHOUT NOTICE</major-heading>
+  <minor-heading id="synthetic/2010/minor/1">Synthetic Policy Question</minor-heading>
+  <speech id="synthetic/2010/speech/1"
+          speakerid="synthetic/member/1"
+          speakername="Alex Example"
+          talktype="speech"
+          time="14:00:00"
+          approximate_wordcount="17"
+          approximate_duration="30"
+          url="https://example.invalid/synthetic/1">
+    <p>This is a <i>synthetic</i> opening contribution with two paragraphs.</p>
+    <p>It exists only to test structure.</p>
+  </speech>
+  <speech id="synthetic/2010/interjection/1"
+          speakerid="synthetic/member/2"
+          speakername="Blair Example"
+          talktype="interjection"
+          time="14:00:10"
+          approximate_wordcount="3"
+          approximate_duration="0"
+          url="https://example.invalid/synthetic/2">
+    <p>That is disputed!</p>
+  </speech>
+  <speech id="synthetic/2010/continuation/1"
+          speakerid="synthetic/member/1"
+          speakername="Alex Example"
+          talktype="continuation"
+          time="14:00:12"
+          approximate_wordcount="8"
+          approximate_duration="10"
+          url="https://example.invalid/synthetic/3">
+    <p>The synthetic opening contribution continues.</p>
+  </speech>
+  <speech id="synthetic/2010/collective/1"
+          speakerid="unknown"
+          speakername="Opposition Members"
+          talktype="speech"
+          time="14:00:13"
+          approximate_wordcount="3"
+          approximate_duration="0"
+          url="https://example.invalid/synthetic/4">
+    <p class="italic">Opposition members interjecting—</p>
+  </speech>
+  <speech id="synthetic/2010/continuation/2"
+          speakerid="synthetic/member/1"
+          speakername="Alex Example"
+          talktype="continuation"
+          time="14:00:14"
+          approximate_wordcount="5"
+          approximate_duration="5"
+          url="https://example.invalid/synthetic/5">
+    <p>The contribution continues again.</p>
+  </speech>
+  <minor-heading id="synthetic/2010/minor/2">Changed Heading</minor-heading>
+  <speech id="synthetic/2010/orphan/1"
+          speakerid="unknown"
+          speakername="Unknown Member"
+          talktype="continuation"
+          time="unknown"
+          approximate_wordcount="6"
+          approximate_duration="0"
+          url="https://example.invalid/synthetic/6">
+    <p>This continuation has no safe parent.</p>
+  </speech>
+  <speech id="synthetic/2010/nospeaker/1"
+          nospeaker="true"
+          talktype="speech"
+          time=""
+          approximate_wordcount="5"
+          approximate_duration="0"
+          url="https://example.invalid/synthetic/7">
+    <p>A synthetic procedural statement occurred.</p>
+  </speech>
+  <division id="synthetic/2010/division/1"
+            divdate="2010-02-02"
+            divnumber="1"
+            nospeaker="true"
+            time="14:05:00"
+            url="https://example.invalid/synthetic/division">
+    <divisioncount ayes="2" noes="1" tellerayes="0" tellernoes="0"/>
+    <memberlist vote="aye">
+      <member id="synthetic/member/1" vote="aye">Alex Example</member>
+    </memberlist>
+  </division>
+  <bills>
+    <bill id="synthetic-bill-1" url="https://example.invalid/synthetic/bill">
+      Synthetic Safeguards Bill 2010
+    </bill>
+  </bills>
+</debates>
+

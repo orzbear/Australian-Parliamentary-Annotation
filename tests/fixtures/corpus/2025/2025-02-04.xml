@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Synthetic Phase 0 fixture. It is not copied from Hansard. -->
+<debates>
+  <major-heading id="synthetic/2025/major/1">ADJOURNMENT</major-heading>
+  <minor-heading id="synthetic/2025/minor/1"></minor-heading>
+  <speech id="synthetic/2025/speech/1"
+          speakerid="synthetic/member/5"
+          speakername="Emery Example"
+          talktype="speech"
+          time="19:30"
+          approximate_wordcount="12"
+          approximate_duration="20"
+          url="https://example.invalid/synthetic/2025/1">
+    <p>This recent-year synthetic fixture has an intentionally empty minor heading.</p>
+  </speech>
+</debates>
+

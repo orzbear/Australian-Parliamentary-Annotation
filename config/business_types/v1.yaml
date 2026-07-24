@@ -1,0 +1,88 @@
+version: "1.0.0"
+mapping_type: exact
+mappings:
+  - heading: "QUESTIONS WITHOUT NOTICE"
+    business_type: "question_time"
+    is_procedural: false
+    is_ceremonial: false
+    is_question_time: true
+    is_division_related: false
+  - heading: "BILLS"
+    business_type: "bills"
+    is_procedural: false
+    is_ceremonial: false
+    is_question_time: false
+    is_division_related: false
+  - heading: "ADJOURNMENT"
+    business_type: "adjournment"
+    is_procedural: false
+    is_ceremonial: false
+    is_question_time: false
+    is_division_related: false
+  - heading: "MATTERS OF PUBLIC IMPORTANCE"
+    business_type: "matters_of_public_importance"
+    is_procedural: false
+    is_ceremonial: false
+    is_question_time: false
+    is_division_related: false
+  - heading: "PRIVATE MEMBERS' BUSINESS"
+    business_type: "private_members_business"
+    is_procedural: false
+    is_ceremonial: false
+    is_question_time: false
+    is_division_related: false
+  - heading: "MEMBERS SWORN"
+    business_type: "members_sworn"
+    is_procedural: true
+    is_ceremonial: true
+    is_question_time: false
+    is_division_related: false
+  - heading: "DISTINGUISHED VISITORS"
+    business_type: "distinguished_visitors"
+    is_procedural: false
+    is_ceremonial: true
+    is_question_time: false
+    is_division_related: false
+  - heading: "DIVISIONS"
+    business_type: "division"
+    is_procedural: true
+    is_ceremonial: false
+    is_question_time: false
+    is_division_related: true
+  - heading: "BUSINESS"
+    business_type: "business"
+    is_procedural: true
+    is_ceremonial: false
+    is_question_time: false
+    is_division_related: false
+  - heading: "MOTIONS"
+    business_type: "motions"
+    is_procedural: null
+    is_ceremonial: false
+    is_question_time: false
+    is_division_related: false
+  - heading: "COMMITTEES"
+    business_type: "committees"
+    is_procedural: null
+    is_ceremonial: false
+    is_question_time: false
+    is_division_related: false
+  - heading: "PARLIAMENTARY REPRESENTATION"
+    business_type: "parliamentary_representation"
+    is_procedural: true
+    is_ceremonial: null
+    is_question_time: false
+    is_division_related: false
+  - heading: "STATEMENTS ON SIGNIFICANT MATTERS"
+    business_type: "statements_on_significant_matters"
+    is_procedural: false
+    is_ceremonial: false
+    is_question_time: false
+    is_division_related: false
+  - heading: "CONDOLENCES"
+    business_type: "condolences"
+    is_procedural: false
+    is_ceremonial: true
+    is_question_time: false
+    is_division_related: false
+

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Synthetic Phase 1 fixture. It is not copied from Hansard. -->
+<debates>
+  <major-heading id="p1/2025/major" url="https://example.invalid/hansardr/2025/major">
+    UNMAPPED SYNTHETIC BUSINESS
+  </major-heading>
+  <minor-heading id="p1/2025/minor" url="https://example.invalid/hansardr/2025/minor"></minor-heading>
+  <speech id="p1/2025/speech" speakerid="member/h" speakername="Harper Example"
+          talktype="speech" time="09:00" approximate_wordcount="5"
+          approximate_duration="10" url="https://example.invalid/no-dataset-marker">
+    <p>A recent synthetic unmapped speech.</p>
+  </speech>
+</debates>
+

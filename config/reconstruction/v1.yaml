@@ -1,0 +1,25 @@
+version: "1.0.0"
+chamber: "Australian Federal House of Representatives"
+expected_source_url_marker: "hansardr"
+collective_speaker_allowlist:
+  - "Honourable Members"
+  - "Opposition Members"
+  - "Government Members"
+collective_interruption_patterns:
+  Honourable Members: "^Honourable members interjecting[—–-]?$"
+  Opposition Members: "^Opposition members interjecting[—–-]?$"
+  Government Members: "^Government members interjecting[—–-]?$"
+collective_interruption_reason_code: "COLLECTIVE_INTERJECTION_EXPLICIT_PATTERN"
+unknown_speaker_ids:
+  - ""
+  - "unknown"
+unknown_speaker_names:
+  - ""
+  - "unknown"
+  - "unknown member"
+safety_limits:
+  max_file_bytes: 52428800
+  max_elements: 2000000
+  max_depth: 64
+  max_individual_text_chars: 10000000
+

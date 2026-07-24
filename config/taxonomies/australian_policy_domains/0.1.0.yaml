@@ -1,0 +1,169 @@
+slug: australian_policy_domains
+name: Australian Policy Domains
+description: Draft Australian policy-domain taxonomy for parliamentary speech coding.
+taxonomy_type: policy_domain
+jurisdiction: Australia
+language_code: en
+owner_scope: platform
+version: 0.1.0
+status: draft
+version_description: Initial owner-specified fourteen-domain analytical draft.
+source_name: Project owner-approved Phase 2.5 specification
+source_url:
+attribution_text:
+licence_note: Project-authored draft; external taxonomy licensing does not apply.
+labels:
+  - code: AU01
+    label: Macroeconomy, budget and taxation
+    short_definition: Whole-economy fiscal and monetary policy, public revenue, taxation, budgets, debt, inflation, interest rates and productivity.
+    inclusion_rules: [Use for broad cost-of-living management.]
+    exclusion_rules: [Workplace relations or industry support belongs in AU02., Welfare payment design belongs in AU05., Housing affordability belongs in AU06.]
+    positive_examples: [Federal budget balance, Income-tax reform, Inflation, Reserve Bank interest-rate decisions, Public debt, General productivity policy]
+    display_order: 1
+    is_active: true
+    is_analytical: true
+    is_fallback: false
+    requires_review: false
+  - code: AU02
+    label: Employment, industry, business and trade
+    short_definition: Employment, workplace relations, wages, unions, industry, corporations, competition, banking, business and international trade.
+    exclusion_rules: [Economy-wide taxation or inflation belongs in AU01., Technology research policy belongs in AU04., Energy generation or mining environmental policy belongs in AU07.]
+    positive_examples: [Industrial relations, Minimum wage, Manufacturing subsidies, Competition policy, Banking regulation, Export and trade agreements]
+    display_order: 2
+    is_active: true
+    is_analytical: true
+    is_fallback: false
+    requires_review: false
+  - code: AU03
+    label: Health
+    short_definition: Healthcare services, Medicare, hospitals, primary care, public and mental health, pharmaceuticals, workforce and system funding.
+    inclusion_rules: [Indigenous health may be secondary AU03 when Indigenous policy is the central concern.]
+    exclusion_rules: [Aged-care services belong in AU05., Indigenous-specific institutions and recognition belong in AU11.]
+    positive_examples: [Medicare bulk billing, Hospital funding, Mental-health services, Pharmaceutical Benefits Scheme, Pandemic health measures]
+    display_order: 3
+    is_active: true
+    is_analytical: true
+    is_fallback: false
+    requires_review: false
+  - code: AU04
+    label: Education, science, technology and communications
+    short_definition: Schools, universities, vocational education, research, science, AI, digital regulation, telecommunications and technology development.
+    exclusion_rules: [Defence technology and military cybersecurity belong in AU12., Online criminal enforcement belongs in AU10.]
+    positive_examples: [School funding, University policy, Vocational education, National Broadband Network, AI regulation, Telecommunications policy]
+    display_order: 4
+    is_active: true
+    is_analytical: true
+    is_fallback: false
+    requires_review: false
+  - code: AU05
+    label: Welfare, families, disability and ageing
+    short_definition: Income support, pensions, disability support, childcare, parental leave, aged care, poverty reduction and family assistance.
+    exclusion_rules: [Healthcare delivery belongs in AU03., Housing supply or homelessness policy belongs in AU06.]
+    positive_examples: [JobSeeker, Age Pension, National Disability Insurance Scheme, Childcare subsidies, Paid parental leave, Aged-care funding]
+    display_order: 5
+    is_active: true
+    is_analytical: true
+    is_fallback: false
+    requires_review: false
+  - code: AU06
+    label: Housing, infrastructure and transport
+    short_definition: Housing, homelessness, urban development, roads, rail, aviation, ports, public transport and general public infrastructure.
+    exclusion_rules: [Telecommunications infrastructure belongs in AU04., Energy infrastructure belongs in AU07., Farm irrigation or rural water infrastructure belongs in AU08.]
+    positive_examples: [Social housing, Housing affordability, Homelessness programs, Motorways, Rail projects, Airport policy, Public transport]
+    display_order: 6
+    is_active: true
+    is_analytical: true
+    is_fallback: false
+    requires_review: false
+  - code: AU07
+    label: Climate, environment, energy and natural resources
+    short_definition: Climate, emissions, biodiversity, pollution, conservation, electricity, renewable energy, fossil fuels, mining and natural resources.
+    exclusion_rules: [Farm production or irrigation belongs in AU08., Industrial employment transition belongs primarily in AU02 with AU07 possibly secondary.]
+    positive_examples: [Emissions trading, Carbon pricing, Renewable-energy targets, Electricity markets, Coal and gas policy, Environmental protection, Biodiversity conservation]
+    display_order: 7
+    is_active: true
+    is_analytical: true
+    is_fallback: false
+    requires_review: false
+  - code: AU08
+    label: Agriculture, fisheries, water and rural affairs
+    short_definition: Farming, fisheries, drought, irrigation, agricultural water, biosecurity, food safety, rural industries and communities.
+    exclusion_rules: [Environmental river protection belongs in AU07., General transport infrastructure belongs in AU06.]
+    positive_examples: [Farm subsidies, Drought assistance, Murray-Darling irrigation, Fisheries regulation, Agricultural biosecurity, Rural community policy]
+    display_order: 8
+    is_active: true
+    is_analytical: true
+    is_fallback: false
+    requires_review: false
+  - code: AU09
+    label: Immigration, asylum and citizenship
+    short_definition: Migration, refugees, asylum, offshore processing, detention, visas, citizenship, settlement and border-entry policy.
+    exclusion_rules: [Military or national-security operations belong in AU12., Criminal law unrelated to migration belongs in AU10.]
+    positive_examples: [Skilled migration, Refugee intake, Offshore processing, Immigration detention, Citizenship requirements, Visa policy]
+    display_order: 9
+    is_active: true
+    is_analytical: true
+    is_fallback: false
+    requires_review: false
+  - code: AU10
+    label: Law, crime, justice and civil liberties
+    short_definition: Courts, policing, prisons, criminal and civil law, privacy, discrimination, human rights, expression and family law.
+    exclusion_rules: [Parliamentary procedure is content_status procedural., Electoral administration belongs in AU13., National-security intelligence belongs in AU12.]
+    positive_examples: [Criminal sentencing, Federal policing, Privacy law, Anti-discrimination law, Court administration, Family law, Online criminal enforcement]
+    display_order: 10
+    is_active: true
+    is_analytical: true
+    is_fallback: false
+    requires_review: false
+  - code: AU11
+    label: Indigenous affairs, recognition and reconciliation
+    short_definition: Aboriginal and Torres Strait Islander policy, Closing the Gap, native title, land rights, recognition, treaty and cultural heritage.
+    inclusion_rules: [Use as primary when Indigenous status, institutions, rights or communities are the central organising concern., Other substantive domains may be secondary.]
+    positive_examples: [Closing the Gap, Native title, Constitutional recognition, The Voice referendum, Indigenous land rights, Treaty processes]
+    display_order: 11
+    is_active: true
+    is_analytical: true
+    is_fallback: false
+    requires_review: false
+  - code: AU12
+    label: Defence, national security and international affairs
+    short_definition: Defence forces, military procurement, intelligence, national-security cybersecurity, terrorism, diplomacy, aid and foreign relations.
+    exclusion_rules: [International trade belongs in AU02., General technology or telecommunications belongs in AU04., Domestic criminal law belongs in AU10.]
+    positive_examples: [AUKUS, Defence procurement, Australian Defence Force operations, Intelligence agencies, Terrorism policy, Foreign aid, Diplomatic relations]
+    display_order: 12
+    is_active: true
+    is_analytical: true
+    is_fallback: false
+    requires_review: false
+  - code: AU13
+    label: Government operations, democracy and federalism
+    short_definition: Elections, public administration, integrity, constitutional reform, federal relations, public service and substantive accountability policy.
+    exclusion_rules: [Speaker rulings are procedural., Points of order are procedural., Routine scheduling and division administration are procedural.]
+    positive_examples: [Electoral reform, Australian Electoral Commission, Public-service reform, Integrity commissions, Federal-state relations, Constitutional reform]
+    display_order: 13
+    is_active: true
+    is_analytical: true
+    is_fallback: false
+    requires_review: false
+  - code: AU14
+    label: Culture, media, sport and national identity
+    short_definition: Arts, museums, heritage, public broadcasting, media, sport, cultural industries, national symbols and identity.
+    exclusion_rules: [Pure tribute or commemoration without policy content is ceremonial_nonpolicy.]
+    positive_examples: [ABC and SBS policy, Arts funding, Museum policy, Sports funding, Cultural heritage, National commemorations with a substantive policy argument]
+    display_order: 14
+    is_active: true
+    is_analytical: true
+    is_fallback: false
+    requires_review: false
+  - code: AU_OTHER_REVIEW
+    label: Other substantive policy
+    short_definition: Clearly substantive public policy for which no current analytical Australian domain applies defensibly.
+    inclusion_rules: [Permitted only for substantive_policy., Explanation is required., Monitor for taxonomy revision.]
+    exclusion_rules: [Do not use merely because coding is difficult., Do not use as a general uncertainty category., Cannot be a secondary domain.]
+    display_order: 15
+    is_active: true
+    is_analytical: false
+    is_fallback: true
+    requires_review: true
+    metadata:
+      explanation_required: true

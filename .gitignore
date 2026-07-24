@@ -1,0 +1,58 @@
+# Immutable source archive: never commit raw Hansard XML.
+/hansard_xml_files/
+
+# Secrets and local configuration.
+.env
+.env.*
+!.env.example
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+secrets/
+
+# Databases and database volumes/dumps.
+*.db
+postgres-data/
+*.sqlite
+*.sqlite3
+*.dump
+*.backup
+pgdata/
+postgres-data/
+
+# Generated research data, exports, reports, and temporary audit output.
+/data/generated/
+/data/processed/
+/exports/
+/artifacts/
+/reports/generated/
+/tmp/
+*.parquet
+*.csv
+*.jsonl
+
+# Python environments, caches, coverage, and build products.
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Local lock/build tool state.
+.python-version
+
+# Editor and operating-system noise.
+/.agents/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

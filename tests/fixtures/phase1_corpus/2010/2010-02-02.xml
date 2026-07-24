@@ -1,0 +1,128 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Synthetic Phase 1 fixture. It is not copied from Hansard. -->
+<debates>
+  <major-heading id="p1/major/1" url="https://example.invalid/hansardr/major/1">
+    QUESTIONS WITHOUT NOTICE
+  </major-heading>
+  <minor-heading id="p1/minor/1" url="https://example.invalid/hansardr/minor/1">
+    Synthetic Question
+  </minor-heading>
+
+  <speech id="p1/opening" speakerid="member/a" speakername="Alex Example"
+          talktype="speech" time="14:00" approximate_wordcount="20"
+          approximate_duration="30" url="https://example.invalid/hansardr/opening">
+    <p>The opening has <i>italic</i>, <b>bold</b>, and
+      <a href="https://example.invalid/">linked text</a>.</p>
+    <p>It has a second paragraph.</p>
+  </speech>
+  <speech id="p1/interjection/1" speakerid="member/b" speakername="Blair Example"
+          talktype="interjection" time="14:01" approximate_wordcount="3"
+          approximate_duration="0" url="https://example.invalid/hansardr/interjection/1">
+    <p>First named interjection!</p>
+  </speech>
+  <speech id="p1/interjection/2" speakerid="member/c" speakername="Casey Example"
+          talktype="interjection" time="14:01" approximate_wordcount="3"
+          approximate_duration="0" url="https://example.invalid/hansardr/interjection/2">
+    <p>Second named interjection!</p>
+  </speech>
+  <speech id="p1/continuation/1" speakerid="member/a" speakername="Alex Example"
+          talktype="continuation" time="14:01" approximate_wordcount="6"
+          approximate_duration="10" url="https://example.invalid/hansardr/continuation/1">
+    <p>The opening resumes after both interruptions.</p>
+  </speech>
+  <speech id="p1/collective/explicit" speakerid="unknown"
+          speakername="Opposition Members" talktype="speech" time="14:02"
+          approximate_wordcount="3" approximate_duration="0"
+          url="https://example.invalid/hansardr/collective/explicit">
+    <p class="italic">Opposition members interjecting—</p>
+  </speech>
+  <speech id="p1/continuation/2" speakerid="member/a" speakername="Alex Example"
+          talktype="continuation" time="14:02" approximate_wordcount="5"
+          approximate_duration="10" url="https://example.invalid/hansardr/continuation/2">
+    <p>The opening resumes once more.</p>
+  </speech>
+  <speech id="p1/collective/response" speakerid="unknown"
+          speakername="Opposition Members" talktype="speech" time="14:03"
+          approximate_wordcount="2" approximate_duration="0"
+          url="https://example.invalid/hansardr/collective/response">
+    <p>Hear, hear!</p>
+  </speech>
+  <speech id="p1/continuation/after-response" speakerid="member/a"
+          speakername="Alex Example" talktype="continuation" time="14:03"
+          approximate_wordcount="7" approximate_duration="10"
+          url="https://example.invalid/hansardr/continuation/after-response">
+    <p>This must remain orphaned after the response.</p>
+  </speech>
+
+  <minor-heading id="p1/minor/2" url="https://example.invalid/hansardr/minor/2">
+    Changed Heading
+  </minor-heading>
+  <speech id="p1/continuation/after-heading" speakerid="member/a"
+          speakername="Alex Example" talktype="continuation" time="14:04"
+          approximate_wordcount="7" approximate_duration="10"
+          url="https://example.invalid/hansardr/continuation/after-heading">
+    <p>This must remain orphaned after the heading.</p>
+  </speech>
+
+  <speech id="p1/same-name/start" speakerid="member/id-one"
+          speakername="Same Name" talktype="speech" time="14:05"
+          approximate_wordcount="6" approximate_duration="10"
+          url="https://example.invalid/hansardr/same-name/start">
+    <p>A known identity starts speaking.</p>
+  </speech>
+  <speech id="p1/same-name/conflict" speakerid="member/id-two"
+          speakername="Same Name" talktype="continuation" time="14:05"
+          approximate_wordcount="7" approximate_duration="10"
+          url="https://example.invalid/hansardr/same-name/conflict">
+    <p>A different known identity cannot merge.</p>
+  </speech>
+
+  <speech id="p1/name-fallback/start" speakerid="member/taylor"
+          speakername="Taylor Fullname" talktype="speech" time="14:06"
+          approximate_wordcount="7" approximate_duration="10"
+          url="https://example.invalid/hansardr/name-fallback/start">
+    <p>The named speaker starts this contribution.</p>
+  </speech>
+  <speech id="p1/name-fallback/continuation" speakername="Taylor Fullname"
+          talktype="continuation" time="14:06" approximate_wordcount="7"
+          approximate_duration="10"
+          url="https://example.invalid/hansardr/name-fallback/continuation">
+    <p>The exact full name safely continues it.</p>
+  </speech>
+
+  <speech id="p1/structural/start" speakerid="member/d"
+          speakername="Devon Example" talktype="speech" time="14:07"
+          approximate_wordcount="6" approximate_duration="10"
+          url="https://example.invalid/hansardr/structural/start">
+    <p>This contribution precedes a division.</p>
+  </speech>
+  <division id="p1/division/1" divdate="2010-02-02" divnumber="1"
+            nospeaker="true" time="14:08"
+            url="https://example.invalid/hansardr/division/1">
+    <divisioncount ayes="1" noes="1" tellerayes="0" tellernoes="0"/>
+    <memberlist vote="aye">
+      <member id="member/a" vote="aye">Alex Example</member>
+    </memberlist>
+    <bills>
+      <bill id="p1/bill/nested" url="https://example.invalid/bill/nested">
+        Nested Synthetic Bill
+      </bill>
+    </bills>
+  </division>
+  <speech id="p1/structural/continuation" speakerid="member/d"
+          speakername="Devon Example" talktype="continuation" time="14:09"
+          approximate_wordcount="7" approximate_duration="10"
+          url="https://example.invalid/hansardr/structural/continuation">
+    <p>This must remain orphaned after the division.</p>
+  </speech>
+
+  <stage-direction id="p1/unknown/event" kind="synthetic">
+    <p>A deliberately unknown top-level structural event.</p>
+  </stage-direction>
+  <bills>
+    <bill id="p1/bill/direct" url="https://example.invalid/bill/direct">
+      Direct Synthetic Bill
+    </bill>
+  </bills>
+</debates>
+

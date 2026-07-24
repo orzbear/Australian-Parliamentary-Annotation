@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Synthetic Phase 1 fixture. It is not copied from Hansard. -->
+<debates>
+  <major-heading id="p1/2016/major" url="https://example.invalid/hansardr/2016/major">
+    BILLS
+  </major-heading>
+  <minor-heading id="p1/2016/minor" url="https://example.invalid/hansardr/2016/minor">
+    Synthetic Formatting Bill
+  </minor-heading>
+  <speech id="p1/formatting" speakerid="member/e" speakername="Emery Example"
+          talktype="speech" time="10:15" approximate_wordcount="30"
+          approximate_duration="60" url="https://example.invalid/hansardr/formatting">
+    <p>Before the chart <img src="https://example.invalid/chart.png"
+       alt="Synthetic fiscal chart"/> after the chart.</p>
+    <p><img src="https://example.invalid/no-alt.png"/></p>
+    <ul>
+      <li>First list item</li>
+      <li>Second <sup>list</sup> item</li>
+    </ul>
+    <table>
+      <tr><td>Cell one</td><td>Cell two</td></tr>
+    </table>
+  </speech>
+  <speech id="p1/malformed-fields" speakerid="unknown"
+          speakername="Unknown Member" talktype="speech" time="15:"
+          approximate_wordcount="many" url="https://example.invalid/hansardr/malformed">
+    <p></p>
+  </speech>
+  <speech id="p1/nospeaker" nospeaker="true" talktype="speech" time=""
+          approximate_wordcount="" approximate_duration=""
+          url="https://example.invalid/hansardr/nospeaker"></speech>
+  <speech id="p1/duplicate" speakerid="member/f" speakername="Frankie Example"
+          talktype="speech" time="11:00" approximate_wordcount="3"
+          approximate_duration="5" url="https://example.invalid/hansardr/duplicate/1">
+    <p>First duplicate identifier.</p>
+  </speech>
+  <speech id="p1/duplicate" speakerid="member/g" speakername="Gray Example"
+          talktype="speech" time="11:01" approximate_wordcount="3"
+          approximate_duration="5" url="https://example.invalid/hansardr/duplicate/2">
+    <p>Second duplicate identifier.</p>
+  </speech>
+</debates>
+

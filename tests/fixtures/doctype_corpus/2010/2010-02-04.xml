@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Synthetic unsafe Phase 1 fixture. It is not copied from Hansard. -->
+<!DOCTYPE debates [
+  <!ENTITY unsafe "entity expansion must never run">
+]>
+<debates>
+  <major-heading>UNSAFE SYNTHETIC DOCUMENT</major-heading>
+  <speech id="p1/doctype" speakerid="member/z" speakername="Unsafe Example"
+          talktype="speech" time="12:00" approximate_wordcount="4"
+          approximate_duration="0" url="https://example.invalid/hansardr/unsafe">
+    <p>&unsafe;</p>
+  </speech>
+</debates>
+

@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools==81.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hansard-annotator"
+version = "0.1.0"
+description = "Reproducible preprocessing for Australian Federal House Hansard"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "alembic>=1.14,<2",
+    "lxml>=5.3,<7",
+    "psycopg[binary]>=3.2,<4",
+    "pyarrow>=18,<25",
+    "PyYAML>=6,<7",
+    "SQLAlchemy>=2.0,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.14,<2",
+    "lxml-stubs>=0.5,<1",
+    "psutil>=6,<8",
+    "pytest>=8,<9",
+    "ruff>=0.9,<1",
+    "types-psutil>=6,<8",
+    "types-PyYAML>=6,<7",
+]
+
+[project.scripts]
+hansard-preprocess = "hansard_annotator.corpus.cli:main"
+hansard-db = "hansard_annotator.db.cli:main"
+hansard-product = "hansard_annotator.product.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests", "tools"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["hansard_annotator"]
+mypy_path = "src"
+warn_unused_ignores = true

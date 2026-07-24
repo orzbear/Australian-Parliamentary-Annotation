@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Synthetic Phase 0 fixture. It is not copied from Hansard. -->
+<debates>
+  <major-heading id="synthetic/2016/major/1">BILLS</major-heading>
+  <minor-heading id="synthetic/2016/minor/1">Synthetic Bill; Second Reading</minor-heading>
+  <speech id="synthetic/2016/speech/1"
+          speakerid="synthetic/member/3"
+          speakername="Casey Example"
+          talktype="speech"
+          time="10:15"
+          approximate_wordcount="18"
+          approximate_duration="30"
+          url="https://example.invalid/synthetic/2016/1">
+    <p>I move that the synthetic bill be read a second time.</p>
+    <ul>
+      <li>First synthetic point</li>
+      <li>Second <b>synthetic</b> point</li>
+    </ul>
+  </speech>
+  <speech id="synthetic/2016/interjection/1"
+          speakerid="synthetic/member/4"
+          speakername="Devon Example"
+          talktype="interjection"
+          time="10:16"
+          approximate_wordcount="4"
+          approximate_duration="0"
+          url="https://example.invalid/synthetic/2016/2">
+    <p>Explain the second point.</p>
+  </speech>
+  <speech id="synthetic/2016/continuation/1"
+          speakerid="synthetic/member/3"
+          speakername="Casey Example"
+          talktype="continuation"
+          time="10:16"
+          approximate_wordcount="7"
+          approximate_duration="10"
+          url="https://example.invalid/synthetic/2016/3">
+    <p>I will explain the synthetic point.</p>
+  </speech>
+</debates>
+
