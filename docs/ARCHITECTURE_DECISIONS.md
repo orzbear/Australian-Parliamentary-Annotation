@@ -108,3 +108,65 @@ The minimum approval set before the web application is:
 4. Async PostgreSQL-backed jobs and exports without initial Redis are accepted.
 
 Production deployment decisions remain conditional on a read-only VPS/Hermes inventory.
+
+## Implemented Phase 3 web amendment
+
+Phase 3 implements the approved modular monolith as a server-rendered FastAPI application.
+Argon2id credentials and opaque, revocable PostgreSQL sessions are local to the application;
+the cookie contains no identity or permissions. CSRF secrets are session-bound, passwords and
+session tokens are never audited, and account disable/password reset revoke active sessions.
+
+Projects pin the corpus, exact preprocessing run, annotation-schema version and referenced
+taxonomy hashes. Pins are database-immutable after activation or task creation. The initial
+development project deliberately pins the accepted draft definitions; production mode rejects
+draft definitions rather than silently publishing them.
+
+Batches accept a closed typed filter grammar, store canonical criteria, seed and selection
+fingerprint, and are idempotent. Tasks reference immutable speaker turns without copying corpus
+text. Claims use PostgreSQL `FOR UPDATE SKIP LOCKED`; assignments permit future multiple coding
+while Phase 3 exposes only each annotator's own payload.
+
+Human annotations have one logical series per assignment and append-only full-value versions.
+Draft no-ops are reused; submission adds evidence rather than overwriting history. Database
+triggers protect annotation versions and audit events. Adjudication, agreement, gold labels,
+LLM labels, CAP, hostility, political enrichment and secondary clients remain deferred.
+
+## Conference two-pass prototype amendment
+
+Broad general-domain coding and narrow Australian-issue coding are separate projects and
+schema versions. A derived project references one source project pinned to the same corpus
+and preprocessing run. Its task stores the exact submitted source annotation version for
+the same speaker turn. Selection fingerprints include the source version and values hash,
+so later revisions cannot silently alter an existing second-pass sample.
+
+The initial second pass is deliberately AUKUS-only and selects AU12 from primary or secondary
+general-domain values. It does not create an Australian-issue taxonomy by inference. A wider
+issue list requires an owner-reviewed codebook and new version. This mechanism is sequential
+screening only and does not implement Phase 4 overlap, agreement, adjudication or gold labels.
+
+## Conference annotated-data export amendment
+
+The conference prototype permits one narrow exception to the future durable asynchronous
+export design: an authorized project manager may synchronously download at most 2,000 current
+submitted/revised annotations as a deterministic in-memory download. Users explicitly choose
+a simple flattened research CSV or an AI-codebook ZIP with instructions, JSONL, CSV, pinned
+codebook context and a checksum manifest. No export file is persisted server-side. Both
+outputs exclude annotator identities/drafts/raw XML and record only sanitised metadata in the
+audit log. Larger, scheduled, production and gold-snapshot exports remain asynchronous
+PostgreSQL-backed jobs when that later scope is approved.
+
+## Hostinger private-pilot deployment amendment
+
+The conference pilot may share the inventoried 2-vCPU/8-GB Hostinger VPS with Hermes, but
+only as an independent compose project under `/opt/hansard-annotator`. Hermes remains under
+`/docker/hermes-agent-vtxm`; its compose file, bridge network, bind-mounted data and port are
+not joined or mutated. Caddy is selected because no incumbent reverse proxy exists and is the
+only Hansard service publishing host ports. PostgreSQL has no host port and uses an
+internal-only network and persistent named volume.
+
+The web container runs non-root, read-only, without Linux capabilities, with production
+secure cookies and a single trusted host. PostgreSQL 16 uses separate owner and application
+logins; migrations remain an explicit one-shot tool after a validated backup. Hostinger
+weekly snapshots supplement daily custom-format dumps, checksums and approved encrypted
+off-VPS copies. The deployment runbook is a required safety boundary and explicitly forbids
+volume-destructive compose operations.

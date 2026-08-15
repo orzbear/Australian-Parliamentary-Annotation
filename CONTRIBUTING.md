@@ -2,11 +2,11 @@
 
 ## Scope and approval gates
 
-Work only within the currently approved phase. Phases 0 through 2.5 permit repository
+Work only within the currently approved phase. Phases 0 through 3 permit repository
 safeguards, read-only audit/preprocessing, generated analytical files outside Git,
 the PostgreSQL corpus schema/import/verification layer, and synthetic/processed-data
-fixtures. Do not begin Phase 3 authentication, annotation workflows, or web work, and
-do not install or deploy production services, without explicit owner approval.
+fixtures and the bounded annotation web MVP. Do not begin Phase 4 adjudication/agreement,
+later research automation, or production deployment without explicit owner approval.
 
 ## Raw-data safety
 
@@ -53,6 +53,24 @@ do not install or deploy production services, without explicit owner approval.
 - Phase 3 development and a bounded pilot may pin an explicitly identified draft
   taxonomy/schema version. Production or gold-standard annotation requires an explicitly
   published immutable version; later changes require a new version rather than mutation.
+- Treat every route as deny-by-default. Enforce project membership server-side and never
+  expose another annotator's payload through HTML, HTMX fragments, counts, or errors.
+- Protect every state-changing browser request with session-bound CSRF validation.
+- Never log or audit passwords, opaque session tokens, full speech text, or annotation notes.
+- Keep annotation versions and audit events append-only; revisions add rows.
+- Keep HTMX and frontend assets local and version-pinned. Do not introduce a public CDN.
+- Do not auto-run Alembic from web startup or use the development seeder in production.
+- Production VPS work must follow `docs/PILOT_DEPLOYMENT_RUNBOOK.md`. Never operate from the
+  Hermes compose directory, expose PostgreSQL/web ports, print production secrets, or run
+  `docker compose down -v`. Back up and verify before migrations.
+- A derived annotation task must cite the exact immutable submitted source-annotation
+  version that selected the same speaker turn. Never derive from a moving unrecorded query.
+- Sequential issue screening is not agreement or adjudication. Keep those Phase 4 concepts
+  absent until separately approved.
+- Annotated-data exports must contain only current submitted/revised human versions and omit
+  annotator identity and raw XML. AI-codebook packages additionally include exact
+  schema/taxonomy context and checksums and remain human-reviewed inputs. Never treat an
+  AI-produced codebook as approved automatically.
 
 ## Checks before review
 
@@ -61,11 +79,17 @@ Run:
 ```powershell
 python -m unittest discover -s tests -v
 .\.venv\Scripts\python.exe -m pytest -q
-.\.venv\Scripts\ruff.exe check src tests migrations tools
-.\.venv\Scripts\mypy.exe src
+.\.venv\Scripts\python.exe -m ruff check .
+.\.venv\Scripts\python.exe -m mypy
+npm.cmd run build
 git check-ignore -v hansard_xml_files/2010/2010-02-02.xml
 git status --short
 ```
 
 Review the diff for accidental source data, secrets, generated data, or scope creep.
 Do not commit unless the owner asks for a commit.
+
+GitHub CI repeats the asset build, lint, type, fixture/unit tests, a real PostgreSQL migration
+test, production configuration validation and production image build. See
+`docs/CI_CD.md`. Production is deployed only from a reviewed `main` commit; pushing a branch
+never updates the live domain.

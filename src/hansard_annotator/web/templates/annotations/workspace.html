@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% from "components/macros.html" import csrf, badge, error_summary %}
+{% block title %}Annotate {{ assignment.speaker_name_raw or 'speech' }}{% endblock %}
+{% block main_class %}workspace-shell{% endblock %}
+{% block content %}
+<header class="workspace-header">
+  <div><a class="text-sm font-medium text-brand" href="/projects/{{ assignment.project_id }}">← {{ assignment.project_name }}</a><h1 class="mt-1 text-xl font-semibold">Annotation workspace</h1></div>
+  <div class="flex items-center gap-3">{{ badge(assignment.assignment_status) }}<span class="text-sm text-muted">{{ assignment.calculated_word_count }} words</span></div>
+</header>
+{% if request.query_params.get('submitted') %}<div class="alert alert-success mb-4" role="status">Annotation submitted. The next available task is ready.</div>{% endif %}
+{{ error_summary(errors) }}
+<div class="workspace-grid">
+  <article class="speech-panel" aria-labelledby="speech-heading">
+    <div class="speech-context">
+      <p class="eyebrow">{{ assignment.chamber }} · {{ assignment.speech_date }}</p>
+      <h2 id="speech-heading" class="mt-2 text-3xl font-semibold">{{ assignment.speaker_name_raw or 'Unknown speaker' }}</h2>
+      <p class="mt-2 text-lg">{{ assignment.major_heading_original }}{% if assignment.minor_heading_original %} · {{ assignment.minor_heading_original }}{% endif %}</p>
+      <div class="hint-row mt-4" aria-label="Preprocessing hints">
+        <span class="hint-label">Preprocessing hints</span>
+        <span>procedural: {{ assignment.is_procedural if assignment.is_procedural is not none else 'unknown' }}</span>
+        <span>ceremonial: {{ assignment.is_ceremonial if assignment.is_ceremonial is not none else 'unknown' }}</span>
+        <span>question time: {{ assignment.is_question_time if assignment.is_question_time is not none else 'unknown' }}</span>
+      </div>
+    </div>
+    <div class="speech-text">{{ assignment.text_clean }}</div>
+    <details class="provenance">
+      <summary>Source and technical provenance</summary>
+      <dl class="metadata mt-3">
+        <div><dt>Business type</dt><dd>{{ assignment.business_type or 'Unknown' }}</dd></div>
+        <div><dt>Interruptions</dt><dd>{{ assignment.interruption_count }}</dd></div>
+        <div><dt>Orphan continuation</dt><dd>{{ assignment.is_orphan_continuation }}</dd></div>
+        <div><dt>Source</dt><dd><a href="{{ assignment.source_url }}" rel="noreferrer">{{ assignment.source_file }}</a></dd></div>
+        <div><dt>Corpus/run</dt><dd>{{ assignment.corpus_name }} · {{ assignment.run_name }} · {{ assignment.pipeline_version }}</dd></div>
+        <div><dt>Turn key</dt><dd class="hash">{{ assignment.turn_key }}</dd></div>
+        {% if assignment.source_annotation_version_id %}<div><dt>Derived from</dt><dd>{{ assignment.source_project_name }} · source annotation version {{ assignment.source_annotation_version_id }}</dd></div><div><dt>Source label hash</dt><dd class="hash">{{ assignment.source_values_sha256 }}</dd></div>{% endif %}
+      </dl>
+    </details>
+  </article>
+  <aside class="annotation-panel" aria-labelledby="form-heading">
+    <div class="annotation-title"><p class="eyebrow">Human annotation · {{ schema_version }}</p><h2 id="form-heading" class="mt-1 text-2xl font-semibold">{{ schema_name }}</h2><p class="mt-2 text-sm text-muted">Preprocessing hints are context only. This form follows the project's pinned annotation pass.</p></div>
+    <form id="annotation-form" method="post" action="/assignments/{{ assignment.id }}/submit" data-dirty-form>
+      {{ csrf(principal) }}
+      <div class="annotation-fields">
+      {% for field in fields %}
+        {% set current = values.get(field.field_key) %}
+        <fieldset class="field-wrap {% if errors.get(field.field_key) %}field-error{% endif %}" data-field="{{ field.field_key }}">
+          <legend>{{ field.label }}{% if field.required %}<span aria-hidden="true"> *</span>{% endif %}</legend>
+          <p class="help">{{ field.help_text }}</p>
+          {% if field.field_type == 'single_taxonomy' %}
+            <div class="choice-stack">
+            {% for option in labels[field.taxonomy_version_id] %}
+              <label class="choice-card"><input type="radio" name="{{ field.field_key }}" value="{{ option.code }}" {% if current == option.code %}checked{% endif %}><span><strong>{{ option.label }}</strong><small>{{ option.short_definition }}</small></span></label>
+            {% endfor %}
+            </div>
+          {% elif field.field_type == 'multiple_taxonomy' %}
+            {% if field.ui_hints.get('reveal_control_label') %}<label class="inline-control mt-3"><input type="checkbox" data-reveal-toggle="{{ field.field_key }}" {% if current %}checked{% endif %}> {{ field.ui_hints.get('reveal_control_label') }}</label>{% endif %}
+            <div data-reveal-content="{{ field.field_key }}" {% if field.ui_hints.get('reveal_control_label') and not current %}hidden{% endif %}>
+            <div class="flex items-center justify-between"><span class="help">Choose up to {{ field.maximum_items }}</span><output data-choice-count>0 of {{ field.maximum_items }}</output></div>
+            <div class="chip-grid" data-max="{{ field.maximum_items }}">
+            {% for option in labels[field.taxonomy_version_id] %}
+              <label class="choice-chip"><input type="checkbox" name="{{ field.field_key }}" value="{{ option.code }}" {% if option.code in (current or []) %}checked{% endif %}><span>{{ option.label }}</span></label>
+            {% endfor %}
+            </div>
+            </div>
+          {% elif field.field_type in ['boolean','uncertainty'] %}
+            {% if field.ui_hints.get('control') == 'checkbox' %}
+              <input type="hidden" name="{{ field.field_key }}" value="false"><label class="choice-card mt-3"><input type="checkbox" name="{{ field.field_key }}" value="true" {% if current is sameas true %}checked{% endif %}><span><strong>{{ field.ui_hints.get('checked_label', field.label) }}</strong></span></label>
+            {% else %}
+              <div class="inline-choices"><label><input type="radio" name="{{ field.field_key }}" value="false" {% if current is sameas false %}checked{% endif %}> No</label><label><input type="radio" name="{{ field.field_key }}" value="true" {% if current is sameas true %}checked{% endif %}> Yes</label></div>
+            {% endif %}
+          {% elif field.field_type == 'short_text' %}
+            <input name="{{ field.field_key }}" value="{{ current or '' }}" maxlength="500">
+          {% elif field.field_type == 'long_text' %}
+            <textarea name="{{ field.field_key }}" rows="4" maxlength="5000">{{ current or '' }}</textarea>
+          {% else %}<div class="alert alert-error">Unsupported field type: {{ field.field_type }}</div>{% endif %}
+          {% for message in errors.get(field.field_key, []) %}<p class="error-text">{{ message }}</p>{% endfor %}
+        </fieldset>
+      {% endfor %}
+      </div>
+      <div class="annotation-actions">
+        <div id="save-status" class="save-status" aria-live="polite">{% if revision_number %}Loaded revision {{ revision_number }}{% else %}No draft saved yet{% endif %}</div>
+        <div class="grid grid-cols-2 gap-3">
+          <button class="btn btn-secondary" type="submit" formaction="/assignments/{{ assignment.id }}/draft" hx-post="/assignments/{{ assignment.id }}/draft" hx-target="#save-status" hx-swap="innerHTML" data-save-draft>Save draft</button>
+          <button class="btn btn-primary" type="submit" data-submit-next>Submit &amp; next</button>
+        </div>
+      </div>
+    </form>
+    <div class="secondary-actions">
+      <form method="post" action="/assignments/{{ assignment.id }}/skip">{{ csrf(principal) }}<button class="btn btn-quiet" type="submit">Skip for now</button></form>
+      <form method="post" action="/assignments/{{ assignment.id }}/flag" class="flex gap-2">{{ csrf(principal) }}<label class="sr-only" for="flag-reason">Flag reason</label><input id="flag-reason" name="reason" placeholder="Problem requiring review" required><button class="btn btn-danger" type="submit">Flag</button></form>
+      <a class="btn btn-quiet" href="/assignments/{{ assignment.id }}/history">Revision history</a>
+    </div>
+  </aside>
+</div>
+{% endblock %}

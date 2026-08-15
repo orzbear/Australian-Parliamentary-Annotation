@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import json
 import os
+import zipfile
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import psycopg
@@ -15,6 +18,7 @@ import pytest
 import yaml
 from alembic import command
 from alembic.config import Config
+from fastapi.testclient import TestClient
 from psycopg.rows import dict_row
 from sqlalchemy import inspect
 from sqlalchemy.exc import DBAPIError
@@ -41,6 +45,35 @@ from hansard_annotator.product.loaders import (
 )
 from hansard_annotator.product.seeds import SeedConflictError
 from hansard_annotator.product.verification import verify_product_foundation
+from hansard_annotator.web.annotations.service import save_annotation
+from hansard_annotator.web.app import create_app
+from hansard_annotator.web.auth.service import (
+    AuthenticationError,
+    authenticate,
+    create_user,
+    resolve_session,
+    revoke_session,
+    set_user_enabled,
+)
+from hansard_annotator.web.config import WebSettings
+from hansard_annotator.web.exports.service import (
+    build_ai_codebook_export,
+    build_annotation_export,
+)
+from hansard_annotator.web.projects.permissions import PermissionDenied
+from hansard_annotator.web.projects.service import (
+    create_project,
+    set_membership,
+    transition_project,
+)
+from hansard_annotator.web.security import SESSION_COOKIE
+from hansard_annotator.web.tasks.schemas import SelectionCriteria
+from hansard_annotator.web.tasks.service import (
+    claim_next,
+    generate_batch,
+    get_assignment,
+    preview_batch,
+)
 
 TEST_URL = os.environ.get("HANSARD_TEST_DATABASE_URL")
 pytestmark = pytest.mark.skipif(
@@ -65,6 +98,22 @@ PHASE2_TABLES = (
     "image_anomalies",
     "import_artifacts",
 )
+PHASE3_TABLES = {
+    "users",
+    "user_credentials",
+    "global_roles",
+    "user_global_roles",
+    "web_sessions",
+    "projects",
+    "project_taxonomy_pins",
+    "project_memberships",
+    "batches",
+    "tasks",
+    "assignments",
+    "annotations",
+    "annotation_versions",
+    "audit_events",
+}
 
 
 @pytest.fixture
@@ -77,6 +126,7 @@ def database_url(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     yield TEST_URL
     cleanup_url = TEST_URL.replace("postgresql+psycopg://", "postgresql://")
     with psycopg.connect(cleanup_url, autocommit=True) as connection:
+        connection.execute("TRUNCATE users,projects CASCADE")
         connection.execute("TRUNCATE annotation_schemas,taxonomies CASCADE")
     command.downgrade(config, "base")
 
@@ -169,6 +219,25 @@ def _fixture_run(
         artefact_count=0,
         artefact_bytes=0,
         dataset_rows={name: counts[name] for name in EXPECTED_FIELDS},
+    )
+
+
+def _web_settings(database_url: str) -> WebSettings:
+    return WebSettings(
+        database=DatabaseSettings(
+            url=database_url, processed_data_root=Path("data/processed")
+        ),
+        environment="test",
+        session_secret="phase3-test-secret-at-least-thirty-two-characters",
+        cookie_secure=False,
+        allowed_hosts=("testserver",),
+        base_url="http://testserver",
+        idle_minutes=60,
+        absolute_hours=12,
+        minimum_password_length=12,
+        lockout_failures=2,
+        lockout_minutes=15,
+        log_level="INFO",
     )
 
 
@@ -865,3 +934,544 @@ def test_annotation_ready_views_are_explicitly_current_run_aware(
     assert {row["run_name"] for row in historical} == {"current-run", "historical-run"}
     assert {row["is_current_corpus_version"] for row in historical} == {False, True}
     assert current == [{"run_name": "current-run", "is_current_corpus_version": True}]
+
+
+def test_phase3_relations_roles_and_empty_round_trip(database_url: str) -> None:
+    settings = DatabaseSettings(url=database_url, processed_data_root=Path("data/processed"))
+    inspector = inspect(create_database_engine(settings))
+    assert set(inspector.get_table_names()) >= PHASE3_TABLES
+    url = database_url.replace("postgresql+psycopg://", "postgresql://")
+    with psycopg.connect(url) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM global_roles WHERE role_key='admin'"
+        ).fetchone()[0] == 1
+        corpus_before = connection.execute(
+            "SELECT count(*) FROM speaker_turns"
+        ).fetchone()[0]
+    config = Config("alembic.ini")
+    command.downgrade(config, "20260724_03")
+    command.upgrade(config, "head")
+    with psycopg.connect(url) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM global_roles WHERE role_key='admin'"
+        ).fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM speaker_turns").fetchone()[0] == corpus_before
+
+
+def test_phase3_authentication_lockout_sessions_and_disable(
+    database_url: str,
+) -> None:
+    settings = _web_settings(database_url)
+    password = "correct horse phase3"
+    user = create_user(
+        settings,
+        "researcher",
+        "Researcher",
+        password,
+        must_change_password=False,
+    )
+    principal, token = authenticate(settings, "researcher", password)
+    assert principal.user_id == user["id"]
+    assert resolve_session(settings, token) is not None
+    revoke_session(settings, principal.session_id, principal.user_id)
+    assert resolve_session(settings, token) is None
+    for _ in range(2):
+        with pytest.raises(AuthenticationError, match="Sign-in failed"):
+            authenticate(settings, "researcher", "incorrect password")
+    with pytest.raises(AuthenticationError, match="Sign-in failed"):
+        authenticate(settings, "researcher", password)
+
+    second = create_user(
+        settings,
+        "disable-me",
+        "Disabled Researcher",
+        password,
+        must_change_password=False,
+    )
+    set_user_enabled(settings, int(second["id"]), False, int(second["id"]))
+    with pytest.raises(AuthenticationError, match="Sign-in failed"):
+        authenticate(settings, "disable-me", password)
+    url = database_url.replace("postgresql+psycopg://", "postgresql://")
+    with psycopg.connect(url) as connection:
+        hashes = connection.execute(
+            "SELECT password_hash FROM user_credentials"
+        ).fetchall()
+        assert all(password not in row[0] and row[0].startswith("$argon2id$") for row in hashes)
+        metadata = connection.execute(
+            "SELECT metadata::text FROM audit_events"
+        ).fetchall()
+        assert all(password not in row[0] and token not in row[0] for row in metadata)
+
+
+def test_phase3_project_batch_claim_annotation_and_permissions(
+    database_url: str, tmp_path: Path
+) -> None:
+    settings = _web_settings(database_url)
+    db_settings = settings.database
+    import_validated_run(
+        db_settings,
+        _fixture_run(tmp_path, run_id="phase3-corpus-fixture"),
+    )
+    for seed in (
+        Path("config/taxonomies/australian_policy_domains/0.1.0.yaml"),
+        Path("config/taxonomies/content_status/1.0.0.yaml"),
+    ):
+        load_taxonomy(db_settings, seed, repository_root=Path("."))
+    load_annotation_schema(
+        db_settings,
+        Path("config/annotation_schemas/australian_policy_annotation/0.1.0.yaml"),
+        repository_root=Path("."),
+    )
+    password = "phase three safe password"
+    create_user(
+        settings,
+        "phase3-admin",
+        "Phase 3 Admin",
+        password,
+        admin=True,
+        must_change_password=False,
+    )
+    create_user(
+        settings,
+        "annotator-a",
+        "Annotator A",
+        password,
+        must_change_password=False,
+    )
+    create_user(
+        settings,
+        "annotator-b",
+        "Annotator B",
+        password,
+        must_change_password=False,
+    )
+    admin, _ = authenticate(settings, "phase3-admin", password)
+    annotator_a, _ = authenticate(settings, "annotator-a", password)
+    annotator_b, _ = authenticate(settings, "annotator-b", password)
+    url = database_url.replace("postgresql+psycopg://", "postgresql://")
+    with psycopg.connect(url, row_factory=dict_row) as connection:
+        options = connection.execute(
+            """
+            SELECT c.id AS corpus_id,pr.id AS run_id,asv.id AS schema_id
+            FROM corpora c JOIN preprocessing_runs pr ON pr.corpus_id=c.id
+            CROSS JOIN annotation_schema_versions asv
+            LIMIT 1
+            """
+        ).fetchone()
+    assert options is not None
+    project = create_project(
+        settings,
+        admin,
+        slug="phase3-integration",
+        name="Phase 3 integration",
+        description="Synthetic integration workflow",
+        mode="development",
+        corpus_id=options["corpus_id"],
+        preprocessing_run_id=options["run_id"],
+        annotation_schema_version_id=options["schema_id"],
+    )
+    project_id = int(project["id"])
+    set_membership(settings, admin, project_id, annotator_a.user_id, "annotator")
+    set_membership(settings, admin, project_id, annotator_b.user_id, "annotator")
+    criteria = SelectionCriteria(minimum_words=0, limit=4, seed=314159)
+    preview = preview_batch(settings, admin, project_id, criteria)
+    assert preview["eligible_count"] >= 4
+    batch = generate_batch(
+        settings,
+        admin,
+        project_id,
+        name="Deterministic pilot",
+        criteria=criteria,
+    )
+    reused = generate_batch(
+        settings,
+        admin,
+        project_id,
+        name="Deterministic pilot",
+        criteria=criteria,
+    )
+    assert batch["selected_count"] == 4
+    assert reused["reused"] is True
+    with pytest.raises(ValueError, match="different criteria"):
+        generate_batch(
+            settings,
+            admin,
+            project_id,
+            name="Deterministic pilot",
+            criteria=SelectionCriteria(minimum_words=0, limit=3, seed=2),
+        )
+    transition_project(settings, admin, project_id, "active")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        claims = list(
+            executor.map(
+                lambda actor: claim_next(settings, actor, project_id),
+                (annotator_a, annotator_b),
+            )
+        )
+    claimed_ids = [claim["id"] for claim in claims if claim is not None]
+    assert len(claimed_ids) == 2
+    assert len(set(claimed_ids)) == 2
+
+    assignment_id = int(claims[0]["id"])
+    assignment = get_assignment(settings, annotator_a, assignment_id)
+    assert assignment["project_id"] == project_id
+    with pytest.raises(LookupError):
+        get_assignment(settings, annotator_b, assignment_id)
+    draft = {
+        "content_status": "substantive_policy",
+        "primary_australian_domain": None,
+        "secondary_australian_domains": [],
+        "specific_australian_issue": None,
+        "topic_uncertain": False,
+        "fallback_explanation": None,
+        "unclassifiable_reason": None,
+        "annotation_notes": "Draft note",
+    }
+    first = save_annotation(
+        settings, annotator_a, assignment_id, draft, event_type="draft_saved"
+    )
+    reused_draft = save_annotation(
+        settings, annotator_a, assignment_id, draft, event_type="draft_saved"
+    )
+    assert first["revision_number"] == 1
+    assert reused_draft["reused"] is True
+    submitted = {
+        **draft,
+        "primary_australian_domain": "AU03",
+        "annotation_notes": "Submitted note",
+    }
+    final = save_annotation(
+        settings, annotator_a, assignment_id, submitted, event_type="submitted"
+    )
+    assert final["revision_number"] == 2
+    with psycopg.connect(url) as connection:
+        assert connection.execute(
+            """
+            SELECT count(*) FROM annotation_versions av
+            JOIN annotations an ON an.id=av.annotation_id
+            WHERE an.assignment_id=%s
+            """,
+            (assignment_id,),
+        ).fetchone()[0] == 2
+        with pytest.raises(psycopg.errors.ObjectNotInPrerequisiteState):
+            connection.execute(
+                "UPDATE annotation_versions SET revision_number=9 WHERE annotation_id=%s",
+                (first["annotation_id"],),
+            )
+        connection.rollback()
+    transition_project(settings, admin, project_id, "paused")
+    with pytest.raises(PermissionDenied, match="active"):
+        claim_next(settings, annotator_a, project_id)
+
+
+def test_phase3_browser_auth_csrf_headers_and_generic_errors(
+    database_url: str,
+) -> None:
+    settings = _web_settings(database_url)
+    password = "browser testing password"
+    create_user(
+        settings,
+        "browser-user",
+        "Browser User",
+        password,
+        must_change_password=False,
+    )
+    with TestClient(create_app(settings)) as client:
+        assert client.get("/health/live").json() == {"status": "ok"}
+        assert client.get("/health/ready").json() == {"status": "ok"}
+        login_page = client.get("/login")
+        assert login_page.status_code == 200
+        assert "Content-Security-Policy" in login_page.headers
+        assert login_page.headers["X-Frame-Options"] == "DENY"
+        login_csrf = client.cookies.get("hansard_login_csrf")
+        assert login_csrf
+        rejected = client.post(
+            "/login",
+            data={
+                "username": "browser-user",
+                "password": "wrong password",
+                "csrf_token": login_csrf,
+            },
+        )
+        assert rejected.status_code == 400
+        assert "Username or password was not accepted" in rejected.text
+        assert "$argon2" not in rejected.text
+
+        login_csrf = client.cookies.get("hansard_login_csrf")
+        accepted = client.post(
+            "/login",
+            data={
+                "username": "browser-user",
+                "password": password,
+                "csrf_token": login_csrf,
+            },
+            follow_redirects=False,
+        )
+        assert accepted.status_code == 303
+        session_token = client.cookies.get(SESSION_COOKIE)
+        assert session_token
+        assert client.get("/").status_code == 200
+        assert client.post("/logout", data={"csrf_token": "invalid"}).status_code == 403
+        principal = resolve_session(settings, session_token)
+        assert principal is not None
+        logout = client.post(
+            "/logout",
+            data={"csrf_token": principal.csrf_token},
+            follow_redirects=False,
+        )
+        assert logout.status_code == 303
+        assert resolve_session(settings, session_token) is None
+
+
+def test_two_pass_aukus_derivation_pins_source_annotation_version(
+    database_url: str, tmp_path: Path
+) -> None:
+    settings = _web_settings(database_url)
+    import_validated_run(
+        settings.database,
+        _fixture_run(tmp_path, run_id="two-pass-corpus-fixture"),
+    )
+    load_taxonomy(
+        settings.database,
+        Path("config/taxonomies/australian_policy_domains/0.1.0.yaml"),
+        repository_root=Path("."),
+    )
+    for seed in (
+        Path("config/annotation_schemas/australian_policy_annotation/0.2.0.yaml"),
+        Path("config/annotation_schemas/australian_aukus_screen/0.1.0.yaml"),
+    ):
+        load_annotation_schema(settings.database, seed, repository_root=Path("."))
+
+    password = "two pass prototype password"
+    create_user(
+        settings,
+        "prototype-admin",
+        "Prototype Admin",
+        password,
+        admin=True,
+        must_change_password=False,
+    )
+    create_user(
+        settings,
+        "prototype-coder",
+        "Prototype Coder",
+        password,
+        must_change_password=False,
+    )
+    admin, admin_token = authenticate(settings, "prototype-admin", password)
+    coder, _ = authenticate(settings, "prototype-coder", password)
+    url = database_url.replace("postgresql+psycopg://", "postgresql://")
+    with psycopg.connect(url, row_factory=dict_row) as connection:
+        pins = connection.execute(
+            """
+            SELECT c.id AS corpus_id,pr.id AS run_id,
+                   general.id AS general_schema_id,auk.id AS aukus_schema_id
+            FROM corpora c JOIN preprocessing_runs pr ON pr.corpus_id=c.id
+            JOIN annotation_schemas general_schema
+              ON general_schema.slug='australian_policy_annotation'
+            JOIN annotation_schema_versions general
+              ON general.annotation_schema_id=general_schema.id
+             AND general.version='0.2.0'
+            JOIN annotation_schemas auk_schema
+              ON auk_schema.slug='australian_aukus_screen'
+            JOIN annotation_schema_versions auk
+              ON auk.annotation_schema_id=auk_schema.id AND auk.version='0.1.0'
+            LIMIT 1
+            """
+        ).fetchone()
+    assert pins is not None
+    general = create_project(
+        settings,
+        admin,
+        slug="conference-general-pass",
+        name="Conference general pass",
+        description="Synthetic two-pass integration project",
+        mode="development",
+        corpus_id=pins["corpus_id"],
+        preprocessing_run_id=pins["run_id"],
+        annotation_schema_version_id=pins["general_schema_id"],
+    )
+    general_id = int(general["id"])
+    set_membership(settings, admin, general_id, coder.user_id, "annotator")
+    generate_batch(
+        settings,
+        admin,
+        general_id,
+        name="General source",
+        criteria=SelectionCriteria(minimum_words=0, limit=2, seed=20260810),
+    )
+    transition_project(settings, admin, general_id, "active")
+    source_assignment = claim_next(settings, coder, general_id)
+    assert source_assignment is not None
+    source_assignment_id = int(source_assignment["id"])
+    source_submission = save_annotation(
+        settings,
+        coder,
+        source_assignment_id,
+        {
+            "is_non_policy": False,
+            "primary_australian_domain": "AU12",
+            "secondary_australian_domains": [],
+            "fallback_explanation": None,
+            "annotation_notes": None,
+        },
+        event_type="submitted",
+    )
+
+    first_export = build_ai_codebook_export(settings, admin, general_id)
+    second_export = build_ai_codebook_export(settings, admin, general_id)
+    assert first_export.content == second_export.content
+    assert first_export.record_count == 1
+    assert first_export.snapshot_sha256[:12] in first_export.filename
+    with zipfile.ZipFile(io.BytesIO(first_export.content)) as archive:
+        assert archive.namelist() == [
+            "AI_INSTRUCTIONS.md",
+            "CODEBOOK_CONTEXT.json",
+            "annotations.csv",
+            "annotations.jsonl",
+            "manifest.json",
+        ]
+        manifest = json.loads(archive.read("manifest.json"))
+        record = json.loads(archive.read("annotations.jsonl"))
+        context = json.loads(archive.read("CODEBOOK_CONTEXT.json"))
+        assert manifest["record_count"] == 1
+        assert manifest["privacy"]["annotator_identity_included"] is False
+        assert manifest["privacy"]["raw_xml_included"] is False
+        assert record["speech"]["text"]
+        assert record["human_annotation"]["values"][
+            "primary_australian_domain"
+        ] == "AU12"
+        assert record["human_annotation"]["readable_fields"][1]["value"][
+            "label"
+        ]
+        assert context["schema"]["version"] == "0.2.0"
+        combined = b"".join(archive.read(name) for name in archive.namelist())
+        assert b"prototype-admin" not in combined
+        assert b"prototype-coder" not in combined
+    with pytest.raises(PermissionDenied):
+        build_ai_codebook_export(settings, coder, general_id)
+    first_csv = build_annotation_export(settings, admin, general_id, "simple_csv")
+    second_csv = build_annotation_export(settings, admin, general_id, "simple_csv")
+    assert first_csv.content == second_csv.content
+    assert first_csv.media_type == "text/csv"
+    assert first_csv.filename.endswith(".csv")
+    csv_rows = list(
+        csv.DictReader(io.StringIO(first_csv.content.decode("utf-8-sig")))
+    )
+    assert len(csv_rows) == 1
+    assert csv_rows[0]["primary_australian_domain"] == "AU12"
+    assert csv_rows[0]["primary_australian_domain_label"]
+    assert csv_rows[0]["speech_text"]
+    assert "annotation_notes" in csv_rows[0]
+    with TestClient(create_app(settings)) as client:
+        client.cookies.set(SESSION_COOKIE, admin_token)
+        new_project_page = client.get("/projects/new")
+        assert new_project_page.status_code == 200
+        assert "Create a pinned research project" in new_project_page.text
+        assert "Australian Policy Annotation 0.2.0" in new_project_page.text
+        download = client.post(
+            f"/projects/{general_id}/exports/annotations",
+            data={"csrf_token": admin.csrf_token, "export_type": "ai_codebook"},
+        )
+        assert download.status_code == 200
+        assert download.headers["content-type"] == "application/zip"
+        assert "ai-codebook-input" in download.headers["content-disposition"]
+        assert download.headers["cache-control"] == "no-store"
+        with zipfile.ZipFile(io.BytesIO(download.content)) as archive:
+            assert json.loads(archive.read("manifest.json"))["record_count"] == 1
+        csv_download = client.post(
+            f"/projects/{general_id}/exports/annotations",
+            data={"csrf_token": admin.csrf_token, "export_type": "simple_csv"},
+        )
+        assert csv_download.status_code == 200
+        assert csv_download.headers["content-type"].startswith("text/csv")
+        assert "annotated-data" in csv_download.headers["content-disposition"]
+        assert next(
+            csv.DictReader(io.StringIO(csv_download.content.decode("utf-8-sig")))
+        )["primary_australian_domain_label"]
+
+    aukus = create_project(
+        settings,
+        admin,
+        slug="conference-aukus-pass",
+        name="Conference AUKUS pass",
+        description="Synthetic AU12-derived AUKUS screen",
+        mode="development",
+        corpus_id=pins["corpus_id"],
+        preprocessing_run_id=pins["run_id"],
+        annotation_schema_version_id=pins["aukus_schema_id"],
+        source_project_id=general_id,
+    )
+    aukus_id = int(aukus["id"])
+    set_membership(settings, admin, aukus_id, coder.user_id, "annotator")
+    criteria = SelectionCriteria(source_domain_code="AU12", limit=10, seed=20260810)
+    assert preview_batch(settings, admin, aukus_id, criteria) == {
+        "eligible_count": 1,
+        "selected_count": 1,
+    }
+    derived_batch = generate_batch(
+        settings,
+        admin,
+        aukus_id,
+        name="AUKUS source screen",
+        criteria=criteria,
+    )
+    assert derived_batch["selected_count"] == 1
+    with psycopg.connect(url, row_factory=dict_row) as connection:
+        provenance = connection.execute(
+            """
+            SELECT t.source_annotation_version_id,av.values_sha256,
+                   an.current_version_id
+            FROM tasks t JOIN annotation_versions av
+              ON av.id=t.source_annotation_version_id
+            JOIN annotations an ON an.id=av.annotation_id
+            WHERE t.project_id=%s
+            """,
+            (aukus_id,),
+        ).fetchone()
+    assert provenance is not None
+    pinned_source_version = int(provenance["source_annotation_version_id"])
+    assert pinned_source_version == int(provenance["current_version_id"])
+    assert source_submission["sha256"] == provenance["values_sha256"]
+
+    transition_project(settings, admin, aukus_id, "active")
+    derived_assignment = claim_next(settings, coder, aukus_id)
+    assert derived_assignment is not None
+    derived_detail = get_assignment(settings, coder, int(derived_assignment["id"]))
+    assert derived_detail["source_annotation_version_id"] == pinned_source_version
+    save_annotation(
+        settings,
+        coder,
+        int(derived_assignment["id"]),
+        {"discusses_aukus": True, "annotation_notes": None},
+        event_type="submitted",
+    )
+
+    save_annotation(
+        settings,
+        coder,
+        source_assignment_id,
+        {
+            "is_non_policy": False,
+            "primary_australian_domain": "AU12",
+            "secondary_australian_domains": [],
+            "fallback_explanation": None,
+            "annotation_notes": "Later source revision",
+        },
+        event_type="revised",
+    )
+    with psycopg.connect(url, row_factory=dict_row) as connection:
+        after_revision = connection.execute(
+            """
+            SELECT t.source_annotation_version_id,an.current_version_id
+            FROM tasks t JOIN annotation_versions av
+              ON av.id=t.source_annotation_version_id
+            JOIN annotations an ON an.id=av.annotation_id
+            WHERE t.project_id=%s
+            """,
+            (aukus_id,),
+        ).fetchone()
+    assert after_revision is not None
+    assert int(after_revision["source_annotation_version_id"]) == pinned_source_version
+    assert int(after_revision["current_version_id"]) != pinned_source_version

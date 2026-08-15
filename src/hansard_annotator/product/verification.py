@@ -165,28 +165,26 @@ def verify_product_foundation(
     }
     if actual_fields != expected_fields or "cap" in " ".join(taxonomy_slugs).lower():
         raise ProductVerificationError("initial annotation schema is invalid or requires CAP")
-    forbidden = {
+    phase3_relations = {
         "users",
-        "annotation_projects",
+        "projects",
+        "batches",
+        "tasks",
         "assignments",
         "annotations",
-        "adjudications",
+        "annotation_versions",
     }
-    forbidden_rows = connection.execute(
+    phase3_rows = connection.execute(
             """
             SELECT table_name FROM information_schema.tables
             WHERE table_schema='public' AND table_name=ANY(%s)
             """,
-            (list(forbidden),),
+            (list(phase3_relations),),
         ).fetchall()
-    existing_forbidden = {
+    existing_phase3 = {
         row["table_name"] if isinstance(row, dict) else row[0]
-        for row in forbidden_rows
+        for row in phase3_rows
     }
-    if existing_forbidden:
-        raise ProductVerificationError(
-            f"Phase 3 tables exist unexpectedly: {sorted(existing_forbidden)}"
-        )
     return {
         "ok": True,
         "corpus_slug": "australian-house-representatives-hansard",
@@ -196,6 +194,6 @@ def verify_product_foundation(
         "content_status_labels": statuses,
         "annotation_schema_fields": len(fields),
         "cap_required": False,
-        "phase3_tables": [],
+        "phase3_tables": sorted(existing_phase3),
         "phase2": phase2,
     }

@@ -1,0 +1,6 @@
+{% extends "base.html" %}
+{% block title %}Audit events{% endblock %}
+{% block content %}
+<div><p class="eyebrow">Security and workflow evidence</p><h1 class="mt-2 text-4xl font-semibold">Audit events</h1><p class="mt-2 text-muted">Sanitised identifiers and state transitions only.</p></div>
+<section class="surface mt-7 overflow-x-auto"><table><thead><tr><th>Time</th><th>Actor</th><th>Event</th><th>Entity</th><th>Project</th><th>Metadata</th></tr></thead><tbody>{% for event in events %}<tr><td>{{ event.occurred_at }}</td><td>{{ event.username or 'System' }}</td><td>{{ event.event_type }}</td><td>{{ event.entity_type }}</td><td>{{ event.project_name or '—' }}</td><td><code>{{ event.metadata }}</code></td></tr>{% endfor %}</tbody></table></section>
+{% endblock %}

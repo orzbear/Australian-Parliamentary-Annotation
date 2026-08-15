@@ -1,0 +1,24 @@
+slug: australian_aukus_screen
+name: Australian AUKUS Screen
+description: Narrow second-pass screen for AUKUS among general-domain AU12 speeches.
+schema_type: content_coding
+version: 0.1.0
+status: draft
+version_description: Initial AUKUS-only conference prototype.
+fields:
+  - field_key: discusses_aukus
+    label: AUKUS discussion
+    help_text: Check when the speech substantively discusses AUKUS, rather than making only a passing or unrelated defence reference.
+    field_type: boolean
+    display_order: 1
+    required: true
+    validation_rules: {default: false}
+    ui_hints:
+      control: checkbox
+      checked_label: This speech substantively discusses AUKUS
+  - field_key: annotation_notes
+    label: Annotation notes
+    help_text: Optional note about the AUKUS decision.
+    field_type: long_text
+    display_order: 2
+    required: false

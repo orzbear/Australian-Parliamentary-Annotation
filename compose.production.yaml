@@ -1,0 +1,133 @@
+name: hansard-annotator
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+x-app-environment: &app-environment
+  HANSARD_DATABASE_URL: postgresql+psycopg://${HANSARD_APP_DB_USER}:${HANSARD_APP_DB_PASSWORD}@postgres:5432/${POSTGRES_DB}
+  HANSARD_PROCESSED_DATA_ROOT: /var/empty/hansard-processed
+  HANSARD_APP_ENV: production
+  HANSARD_SESSION_SECRET: ${HANSARD_SESSION_SECRET}
+  HANSARD_COOKIE_SECURE: "true"
+  HANSARD_ALLOWED_HOSTS: ${HANSARD_DOMAIN}
+  HANSARD_BASE_URL: https://${HANSARD_DOMAIN}
+  HANSARD_SESSION_IDLE_MINUTES: ${HANSARD_SESSION_IDLE_MINUTES:-60}
+  HANSARD_SESSION_ABSOLUTE_HOURS: ${HANSARD_SESSION_ABSOLUTE_HOURS:-12}
+  HANSARD_MINIMUM_PASSWORD_LENGTH: ${HANSARD_MINIMUM_PASSWORD_LENGTH:-14}
+  HANSARD_LOGIN_LOCKOUT_FAILURES: ${HANSARD_LOGIN_LOCKOUT_FAILURES:-5}
+  HANSARD_LOGIN_LOCKOUT_MINUTES: ${HANSARD_LOGIN_LOCKOUT_MINUTES:-15}
+  HANSARD_LOG_LEVEL: ${HANSARD_LOG_LEVEL:-INFO}
+
+services:
+  postgres:
+    image: postgres:16.14-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      HANSARD_APP_DB_USER: ${HANSARD_APP_DB_USER}
+      HANSARD_APP_DB_PASSWORD: ${HANSARD_APP_DB_PASSWORD}
+    volumes:
+      - hansard-postgres-data:/var/lib/postgresql/data
+      - ./deploy/postgres/init-roles.sh:/docker-entrypoint-initdb.d/10-hansard-roles.sh:ro
+    networks:
+      - database
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    shm_size: 256mb
+    mem_limit: 2g
+    cpus: 1.0
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+
+  web:
+    image: hansard-annotator:${HANSARD_IMAGE_TAG:-pilot}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment: *app-environment
+    expose:
+      - "8000"
+    networks:
+      - frontend
+      - database
+    depends_on:
+      postgres:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 1g
+    cpus: 1.0
+    stop_grace_period: 30s
+    logging: *default-logging
+
+  migrate:
+    image: hansard-annotator:${HANSARD_IMAGE_TAG:-pilot}
+    profiles: ["tools"]
+    environment:
+      <<: *app-environment
+      HANSARD_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    command: ["python", "-m", "hansard_annotator.db.cli", "migrate"]
+    networks:
+      - database
+    depends_on:
+      postgres:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+
+  caddy:
+    image: caddy:2.11.4-alpine
+    restart: unless-stopped
+    environment:
+      HANSARD_DOMAIN: ${HANSARD_DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      - frontend
+    depends_on:
+      web:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    cpus: 0.25
+    logging: *default-logging
+
+networks:
+  frontend:
+  database:
+    internal: true
+
+volumes:
+  hansard-postgres-data:
+  caddy-data:
+  caddy-config:

@@ -5,14 +5,14 @@ House of Representatives Hansard. The research objective is to study issue-speci
 out-party-directed hostility while retaining enough provenance to reconstruct every
 published analytical dataset.
 
-Phases 0, 1, 2, and 2.5 are complete. Phase 1 provides a read-only, versioned preprocessing
+Phases 0 through 3 are complete. Phase 1 provides a read-only, versioned preprocessing
 pipeline that emits explicit-schema Parquet datasets and audit/anomaly reports. Phase 2
 provides the PostgreSQL 16 corpus schema, Alembic migration, transactional COPY/staging
 importer, reconciliation tools, read-oriented views, and real-PostgreSQL tests. Phase 2.5
 adds the corpus registry, bounded source-adapter registry, and versioned taxonomy and
-annotation-schema templates. Phase 3
-has not started: there is no authentication, annotation workflow, web application,
-deployment, LLM workflow, political enrichment, or Telegram/Hermes integration.
+annotation-schema templates. Phase 3 adds the secure research annotation web MVP.
+Production deployment, adjudication/agreement, LLM workflows, political enrichment,
+CAP, hostility coding, and Telegram/Hermes remain deliberately absent.
 
 ## Safety invariants
 
@@ -192,6 +192,116 @@ Australian discovery/preprocessing code; no third-party plugin loading occurs.
 
 Publication boundaries are in [the licensing policy](docs/LICENSING_AND_DATA_POLICY.md)
 and terminology in [the glossary](docs/GLOSSARY.md). CAP, other parliament adapters,
-projects, assignments, annotations, and all web/API functionality remain unimplemented.
-The completed migration and acceptance evidence are in
+and production publication remain unimplemented. The foundation evidence is in
 [the Phase 2.5 report](docs/PHASE_2_5_REPORT.md).
+
+## Phase 3 web MVP
+
+Copy `.env.example` to the ignored `.env`, set the database values and a unique
+`HANSARD_SESSION_SECRET` of at least 32 characters, then install/build the pinned
+assets and migrate explicitly:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.lock
+npm.cmd ci
+npm.cmd run build
+docker compose --env-file .env -f compose.dev.yaml up -d --wait postgres
+.\.venv\Scripts\python.exe -m hansard_annotator.db.cli migrate
+```
+
+Create the first administrator without placing a password on the command line:
+
+```powershell
+$env:FIRST_ADMIN_PASSWORD = Read-Host "Temporary password"
+.\.venv\Scripts\python.exe -m hansard_annotator.web.cli create-user owner `
+  --display-name "Project owner" --admin --password-env FIRST_ADMIN_PASSWORD
+Remove-Item Env:FIRST_ADMIN_PASSWORD
+```
+
+Start the local application:
+
+```powershell
+npm.cmd run dev
+```
+
+This launches the FastAPI development server with reload enabled, using the project
+virtual environment and `.env`. Open <http://127.0.0.1:8000>. `npm.cmd run build` only
+rebuilds the local CSS and HTMX assets; npm is not the application runtime.
+
+The application never migrates on startup. Development/pilot projects may pin the
+explicit draft schema and taxonomies; production-mode projects reject drafts. Account
+creation, password reset/disable/enable, session revocation, and development seeding are
+administrator CLI operations (`python -m hansard_annotator.web.cli --help`).
+
+Run the isolated PostgreSQL suite with `HANSARD_TEST_DATABASE_URL` set, then run the
+gated browser workflow against a seeded local instance:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\python.exe -m ruff check .
+.\.venv\Scripts\python.exe -m mypy
+.\.venv\Scripts\python.exe -m pytest tests/browser/test_phase3_browser.py
+```
+
+See the [Phase 3 report](docs/PHASE_3_REPORT.md), [design](docs/PHASE_3_DESIGN.md),
+[security model](docs/PHASE_3_SECURITY_MODEL.md), and
+[UI style guide](docs/UI_STYLE_GUIDE.md).
+
+## Conference two-pass prototype
+
+The development-only conference prototype separates fast general-domain coding from a
+derived AUKUS screen. General schema `0.2.0` assumes policy, completes entirely non-policy
+turns through one checkbox, and hides optional secondary topics. A separate AUKUS project
+selects only submitted general annotations containing AU12 as primary or secondary and pins
+the exact qualifying annotation version on every derived task.
+
+Apply revision `20260810_05`, load both draft seeds, then seed the projects:
+
+```powershell
+.\.venv\Scripts\python.exe -m hansard_annotator.db.cli migrate
+.\.venv\Scripts\python.exe -m hansard_annotator.product.cli schema load `
+  config/annotation_schemas/australian_policy_annotation/0.2.0.yaml
+.\.venv\Scripts\python.exe -m hansard_annotator.product.cli schema load `
+  config/annotation_schemas/australian_aukus_screen/0.1.0.yaml
+.\.venv\Scripts\python.exe -m hansard_annotator.web.cli `
+  seed-conference-prototype --admin-username owner
+```
+
+See [the prototype design and checkpoint](docs/CONFERENCE_TWO_PASS_PROTOTYPE.md). Existing
+Phase 3 annotations remain on their original pinned schema and are not converted.
+
+### Export annotated pilot data
+
+Project administrators and project managers can open a project with submitted annotations
+and use **Export annotated data**. Choose one of two deterministic outputs:
+
+- **Simple annotated data — CSV:** one speech per row, with separate annotation-code and
+  readable topic-label columns for ordinary analysis; or
+- **AI codebook drafting package — ZIP:** a richer package containing:
+
+  - `AI_INSTRUCTIONS.md`, ready to give to an AI agent;
+  - `annotations.jsonl`, the preferred complete machine-readable records;
+  - `annotations.csv`, a spreadsheet-readable copy;
+  - `CODEBOOK_CONTEXT.json`, the pinned schema and topic definitions; and
+  - `manifest.json`, provenance, privacy notes and SHA-256 checksums.
+
+Only current submitted/revised human annotation versions are exported. Clean speech text,
+public parliamentary context and annotation notes are included; annotator identities,
+drafts, credentials, raw XML and internal database IDs are excluded. Review free-text notes
+before sharing an export externally. The optional AI package uses no AI API and incurs no
+model API charge.
+
+## Private pilot deployment
+
+The reviewed Hostinger target is `annotator.polisde.tech`. Production deployment uses
+`compose.production.yaml`: Caddy is the only public service, FastAPI runs non-root/read-only,
+and PostgreSQL 16 is private with a persistent volume and separate application login. Web
+startup never migrates automatically. Follow the guarded
+[pilot deployment runbook](docs/PILOT_DEPLOYMENT_RUNBOOK.md) before any VPS mutation.
+
+The deployment remains separate from the existing Hermes compose project and data. Never
+expose ports 5432/8000 or run `docker compose down -v`. Hostinger snapshots do not replace
+custom-format PostgreSQL backups, checksums and encrypted off-VPS copies.
+
+Repository changes do not update the live domain automatically. The reviewed branch, CI and
+manual pilot deployment process is documented in [the CI/CD policy](docs/CI_CD.md).

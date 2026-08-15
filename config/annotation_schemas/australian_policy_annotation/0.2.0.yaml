@@ -1,0 +1,63 @@
+slug: australian_policy_annotation
+name: Australian Policy Annotation
+description: Reusable initial schema for content status and Australian policy-domain coding.
+schema_type: policy_annotation
+version: 0.2.0
+status: draft
+version_description: Policy-by-default general-domain pass with optional hidden secondary topics.
+fields:
+  - field_key: is_non_policy
+    label: Entirely non-policy
+    help_text: Check only when the whole turn is procedural, ceremonial or otherwise contains no substantive public-policy discussion.
+    field_type: boolean
+    display_order: 1
+    required: true
+    validation_rules: {default: false}
+    ui_hints:
+      control: checkbox
+      checked_label: This speech is entirely non-policy
+  - field_key: primary_australian_domain
+    label: Primary policy topic
+    help_text: Select the one general Australian policy domain that best represents the turn.
+    field_type: single_taxonomy
+    display_order: 2
+    required: false
+    taxonomy: {slug: australian_policy_domains, version: 0.1.0}
+    requirement_rules:
+      required_when:
+        field_equals: {field: is_non_policy, value: false}
+      null_unless:
+        field_equals: {field: is_non_policy, value: false}
+  - field_key: secondary_australian_domains
+    label: Secondary policy topics
+    help_text: Optionally select up to two additional substantive domains; do not code passing references.
+    field_type: multiple_taxonomy
+    display_order: 3
+    required: false
+    taxonomy: {slug: australian_policy_domains, version: 0.1.0}
+    minimum_items: 0
+    maximum_items: 2
+    validation_rules:
+      unique_items: true
+      different_from_field: primary_australian_domain
+      excluded_codes: [AU_OTHER_REVIEW]
+    requirement_rules:
+      null_unless:
+        field_equals: {field: is_non_policy, value: false}
+    ui_hints:
+      reveal_control_label: Add secondary topics
+  - field_key: fallback_explanation
+    label: Other-topic explanation
+    help_text: Briefly explain why none of the listed general domains applies.
+    field_type: long_text
+    display_order: 4
+    required: false
+    requirement_rules:
+      required_when:
+        taxonomy_code_equals: {field: primary_australian_domain, value: AU_OTHER_REVIEW}
+  - field_key: annotation_notes
+    label: Annotation notes
+    help_text: Optional coder notes.
+    field_type: long_text
+    display_order: 5
+    required: false

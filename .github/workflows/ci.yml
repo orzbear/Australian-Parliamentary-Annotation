@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality-and-production-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16.14-bookworm
+        env:
+          POSTGRES_DB: hansard_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ci-only-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d hansard_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12.13"
+          cache: pip
+          cache-dependency-path: requirements.lock
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install locked dependencies
+        run: |
+          python -m pip install -r requirements.lock
+          npm ci
+          npm audit --audit-level=moderate
+
+      - name: Build browser assets reproducibly
+        run: |
+          npm run build
+          git diff --exit-code -- src/hansard_annotator/web/static/dist
+
+      - name: Lint and type-check
+        run: |
+          python -m ruff check .
+          python -m mypy
+
+      - name: Run unit and fixture tests
+        run: python -m pytest -q
+
+      - name: Exercise migrations on real PostgreSQL
+        env:
+          HANSARD_TEST_DATABASE_URL: postgresql+psycopg://postgres:ci-only-password@127.0.0.1:5432/hansard_test
+        run: >-
+          python -m pytest -q
+          tests/integration/test_phase2_database.py::test_migration_schema_downgrade_and_upgrade
+
+      - name: Validate production Compose model
+        env:
+          HANSARD_DOMAIN: annotator.example.test
+          ACME_EMAIL: ci@example.test
+          POSTGRES_DB: hansard
+          POSTGRES_USER: hansard_owner
+          POSTGRES_PASSWORD: ci-owner-password
+          HANSARD_APP_DB_USER: hansard_app
+          HANSARD_APP_DB_PASSWORD: ci-app-password
+          HANSARD_SESSION_SECRET: ci-session-secret-that-is-long-enough-for-validation
+        run: |
+          docker compose -f compose.production.yaml config --quiet
+          test "$(docker compose -f compose.production.yaml config --services | sort | xargs)" = "caddy postgres web"
+
+      - name: Validate Caddy configuration
+        run: >-
+          docker run --rm
+          -e HANSARD_DOMAIN=annotator.example.test
+          -e ACME_EMAIL=ci@example.test
+          -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro"
+          caddy:2.11.4-alpine
+          caddy validate --config /etc/caddy/Caddyfile
+
+      - name: Build production image
+        run: docker build --tag hansard-annotator:ci .

@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% from "components/macros.html" import badge %}
+{% block title %}Dashboard · Hansard Workspace{% endblock %}
+{% block content %}
+<div class="flex flex-wrap items-end justify-between gap-4">
+  <div><p class="eyebrow">Personal workspace</p><h1 class="mt-2 text-4xl font-semibold tracking-tight">Good to see you, {{ principal.display_name }}</h1><p class="mt-2 text-muted">Continue your assigned research work or inspect recent progress.</p></div>
+</div>
+<section class="stats-grid mt-8" aria-label="Task summary">
+  {% for key, label in [('assigned','Assigned'),('drafts','Drafts'),('submitted','Submitted'),('skipped','Skipped'),('flagged','Flagged')] %}
+  <article class="stat"><span>{{ label }}</span><strong>{{ counts[key] or 0 }}</strong></article>
+  {% endfor %}
+</section>
+<div class="mt-8 grid gap-7 lg:grid-cols-[1.5fr_1fr]">
+  <section class="surface p-6">
+    <div class="flex items-center justify-between"><div><p class="eyebrow">Your queue</p><h2 class="mt-1 text-2xl font-semibold">Ready to continue</h2></div></div>
+    {% if queue %}
+    <div class="mt-5 divide-y divide-slate-200">
+      {% for item in queue %}
+      <a class="queue-row" href="/assignments/{{ item.id }}">
+        <div><strong>{{ item.speaker_name_raw or 'Unknown speaker' }}</strong><p>{{ item.project_name }} · schema {{ item.schema_version }} · {{ item.speech_date }}</p></div>
+        <div class="text-right">{{ badge(item.status) }}<p class="mt-1 text-sm text-muted">{{ item.calculated_word_count }} words</p></div>
+      </a>
+      {% endfor %}
+    </div>
+    {% else %}
+    <div class="empty-state mt-6"><h3>No personal assignments yet</h3><p>Open an active project to claim available research work.</p></div>
+    {% endif %}
+  </section>
+  <section class="surface p-6">
+    <p class="eyebrow">Projects</p><h2 class="mt-1 text-2xl font-semibold">Your studies</h2>
+    <div class="mt-5 space-y-3">
+      {% for project in projects %}
+      <a class="project-mini" href="/projects/{{ project.id }}"><div><strong>{{ project.name }}</strong><p>Schema {{ project.schema_version }} · {{ project.submitted_count }} / {{ project.task_count }} submitted · {{ project.run_name }}</p></div>{{ badge(project.status) }}</a>
+      {% else %}<div class="empty-state"><p>No projects are assigned.</p></div>{% endfor %}
+    </div>
+  </section>
+</div>
+{% endblock %}

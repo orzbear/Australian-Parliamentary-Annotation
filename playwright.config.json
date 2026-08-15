@@ -1,0 +1,9 @@
+{
+  "base_url_environment": "HANSARD_BROWSER_BASE_URL",
+  "default_timeout_ms": 10000,
+  "desktop_viewport": {"width": 1440, "height": 1000},
+  "mobile_viewport": {"width": 390, "height": 844},
+  "screenshots": "docs/screenshots/phase3",
+  "browser": "chromium",
+  "headless": true
+}
