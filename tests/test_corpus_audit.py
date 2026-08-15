@@ -144,9 +144,8 @@ class AuditSafetyAndCoverageTests(unittest.TestCase):
 
     def test_raw_xml_directory_is_ignored_by_git(self) -> None:
         raw_example = RAW_ROOT / "2010" / "2010-02-02.xml"
-        self.assertTrue(raw_example.is_file())
         result = subprocess.run(
-            ["git", "check-ignore", "--quiet", str(raw_example)],
+            ["git", "check-ignore", "--quiet", "--no-index", str(raw_example)],
             cwd=REPOSITORY_ROOT,
             env={
                 **os.environ,

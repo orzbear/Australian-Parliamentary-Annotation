@@ -21,11 +21,12 @@ separate, auditable operation.
 
 ## Continuous integration
 
-`.github/workflows/ci.yml` runs on pushes to `main` and the current Phase 3 branch, and on
-pull requests to `main`. It uses read-only repository permissions and immutable commit pins
-for GitHub-maintained actions. It builds browser assets, runs lint/type/unit checks, exercises
-migrations on PostgreSQL 16, validates the production Compose/Caddy configuration, and builds
-the production image. It never receives production credentials or corpus data.
+`.github/workflows/ci.yml` runs on pull requests to `main` and again after accepted changes
+are merged into `main`. This avoids duplicate push and pull-request runs for feature branches.
+It uses read-only repository permissions and immutable commit pins for GitHub-maintained
+actions. It builds browser assets, runs lint/type/unit checks, exercises migrations on
+PostgreSQL 16, validates the production Compose/Caddy configuration, and builds the production
+image. It never receives production credentials or corpus data.
 
 Configure `main` branch protection to require the `CI / quality-and-production-build` check
 before merging. Keep the repository private while licensing/publication decisions remain
@@ -48,4 +49,3 @@ single-production concurrency group. Do not install a self-hosted Actions runner
 Automatic deployment on every push is deliberately not enabled for the pilot. A failed test,
 accidental push, or compromised dependency must not immediately modify the research service
 or its database.
-
