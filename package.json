@@ -10,6 +10,6 @@
   },
   "devDependencies": {
     "htmx.org": "2.0.6",
-    "tailwindcss": "3.4.17"
+    "tailwindcss": "4.3.3"
   }
 }
