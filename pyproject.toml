@@ -10,17 +10,24 @@ readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "alembic>=1.14,<2",
+    "argon2-cffi>=23.1,<26",
+    "fastapi>=0.116,<1",
+    "jinja2>=3.1,<4",
     "lxml>=5.3,<7",
+    "python-multipart>=0.0.20,<1",
     "psycopg[binary]>=3.2,<4",
     "pyarrow>=18,<25",
     "PyYAML>=6,<7",
     "SQLAlchemy>=2.0,<3",
+    "uvicorn[standard]>=0.35,<1",
 ]
 
 [project.optional-dependencies]
 dev = [
     "mypy>=1.14,<2",
     "lxml-stubs>=0.5,<1",
+    "httpx>=0.28,<1",
+    "playwright>=1.54,<2",
     "psutil>=6,<8",
     "pytest>=8,<9",
     "ruff>=0.9,<1",
@@ -32,9 +39,16 @@ dev = [
 hansard-preprocess = "hansard_annotator.corpus.cli:main"
 hansard-db = "hansard_annotator.db.cli:main"
 hansard-product = "hansard_annotator.product.cli:main"
+hansard-web = "hansard_annotator.web.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"hansard_annotator.web" = [
+    "templates/**/*.html",
+    "static/**/*",
+]
 
 [tool.pytest.ini_options]
 addopts = "-ra"

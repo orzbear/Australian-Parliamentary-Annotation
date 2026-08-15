@@ -1,0 +1,15 @@
+{
+  "name": "hansard-annotator-web-assets",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "node tools/dev-server.mjs",
+    "build": "npm run build:css && npm run build:htmx",
+    "build:css": "tailwindcss -i src/hansard_annotator/web/static/src/app.css -o src/hansard_annotator/web/static/dist/app.css --minify",
+    "build:htmx": "node tools/copy-htmx.mjs"
+  },
+  "devDependencies": {
+    "htmx.org": "2.0.6",
+    "tailwindcss": "3.4.17"
+  }
+}

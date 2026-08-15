@@ -19,5 +19,37 @@ services:
       retries: 30
       start_period: 5s
 
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    profiles: ["web"]
+    restart: unless-stopped
+    environment:
+      HANSARD_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      HANSARD_PROCESSED_DATA_ROOT: /app/data/processed
+      HANSARD_APP_ENV: development
+      HANSARD_SESSION_SECRET: ${HANSARD_SESSION_SECRET:-}
+      HANSARD_COOKIE_SECURE: "false"
+      HANSARD_ALLOWED_HOSTS: 127.0.0.1,localhost
+      HANSARD_BASE_URL: http://127.0.0.1:8000
+    command:
+      - python
+      - -m
+      - uvicorn
+      - hansard_annotator.web.app:create_app
+      - --factory
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./src:/app/src:ro
+
 volumes:
   hansard-postgres-data:

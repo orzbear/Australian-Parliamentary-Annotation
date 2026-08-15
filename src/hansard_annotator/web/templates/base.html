@@ -1,0 +1,42 @@
+{% from "components/macros.html" import csrf %}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>{% block title %}Hansard Research Workspace{% endblock %}</title>
+  <link rel="stylesheet" href="/static/dist/app.css">
+  <script src="/static/dist/htmx-2.0.6.min.js" defer></script>
+  <script src="/static/src/app.js" defer></script>
+</head>
+<body class="min-h-screen bg-canvas text-ink antialiased">
+  <a class="skip-link" href="#main">Skip to content</a>
+  {% if principal %}
+  <header class="app-header">
+    <div class="page-shell flex items-center justify-between gap-4 py-3">
+      <a class="brand" href="/" aria-label="Hansard Research Workspace home">
+        <span class="brand-mark">H</span><span>Hansard workspace</span>
+      </a>
+      <nav aria-label="Primary" class="flex items-center gap-1 sm:gap-3">
+        <a class="nav-link" href="/">Dashboard</a>
+        <a class="nav-link" href="/projects">Projects</a>
+        {% if principal.is_admin %}<a class="nav-link" href="/admin/users">Admin</a>{% endif %}
+        <form method="post" action="/logout">
+          {{ csrf(principal) }}
+          <button class="btn btn-quiet" type="submit">Sign out</button>
+        </form>
+      </nav>
+    </div>
+  </header>
+  {% endif %}
+  <main id="main" class="{% block main_class %}page-shell py-8{% endblock %}">
+    {% block content %}{% endblock %}
+  </main>
+  {% if principal %}
+  <footer class="page-shell border-t border-slate-200 py-6 text-sm text-muted">
+    Signed in as {{ principal.display_name }} · Research annotations remain versioned and auditable.
+  </footer>
+  {% endif %}
+</body>
+</html>

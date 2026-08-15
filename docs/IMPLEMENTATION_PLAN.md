@@ -1,7 +1,10 @@
 # Australian Hansard Annotation Platform — Implementation Plan
 
-Status: Phases 0, 1, 2, and 2.5 completed by 24 July 2026. Phase 3 application
-implementation remains unauthorised.
+Status: Phases 0 through 3 completed by 24 July 2026. A bounded two-pass conference
+prototype was added on 10 August 2026. Phase 4 remains unauthorised pending owner review
+and research-method decisions. A private-pilot deployment package for
+`annotator.polisde.tech` was prepared on 14 August 2026 but has not yet been executed on the
+Hostinger VPS.
 
 ## 1. Executive summary
 
@@ -690,9 +693,22 @@ Phase 5 can begin data-source work in parallel after Phase 2, but active project
 
 ### Phase 3
 
-- Roles/project isolation and blind-own-label behaviour pass API/browser tests.
-- Two annotators can claim, draft, submit, revise, and recover on desktop/mobile.
-- Codebook/version and interface source are bound to every submission.
+- Local Argon2id authentication, opaque PostgreSQL-backed sessions, session-bound CSRF,
+  persistent lockout, security headers, and administrator account operations are implemented.
+- Projects pin an immutable corpus/run/schema and taxonomy hashes. Deterministic batches,
+  PostgreSQL `FOR UPDATE SKIP LOCKED` claiming, assignment management, and personal/project
+  progress views are implemented.
+- Server-rendered declarative forms validate against the pinned schema. Human drafts and
+  submissions create append-only versions; cross-coder payload access is denied.
+- Desktop/mobile Playwright acceptance, concurrent claiming, restart persistence, PostgreSQL
+  integration, Ruff, strict mypy, and unchanged-corpus verification pass.
+- Phase 4 adjudication/agreement and every later research/automation integration remain absent.
+- The conference prototype adds a streamlined draft general pass and an independently
+  versioned AUKUS screen derived from submitted AU12 labels. Each derived task pins the
+  qualifying source annotation version; this is sequential coding, not double coding.
+- A manager-only deterministic export offers a flattened annotated-data CSV or an optional
+  AI-codebook ZIP with clean text, schema/taxonomy context, instructions and checksums. Both
+  exclude drafts, annotator identities and raw XML; neither publishes a codebook.
 
 ### Phase 2.5
 
@@ -751,13 +767,21 @@ Before Phase 1:
    clean text, and a projection checksum where useful. Canonical fragment XML is optional
    and is not stored in PostgreSQL by default.
 
-Before Phase 3:
+Phase 3 approvals applied:
 
-5. FastAPI/Jinja2/HTMX and PostgreSQL are approved; approve detailed local
-   Argon2id/session lifecycle and role boundaries.
-6. Review and publish (or revise) the Phase 2.5 draft taxonomy/schema; define coder count,
-   blinding, revision, adjudication, and evidence-span policy.
-7. Approve task sampling/assignment and whether project managers may view labels before completion.
+5. FastAPI/Jinja2/HTMX/PostgreSQL and the documented local Argon2id/session lifecycle
+   and role boundaries were approved for the Phase 3 MVP.
+6. The development project explicitly pins the still-draft Phase 2.5 definitions.
+7. Deterministic task sampling/assignment is implemented; annotators remain blind to
+   peers' payloads.
+
+Before Phase 4:
+
+8. Review and publish or revise the draft taxonomy/schema and approve the final codebook.
+9. Define coder count/overlap, blinding release, evidence-span, revision/recode,
+   disagreement, adjudication, and gold-label policies.
+10. Decide whether and when project managers may inspect labels, and define adjudicator
+    eligibility/conflict rules.
 
 Before production/later phases:
 

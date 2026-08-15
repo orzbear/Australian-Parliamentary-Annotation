@@ -1,0 +1,111 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * { @apply border-slate-200; }
+  body { font-family: Inter, ui-sans-serif, system-ui, "Segoe UI", sans-serif; }
+  label, legend { @apply block text-sm font-semibold text-ink; }
+  input, select, textarea { @apply mt-1 min-h-11 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-base text-ink shadow-sm outline-none transition; }
+  input:focus, select:focus, textarea:focus { @apply border-indigo-500 ring-4 ring-indigo-100; }
+  textarea { @apply resize-y; }
+  a:focus-visible, button:focus-visible, summary:focus-visible { @apply outline-none ring-4 ring-indigo-200 ring-offset-2; }
+  table { @apply w-full text-left text-sm; }
+  th { @apply bg-slate-50 px-5 py-3 font-semibold text-muted; }
+  td { @apply border-t px-5 py-4 align-top; }
+}
+
+@layer components {
+  .page-shell { @apply mx-auto w-full max-w-7xl px-4 sm:px-6 lg:px-8; }
+  .app-header { @apply sticky top-0 z-40 border-b bg-white/95 backdrop-blur; }
+  .brand { @apply flex items-center gap-2 font-semibold tracking-tight; }
+  .brand-mark { @apply grid h-9 w-9 place-items-center rounded-xl bg-brand text-white shadow-paper; }
+  .nav-link { @apply rounded-lg px-2 py-2 text-sm font-medium text-muted hover:bg-slate-100 hover:text-ink; }
+  .skip-link { @apply fixed -top-20 left-4 z-50 rounded-lg bg-ink px-4 py-3 text-white focus:top-4; }
+  .surface { @apply rounded-2xl border bg-white shadow-paper; }
+  .eyebrow { @apply text-xs font-bold uppercase tracking-[.16em] text-brand; }
+  .btn { @apply inline-flex min-h-11 items-center justify-center rounded-lg px-4 py-2 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-50; }
+  .btn-primary { @apply bg-brand text-white shadow-sm hover:bg-brand-dark; }
+  .btn-secondary { @apply border border-slate-300 bg-white text-ink hover:bg-slate-50; }
+  .btn-quiet { @apply text-muted hover:bg-slate-100 hover:text-ink; }
+  .btn-danger { @apply bg-red-700 text-white hover:bg-red-800; }
+  .alert { @apply rounded-xl border p-4 text-sm; }
+  .alert-error { @apply border-red-200 bg-red-50 text-red-900; }
+  .alert-success { @apply border-emerald-200 bg-emerald-50 text-emerald-900; }
+  .help { @apply mt-1 text-sm font-normal text-muted; }
+  .error-text { @apply mt-2 text-sm font-medium text-red-700; }
+  .field-error { @apply rounded-xl border border-red-300 bg-red-50/40 p-4; }
+  .badge { @apply inline-flex rounded-full border px-2.5 py-1 text-xs font-semibold capitalize; }
+  .badge-active, .badge-submitted, .badge-generated { @apply border-emerald-200 bg-emerald-50 text-emerald-800; }
+  .badge-paused, .badge-skipped, .badge-warning, .badge-draft { @apply border-amber-200 bg-amber-50 text-amber-800; }
+  .badge-disabled, .badge-flagged, .badge-archived { @apply border-red-200 bg-red-50 text-red-800; }
+  .badge-development, .badge-pilot, .badge-claimed, .badge-in-progress { @apply border-indigo-200 bg-indigo-50 text-indigo-800; }
+  .stats-grid { @apply grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5; }
+  .stat { @apply surface flex flex-col gap-2 p-5 text-sm text-muted; }
+  .stat strong { @apply text-3xl font-semibold text-ink; }
+  .queue-row, .project-mini { @apply flex items-center justify-between gap-4 rounded-xl p-4 transition hover:bg-slate-50; }
+  .queue-row p, .project-mini p { @apply mt-1 text-sm text-muted; }
+  .empty-state { @apply rounded-xl border border-dashed bg-slate-50 p-8 text-center text-muted; }
+  .empty-state h2, .empty-state h3 { @apply text-lg font-semibold text-ink; }
+  .card-link { @apply transition hover:-translate-y-0.5 hover:border-indigo-200 hover:shadow-xl; }
+  .metadata { @apply divide-y text-sm; }
+  .metadata div { @apply grid gap-1 py-3 sm:grid-cols-[9rem_1fr]; }
+  .metadata dt { @apply font-medium text-muted; }
+  .metadata dd { @apply break-words text-ink; }
+  .hash { @apply break-all font-mono text-xs; }
+  .breadcrumbs { @apply flex gap-2 text-sm text-muted; }
+  .breadcrumbs a { @apply text-brand; }
+  .provenance { @apply rounded-xl border bg-slate-50 p-4; }
+  .provenance summary { @apply cursor-pointer font-semibold; }
+  .login-shell { @apply grid min-h-screen place-items-center bg-[radial-gradient(circle_at_top,#e9eafe,#f7f7f4_55%)] px-4 py-12; }
+  .login-card { @apply w-full max-w-md rounded-[1.25rem] border bg-white p-7 shadow-paper sm:p-10; }
+  .workspace-shell { @apply mx-auto max-w-[96rem] px-3 py-4 sm:px-5 lg:px-7; }
+  .workspace-header { @apply sticky top-[4.1rem] z-30 mb-4 flex items-center justify-between gap-4 rounded-xl border bg-white/95 px-5 py-3 shadow-sm backdrop-blur; }
+  .workspace-grid { @apply grid gap-5 lg:grid-cols-[minmax(0,1.62fr)_minmax(22rem,1fr)]; }
+  .workspace-grid > * { min-width: 0; }
+  .speech-panel { @apply surface overflow-hidden; }
+  .speech-context { @apply border-b bg-slate-50/70 p-6 sm:p-8; }
+  .speech-text { @apply mx-auto max-w-[68ch] whitespace-pre-wrap px-6 py-9 font-serif text-[1.12rem] leading-[1.8] text-slate-800 sm:px-10 sm:text-[1.2rem]; }
+  .speech-panel > .provenance { @apply m-6 sm:m-8; }
+  .hint-row { @apply flex flex-wrap gap-2 text-xs text-muted; }
+  .hint-row span { @apply rounded-full border bg-white px-2.5 py-1; }
+  .hint-row .hint-label { @apply border-indigo-200 bg-indigo-50 font-semibold text-indigo-800; }
+  .annotation-panel { @apply surface self-start overflow-hidden lg:sticky lg:top-[9.2rem] lg:max-h-[calc(100vh-10rem)] lg:overflow-y-auto; }
+  .annotation-title { @apply border-b bg-slate-50/70 p-5; }
+  .annotation-fields { @apply space-y-1 p-5; }
+  .field-wrap { @apply border-b py-5 last:border-0; }
+  .choice-stack { @apply mt-3 space-y-2; }
+  .choice-card { @apply flex cursor-pointer gap-3 rounded-xl border p-3 hover:border-indigo-300 hover:bg-indigo-50/40; }
+  .choice-card input { @apply mt-1 h-4 min-h-0 w-4 shrink-0 accent-indigo-600; }
+  .choice-card small { @apply mt-1 block font-normal leading-snug text-muted; }
+  .chip-grid { @apply mt-3 grid gap-2; }
+  .choice-chip { @apply cursor-pointer; }
+  .choice-chip input { @apply sr-only; }
+  .choice-chip span { @apply block rounded-lg border px-3 py-2 font-medium transition; }
+  .choice-chip input:checked + span { @apply border-indigo-500 bg-indigo-50 text-indigo-900 ring-2 ring-indigo-100; }
+  .inline-choices { @apply mt-3 flex gap-5; }
+  .inline-choices label, .inline-control { @apply flex items-center gap-2; }
+  .inline-choices input, .inline-control input { @apply m-0 h-4 min-h-0 w-4 accent-indigo-600; }
+  .annotation-actions { @apply sticky bottom-0 border-t bg-white p-5 shadow-[0_-8px_20px_rgba(28,33,52,.06)]; }
+  .save-status { @apply mb-3 min-h-5 text-sm text-muted; }
+  .save-ok { @apply font-medium text-emerald-700; }
+  .secondary-actions { @apply space-y-3 border-t bg-slate-50 p-5; }
+  .secondary-actions .flex { grid-template-columns: minmax(0, 1fr) auto; }
+  .secondary-actions input { min-width: 0; }
+  .progress { @apply mt-2 h-2 overflow-hidden rounded-full bg-slate-200; }
+  .progress span { @apply block h-full rounded-full bg-brand; }
+}
+
+@media (max-width: 899px) {
+  .workspace-header { @apply top-0 flex-wrap; }
+  .annotation-panel { position: static; max-height: none; }
+  .secondary-actions .flex { display: grid; }
+}
+@media (max-width: 639px) {
+  .app-header .page-shell { @apply flex-wrap; }
+  .app-header nav { @apply w-full justify-between; }
+  .app-header .brand span:last-child { @apply sr-only; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
+}

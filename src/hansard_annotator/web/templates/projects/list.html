@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% from "components/macros.html" import badge %}
+{% block title %}Projects{% endblock %}
+{% block content %}
+<div class="flex items-end justify-between gap-4"><div><p class="eyebrow">Studies</p><h1 class="mt-2 text-4xl font-semibold">Annotation projects</h1></div>{% if principal.is_admin %}<a class="btn btn-primary" href="/projects/new">New project</a>{% endif %}</div>
+<div class="mt-8 grid gap-5 md:grid-cols-2 xl:grid-cols-3">
+{% for project in projects %}
+<a class="surface card-link p-6" href="/projects/{{ project.id }}">
+  <div class="flex justify-between gap-4">{{ badge(project.status) }}<span class="text-sm text-muted">{{ project.mode }}</span></div>
+  <h2 class="mt-5 text-xl font-semibold">{{ project.name }}</h2>
+  <p class="mt-2 line-clamp-2 text-muted">{{ project.description or 'No description' }}</p>
+  <dl class="metadata mt-5"><div><dt>Schema</dt><dd>{{ project.schema_version }}</dd></div><div><dt>Run</dt><dd>{{ project.run_name }}</dd></div><div><dt>Tasks</dt><dd>{{ project.task_count }}</dd></div></dl>
+</a>
+{% else %}<div class="empty-state md:col-span-2"><h2>No visible projects</h2><p>An administrator or project manager can add you.</p></div>{% endfor %}
+</div>
+{% endblock %}

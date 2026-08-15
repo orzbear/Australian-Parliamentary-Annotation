@@ -1,0 +1,17 @@
+[Unit]
+Description=Hansard annotator PostgreSQL logical backup
+Requires=docker.service
+After=docker.service network-online.target
+ConditionPathExists=/opt/hansard-annotator/.env.production
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/opt/hansard-annotator
+UMask=0077
+ExecStart=/bin/sh /opt/hansard-annotator/deploy/scripts/backup.sh
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
