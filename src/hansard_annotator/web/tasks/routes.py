@@ -40,7 +40,9 @@ async def claim(
     await enforce_csrf(request, principal, settings)
     assignment = claim_next(settings, principal, project_id)
     destination = (
-        f"/assignments/{assignment['id']}" if assignment else f"/projects/{project_id}"
+        f"/assignments/{assignment['id']}"
+        if assignment
+        else f"/projects/{project_id}?no_tasks=1"
     )
     return RedirectResponse(destination, status_code=303)
 
