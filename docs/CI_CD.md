@@ -34,17 +34,20 @@ unresolved.
 
 ## Production deployment
 
-Production deployment remains manual during the private conference pilot. Use the reviewed
-runbook in `docs/PILOT_DEPLOYMENT_RUNBOOK.md`: package an explicit allowlist, verify its
-checksum, back up PostgreSQL, migrate explicitly, recreate only the Hansard web/Caddy
-services, and run `deploy/scripts/verify.sh`. Never transfer `.env.production` through Git or
-replace the PostgreSQL volume.
+Production deployment remains manual and approval-gated during the private conference pilot.
+After its one-time restricted-identity setup, `.github/workflows/deploy-production.yml`
+requires an explicit GitHub Actions dispatch and confirmation phrase, then implements the
+reviewed procedure in `docs/GITHUB_PRODUCTION_DEPLOYMENT.md`: package an exact `main` commit
+with an explicit allowlist, verify its checksum, back up PostgreSQL, migrate explicitly,
+recreate only the Hansard web/Caddy services, and run product verification. Never transfer
+`.env.production` through Git or replace the PostgreSQL volume.
 
-Do not store the owner's passphrase-protected root SSH key in GitHub. Before enabling a
-GitHub deployment workflow, create a dedicated VPS deploy identity, restrict it to the
-Hansard deployment path/command, pin the VPS host key, store its private key as a GitHub
-secret, restrict deployment to `main`, use a `workflow_dispatch` manual trigger and a
-single-production concurrency group. Do not install a self-hosted Actions runner on the VPS.
+Do not store the owner's passphrase-protected root SSH key in GitHub. The setup creates a
+dedicated VPS identity restricted to the Hansard upload directory and release command, pins
+the VPS host key, stores its private key as a GitHub Actions secret, restricts deployment to
+`main`, uses a `workflow_dispatch` manual trigger with explicit confirmation, and serializes
+production deployments. Do not install a self-hosted Actions runner on the VPS. Required
+reviewers can be added when the private repository's GitHub plan supports that protection.
 
 Automatic deployment on every push is deliberately not enabled for the pilot. A failed test,
 accidental push, or compromised dependency must not immediately modify the research service

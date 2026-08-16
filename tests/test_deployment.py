@@ -77,3 +77,40 @@ def test_daily_backup_timer_is_persistent_and_non_destructive() -> None:
     assert "Persistent=true" in timer
     assert "RandomizedDelaySec=15m" in timer
     assert "rm " not in service + timer
+
+
+def test_github_production_deployment_is_manual_gated_and_serialized() -> None:
+    workflow = (ROOT / ".github/workflows/deploy-production.yml").read_text(
+        encoding="utf-8"
+    )
+    workflow_model = yaml.load(workflow, Loader=yaml.BaseLoader)
+
+    assert set(workflow_model["on"]) == {"workflow_dispatch"}
+    assert set(workflow_model["jobs"]) == {"deploy"}
+    assert "workflow_dispatch:" in workflow
+    assert 'test "$GITHUB_REF" = "refs/heads/main"' in workflow
+    assert 'test "$CONFIRMATION" = "deploy-production"' in workflow
+    assert "group: production" in workflow
+    assert "cancel-in-progress: false" in workflow
+    assert "StrictHostKeyChecking=yes" in workflow
+    assert "DEPLOY_SSH_KEY" in workflow
+    assert "POSTGRES_PASSWORD" not in workflow
+    assert "docker compose down" not in workflow
+
+
+def test_restricted_release_command_backs_up_before_migration() -> None:
+    release = (ROOT / "deploy/host/hansard-release").read_text(encoding="utf-8")
+    bootstrap = (ROOT / "deploy/host/bootstrap-github-deployer.sh").read_text(
+        encoding="utf-8"
+    )
+
+    backup_position = release.index('sh "$APP_DIR/deploy/scripts/backup.sh"')
+    migration_position = release.index('sh "$release_dir/deploy/scripts/migrate.sh"')
+    assert backup_position < migration_position
+    assert "sha256sum" in release
+    assert "flock -n" in release
+    assert "--no-build web caddy" in release
+    assert "docker compose down" not in release
+    assert "hansard-postgres-data" not in release
+    assert "NOPASSWD: %s" in bootstrap
+    assert "restrict %s" in bootstrap

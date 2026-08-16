@@ -1,0 +1,75 @@
+name: Deploy production
+run-name: Deploy ${{ github.sha }} to production by ${{ github.actor }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Type deploy-production to confirm the deployment
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: manually-approved-production
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Enforce main and explicit confirmation
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$CONFIRMATION" = "deploy-production"
+
+      - name: Check out reviewed commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Package the exact approved source commit
+        id: package
+        run: |
+          release="release-${GITHUB_SHA}.tar.gz"
+          git archive --format=tar.gz --output="$release" "$GITHUB_SHA" -- \
+            Dockerfile compose.production.yaml alembic.ini \
+            requirements.lock pyproject.toml README.md \
+            deploy src migrations config
+          checksum="$(sha256sum "$release" | cut -d ' ' -f 1)"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          echo "checksum=$checksum" >> "$GITHUB_OUTPUT"
+
+      - name: Configure pinned SSH connection
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$HOME/.ssh/deploy_key"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/deploy_key" "$HOME/.ssh/known_hosts"
+          ssh-keygen -y -f "$HOME/.ssh/deploy_key" >/dev/null
+
+      - name: Upload release and invoke restricted deployment
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          RELEASE: ${{ steps.package.outputs.release }}
+          CHECKSUM: ${{ steps.package.outputs.checksum }}
+        run: |
+          ssh_options="-i $HOME/.ssh/deploy_key -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
+          scp $ssh_options "$RELEASE" "$DEPLOY_USER@$DEPLOY_HOST:/var/lib/hansard-deploy/incoming/$RELEASE"
+          ssh $ssh_options "$DEPLOY_USER@$DEPLOY_HOST" \
+            sudo /usr/local/sbin/hansard-release "$GITHUB_SHA" "$CHECKSUM"
+
+      - name: Verify public readiness
+        run: |
+          curl --fail --silent --show-error --retry 6 --retry-delay 5 \
+            https://annotator.polisde.tech/health/ready
+          echo
