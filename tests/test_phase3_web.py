@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -15,6 +16,8 @@ from hansard_annotator.web.security import (
     verify_password,
 )
 from hansard_annotator.web.tasks.schemas import SelectionCriteria
+
+ROOT = Path(__file__).parents[1]
 
 
 def _fields() -> list[dict[str, Any]]:
@@ -65,6 +68,23 @@ def test_argon2id_and_opaque_security_tokens() -> None:
     token = make_login_csrf("test-secret")
     assert verify_login_csrf(token, "test-secret")
     assert not verify_login_csrf(token, "different-secret")
+
+
+def test_htmx_indicator_styles_are_compatible_with_strict_csp() -> None:
+    base = (ROOT / "src/hansard_annotator/web/templates/base.html").read_text(
+        encoding="utf-8"
+    )
+    css = (ROOT / "src/hansard_annotator/web/static/src/app.css").read_text(
+        encoding="utf-8"
+    )
+    built_css = (ROOT / "src/hansard_annotator/web/static/dist/app.css").read_text(
+        encoding="utf-8"
+    )
+
+    assert '{"includeIndicatorStyles":false}' in base
+    assert ".htmx-indicator" in css
+    assert ".htmx-request .htmx-indicator" in css
+    assert ".htmx-indicator" in built_css
 
 
 def test_annotation_rules_and_canonical_hashing() -> None:

@@ -96,6 +96,9 @@
   .progress span { @apply block h-full rounded-full bg-brand; }
 }
 
+.htmx-indicator { opacity: 0; }
+.htmx-request .htmx-indicator, .htmx-request.htmx-indicator { opacity: 1; transition: opacity 200ms ease-in; }
+
 @media (max-width: 899px) {
   .workspace-header { @apply top-0 flex-wrap; }
   .annotation-panel { position: static; max-height: none; }
