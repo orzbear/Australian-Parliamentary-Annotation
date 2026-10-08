@@ -12,6 +12,12 @@ from hansard_annotator.llm_eval.costs import aggregate_costs
 from hansard_annotator.llm_eval.metrics import compute_metrics
 from hansard_annotator.llm_eval.models import ProviderResponse, TokenUsage
 from hansard_annotator.llm_eval.package import EvaluationPackage, load_evaluation_package
+from hansard_annotator.llm_eval.prompt import (
+    DEFAULT_PROMPT_VERSION,
+    available_prompt_versions,
+    build_system_prompt,
+    prompt_hash,
+)
 from hansard_annotator.llm_eval.providers import GeminiProvider, OpenAIProvider, ProviderError
 from hansard_annotator.llm_eval.reporting import mismatches
 from hansard_annotator.llm_eval.runner import evaluate, make_configuration
@@ -504,3 +510,43 @@ def test_run_identity_changes_with_material_configuration(tmp_path: Path) -> Non
         {"thinking_mode": "disabled", "thinking_budget": 0},
     )
     assert dynamic.identity() != disabled.identity()
+
+
+def test_prompt_versions_coexist_with_distinct_hashes_and_run_identities(tmp_path: Path) -> None:
+    package = load_evaluation_package(_package_dir(tmp_path))
+    assert DEFAULT_PROMPT_VERSION == "phase4a-policy-v1"
+    assert available_prompt_versions() == ("phase4a-policy-v1", "phase4a-policy-v2")
+    v1 = build_system_prompt(package.context, "phase4a-policy-v1")
+    v2 = build_system_prompt(package.context, "phase4a-policy-v2")
+    assert v1.startswith("You classify quoted Australian parliamentary speech.")
+    assert "Follow this mandatory hierarchy" not in v1
+    assert prompt_hash(v1) != prompt_hash(v2)
+    v1_config, _ = make_configuration(
+        package, "gemini", "gemini-2.5-flash", {}, "phase4a-policy-v1"
+    )
+    v2_config, _ = make_configuration(
+        package, "gemini", "gemini-2.5-flash", {}, "phase4a-policy-v2"
+    )
+    assert v1_config.prompt_version == "phase4a-policy-v1"
+    assert v2_config.prompt_version == "phase4a-policy-v2"
+    assert v1_config.identity() != v2_config.identity()
+
+
+def test_v2_encodes_policy_first_hierarchy_and_research_rules(tmp_path: Path) -> None:
+    package = load_evaluation_package(_package_dir(tmp_path))
+    prompt = build_system_prompt(package.context, "phase4a-policy-v2")
+    step_1 = prompt.index("STEP 1 — SUBSTANTIVE-POLICY GATE")
+    step_2 = prompt.index("STEP 2 — PRIMARY POLICY ISSUE")
+    step_3 = prompt.index("STEP 3 — PRECEDENCE RULES")
+    step_4 = prompt.index("STEP 4 — EXACTLY ONE PRIMARY DOMAIN")
+    step_5 = prompt.index("STEP 5 — SECONDARY DOMAINS")
+    step_6 = prompt.index("STEP 6 — CONCISE REASONING/EVIDENCE")
+    assert step_1 < step_2 < step_3 < step_4 < step_5 < step_6
+    assert "is_non_policy=true" in prompt
+    assert "primary_australian_domain=null" in prompt
+    assert "secondary_australian_domains=[]" in prompt
+    assert "veteran-specific institutions" in prompt and "use AU12 as primary" in prompt
+    assert "disaster recovery grants" in prompt and "use AU07 as primary" in prompt
+    assert "AU_OTHER_REVIEW is not a general uncertainty" in prompt
+    assert "ceremonial remarks" in prompt
+    assert "Government funding does not automatically pass the policy gate" in prompt

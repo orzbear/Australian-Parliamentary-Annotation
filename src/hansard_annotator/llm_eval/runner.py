@@ -16,7 +16,7 @@ from typing import Any
 from hansard_annotator.llm_eval.models import RequestResult, TokenUsage
 from hansard_annotator.llm_eval.package import EvaluationPackage
 from hansard_annotator.llm_eval.prompt import (
-    PROMPT_VERSION,
+    DEFAULT_PROMPT_VERSION,
     build_system_prompt,
     build_user_prompt,
     prediction_json_schema,
@@ -52,9 +52,13 @@ def _git_revision() -> str | None:
 
 
 def make_configuration(
-    package: EvaluationPackage, provider: str, model: str, generation: dict[str, Any]
+    package: EvaluationPackage,
+    provider: str,
+    model: str,
+    generation: dict[str, Any],
+    prompt_version: str = DEFAULT_PROMPT_VERSION,
 ) -> tuple[RunConfiguration, str]:
-    system = build_system_prompt(package.context)
+    system = build_system_prompt(package.context, prompt_version)
     schema = package.schema
     return RunConfiguration(
         provider,
@@ -62,7 +66,7 @@ def make_configuration(
         str(package.manifest["snapshot_sha256"]),
         str(schema["version"]),
         str(schema["content_sha256"]),
-        PROMPT_VERSION,
+        prompt_version,
         prompt_hash(system),
         generation,
     ), system
@@ -144,8 +148,11 @@ def evaluate(
     max_retries: int = 2,
     retry_delay: float = 1.0,
     sleeper: Callable[[float], None] = time.sleep,
+    prompt_version: str = DEFAULT_PROMPT_VERSION,
 ) -> list[dict[str, Any]]:
-    configuration, system_prompt = make_configuration(package, provider.name, model, generation)
+    configuration, system_prompt = make_configuration(
+        package, provider.name, model, generation, prompt_version
+    )
     initialise_run(output, configuration, resume=resume)
     checkpoint_path = output / "predictions.jsonl"
     checkpoints = load_checkpoints(checkpoint_path)

@@ -12,6 +12,7 @@ from typing import Any
 from hansard_annotator.llm_eval.costs import aggregate_costs, load_pricing
 from hansard_annotator.llm_eval.metrics import compute_metrics
 from hansard_annotator.llm_eval.package import load_evaluation_package
+from hansard_annotator.llm_eval.prompt import DEFAULT_PROMPT_VERSION, available_prompt_versions
 from hansard_annotator.llm_eval.providers import provider_for
 from hansard_annotator.llm_eval.reporting import mismatches, write_reports
 from hansard_annotator.llm_eval.runner import evaluate, make_configuration
@@ -27,6 +28,11 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument("--provider", choices=("gemini", "openai"), required=True)
     result.add_argument("--model", required=True)
+    result.add_argument(
+        "--prompt-version",
+        choices=available_prompt_versions(),
+        default=DEFAULT_PROMPT_VERSION,
+    )
     result.add_argument("--output", type=Path, required=True)
     result.add_argument("--limit", type=int)
     result.add_argument("--record-id", action="append", default=[])
@@ -104,7 +110,11 @@ def main(argv: list[str] | None = None) -> int:
                 generation["thinking_budget"] = 0
         provider = provider_for(arguments.provider)
         configuration, _ = make_configuration(
-            package, arguments.provider, arguments.model, generation
+            package,
+            arguments.provider,
+            arguments.model,
+            generation,
+            arguments.prompt_version,
         )
         if arguments.dry_run:
             print(
@@ -115,6 +125,7 @@ def main(argv: list[str] | None = None) -> int:
                         "records": len(records),
                         "provider": arguments.provider,
                         "model": arguments.model,
+                        "prompt_version": arguments.prompt_version,
                         "generation": generation,
                         "run_identity": configuration.identity(),
                         "package_snapshot_sha256": package.manifest["snapshot_sha256"],
@@ -137,6 +148,7 @@ def main(argv: list[str] | None = None) -> int:
             resume=not arguments.no_resume,
             max_retries=arguments.max_retries,
             retry_delay=arguments.retry_delay,
+            prompt_version=arguments.prompt_version,
         )
         metric_values = compute_metrics(records, results, package.domain_codes)
         cost_values = aggregate_costs(results, arguments.provider, arguments.model, pricing)

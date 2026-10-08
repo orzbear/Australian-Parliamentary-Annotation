@@ -59,6 +59,25 @@ skips successful records; invalid responses and API failures remain retryable. A
 provider, model, export, schema, prompt, or material generation setting is rejected in the
 same run directory. Use a unique ignored `data/review` directory per model/configuration.
 
+### Prompt versions and development-set boundary
+
+Prompt versions are explicitly selected with `--prompt-version`. `phase4a-policy-v1` remains
+available and is the default for backward reproducibility. `phase4a-policy-v2` adds a mandatory
+policy-first hierarchy, ceremonial/descriptive and grant-only exclusions, veteran (`AU12`) and
+disaster-recovery (`AU07`) precedence, stricter secondary-domain rules, and restricted use of
+`AU_OTHER_REVIEW`. It does not replace the formal taxonomy.
+
+The first 30 human-annotated records were used to diagnose v1 and design v2. They are therefore
+a development sample; subsequent v2 performance on those records is not an unbiased final
+evaluation. The remaining human-annotated records should remain untouched as a later validation
+sample until v2 is frozen.
+
+The header-only research artifact
+`data/review/phase4a-development-adjudication.csv` supports manual development-set review. Its
+allowed `adjudication_outcome` values are `human_correct`, `human_needs_revision`, `model_error`,
+and `codebook_ambiguous`. The file is ignored research output and has no database integration;
+researchers populate and maintain it manually.
+
 ## Security, usage, and cost
 
 Credentials come only from `OPENAI_API_KEY`, `GEMINI_API_KEY`, or `GOOGLE_API_KEY`. They are
@@ -110,6 +129,16 @@ python -m hansard_annotator.llm_eval.cli evaluate `
   --input scripts/conference-codebook-pilot-01-ai-codebook-input-d1d13e895705 `
   --provider gemini --model YOUR_MODEL `
   --output data/review/phase4a-gemini-pilot --limit 30
+```
+
+To run the 30-record development sample with v2 and Gemini 2.5 Flash thinking disabled:
+
+```powershell
+python -m hansard_annotator.llm_eval.cli evaluate `
+  --input scripts/conference-codebook-pilot-01-ai-codebook-input-d1d13e895705 `
+  --provider gemini --model gemini-2.5-flash `
+  --prompt-version phase4a-policy-v2 --thinking-budget 0 `
+  --output data/review/phase4a-gemini-v2-development-thinking-0 --limit 30
 ```
 
 ### Full current benchmark
