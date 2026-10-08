@@ -224,9 +224,7 @@ def _fixture_run(
 
 def _web_settings(database_url: str) -> WebSettings:
     return WebSettings(
-        database=DatabaseSettings(
-            url=database_url, processed_data_root=Path("data/processed")
-        ),
+        database=DatabaseSettings(url=database_url, processed_data_root=Path("data/processed")),
         environment="test",
         session_secret="phase3-test-secret-at-least-thirty-two-characters",
         cookie_secure=False,
@@ -643,9 +641,7 @@ def test_phase25_upgrade_backfills_existing_phase2_rows(database_url: str) -> No
     command.downgrade(config, "20260723_01")
     url = database_url.replace("postgresql+psycopg://", "postgresql://")
     with psycopg.connect(url) as connection:
-        connection.execute(
-            "ALTER TABLE preprocessing_runs ALTER COLUMN id RESTART WITH 1000"
-        )
+        connection.execute("ALTER TABLE preprocessing_runs ALTER COLUMN id RESTART WITH 1000")
         dummy_id = connection.execute(
             """
             INSERT INTO preprocessing_runs
@@ -844,9 +840,7 @@ def test_review_export_unicode_csv_and_database_read_only(
     assert after == before
 
 
-def test_review_export_sampling_orphans_and_path_safety(
-    database_url: str, tmp_path: Path
-) -> None:
+def test_review_export_sampling_orphans_and_path_safety(database_url: str, tmp_path: Path) -> None:
     settings = DatabaseSettings(url=database_url, processed_data_root=Path("data/processed"))
     import_validated_run(settings, _fixture_run(tmp_path, run_id="sampling-fixture"))
 
@@ -942,20 +936,26 @@ def test_phase3_relations_roles_and_empty_round_trip(database_url: str) -> None:
     assert set(inspector.get_table_names()) >= PHASE3_TABLES
     url = database_url.replace("postgresql+psycopg://", "postgresql://")
     with psycopg.connect(url) as connection:
-        assert connection.execute(
-            "SELECT count(*) FROM global_roles WHERE role_key='admin'"
-        ).fetchone()[0] == 1
-        corpus_before = connection.execute(
-            "SELECT count(*) FROM speaker_turns"
-        ).fetchone()[0]
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM global_roles WHERE role_key='admin'"
+            ).fetchone()[0]
+            == 1
+        )
+        corpus_before = connection.execute("SELECT count(*) FROM speaker_turns").fetchone()[0]
     config = Config("alembic.ini")
     command.downgrade(config, "20260724_03")
     command.upgrade(config, "head")
     with psycopg.connect(url) as connection:
-        assert connection.execute(
-            "SELECT count(*) FROM global_roles WHERE role_key='admin'"
-        ).fetchone()[0] == 1
-        assert connection.execute("SELECT count(*) FROM speaker_turns").fetchone()[0] == corpus_before
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM global_roles WHERE role_key='admin'"
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            connection.execute("SELECT count(*) FROM speaker_turns").fetchone()[0] == corpus_before
+        )
 
 
 def test_phase3_authentication_lockout_sessions_and_disable(
@@ -993,13 +993,9 @@ def test_phase3_authentication_lockout_sessions_and_disable(
         authenticate(settings, "disable-me", password)
     url = database_url.replace("postgresql+psycopg://", "postgresql://")
     with psycopg.connect(url) as connection:
-        hashes = connection.execute(
-            "SELECT password_hash FROM user_credentials"
-        ).fetchall()
+        hashes = connection.execute("SELECT password_hash FROM user_credentials").fetchall()
         assert all(password not in row[0] and row[0].startswith("$argon2id$") for row in hashes)
-        metadata = connection.execute(
-            "SELECT metadata::text FROM audit_events"
-        ).fetchall()
+        metadata = connection.execute("SELECT metadata::text FROM audit_events").fetchall()
         assert all(password not in row[0] and token not in row[0] for row in metadata)
 
 
@@ -1128,9 +1124,7 @@ def test_phase3_project_batch_claim_annotation_and_permissions(
         "unclassifiable_reason": None,
         "annotation_notes": "Draft note",
     }
-    first = save_annotation(
-        settings, annotator_a, assignment_id, draft, event_type="draft_saved"
-    )
+    first = save_annotation(settings, annotator_a, assignment_id, draft, event_type="draft_saved")
     reused_draft = save_annotation(
         settings, annotator_a, assignment_id, draft, event_type="draft_saved"
     )
@@ -1141,19 +1135,20 @@ def test_phase3_project_batch_claim_annotation_and_permissions(
         "primary_australian_domain": "AU03",
         "annotation_notes": "Submitted note",
     }
-    final = save_annotation(
-        settings, annotator_a, assignment_id, submitted, event_type="submitted"
-    )
+    final = save_annotation(settings, annotator_a, assignment_id, submitted, event_type="submitted")
     assert final["revision_number"] == 2
     with psycopg.connect(url) as connection:
-        assert connection.execute(
-            """
+        assert (
+            connection.execute(
+                """
             SELECT count(*) FROM annotation_versions av
             JOIN annotations an ON an.id=av.annotation_id
             WHERE an.assignment_id=%s
             """,
-            (assignment_id,),
-        ).fetchone()[0] == 2
+                (assignment_id,),
+            ).fetchone()[0]
+            == 2
+        )
         with pytest.raises(psycopg.errors.ObjectNotInPrerequisiteState):
             connection.execute(
                 "UPDATE annotation_versions SET revision_number=9 WHERE annotation_id=%s",
@@ -1339,12 +1334,8 @@ def test_two_pass_aukus_derivation_pins_source_annotation_version(
         assert manifest["privacy"]["annotator_identity_included"] is False
         assert manifest["privacy"]["raw_xml_included"] is False
         assert record["speech"]["text"]
-        assert record["human_annotation"]["values"][
-            "primary_australian_domain"
-        ] == "AU12"
-        assert record["human_annotation"]["readable_fields"][1]["value"][
-            "label"
-        ]
+        assert record["human_annotation"]["values"]["primary_australian_domain"] == "AU12"
+        assert record["human_annotation"]["readable_fields"][1]["value"]["label"]
         assert context["schema"]["version"] == "0.2.0"
         combined = b"".join(archive.read(name) for name in archive.namelist())
         assert b"prototype-admin" not in combined
@@ -1356,14 +1347,78 @@ def test_two_pass_aukus_derivation_pins_source_annotation_version(
     assert first_csv.content == second_csv.content
     assert first_csv.media_type == "text/csv"
     assert first_csv.filename.endswith(".csv")
-    csv_rows = list(
-        csv.DictReader(io.StringIO(first_csv.content.decode("utf-8-sig")))
-    )
+    csv_rows = list(csv.DictReader(io.StringIO(first_csv.content.decode("utf-8-sig"))))
     assert len(csv_rows) == 1
     assert csv_rows[0]["primary_australian_domain"] == "AU12"
     assert csv_rows[0]["primary_australian_domain_label"]
     assert csv_rows[0]["speech_text"]
     assert "annotation_notes" in csv_rows[0]
+    keyword_any = tmp_path / "target-keyword-any.csv"
+    keyword_all = tmp_path / "target-keyword-all.csv"
+    domain_sample = tmp_path / "target-domain.csv"
+    non_policy_sample = tmp_path / "target-non-policy.csv"
+    database_settings = DatabaseSettings(
+        url=database_url, processed_data_root=Path("data/processed")
+    )
+    export_review_sample(
+        database_settings,
+        ReviewExportOptions(
+            output=keyword_any,
+            limit=100,
+            min_words=0,
+            keywords=("SYNTHETIC", "term-that-does-not-exist"),
+            keyword_mode="any",
+        ),
+    )
+    export_review_sample(
+        database_settings,
+        ReviewExportOptions(
+            output=keyword_all,
+            limit=100,
+            min_words=0,
+            keywords=("synthetic", "term-that-does-not-exist"),
+            keyword_mode="all",
+        ),
+    )
+    export_review_sample(
+        database_settings,
+        ReviewExportOptions(
+            output=domain_sample,
+            limit=100,
+            min_words=0,
+            annotation_project_slug="conference-general-pass",
+            primary_domain="AU12",
+        ),
+    )
+    export_review_sample(
+        database_settings,
+        ReviewExportOptions(
+            output=non_policy_sample,
+            limit=100,
+            min_words=0,
+            annotation_project_slug="conference-general-pass",
+            annotation_status="non-policy",
+        ),
+    )
+    with keyword_any.open(encoding="utf-8", newline="") as source:
+        assert list(csv.DictReader(source))
+    with keyword_all.open(encoding="utf-8", newline="") as source:
+        assert list(csv.DictReader(source)) == []
+    with domain_sample.open(encoding="utf-8", newline="") as source:
+        domain_rows = list(csv.DictReader(source))
+    assert len(domain_rows) == 1
+    with non_policy_sample.open(encoding="utf-8", newline="") as source:
+        assert list(csv.DictReader(source)) == []
+    with psycopg.connect(url) as connection:
+        preserved = connection.execute(
+            "SELECT values FROM annotation_versions WHERE annotation_id=%s AND revision_number=%s",
+            (
+                source_submission["annotation_id"],
+                source_submission["revision_number"],
+            ),
+        ).fetchone()
+    assert preserved is not None
+    assert preserved[0]["primary_australian_domain"] == "AU12"
     with TestClient(create_app(settings)) as client:
         client.cookies.set(SESSION_COOKIE, admin_token)
         new_project_page = client.get("/projects/new")
@@ -1387,9 +1442,9 @@ def test_two_pass_aukus_derivation_pins_source_annotation_version(
         assert csv_download.status_code == 200
         assert csv_download.headers["content-type"].startswith("text/csv")
         assert "annotated-data" in csv_download.headers["content-disposition"]
-        assert next(
-            csv.DictReader(io.StringIO(csv_download.content.decode("utf-8-sig")))
-        )["primary_australian_domain_label"]
+        assert next(csv.DictReader(io.StringIO(csv_download.content.decode("utf-8-sig"))))[
+            "primary_australian_domain_label"
+        ]
 
     aukus = create_project(
         settings,

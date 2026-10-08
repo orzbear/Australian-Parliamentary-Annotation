@@ -55,6 +55,11 @@ class ReviewExportOptions:
     procedural_hint: HintFilter | None = None
     ceremonial_hint: HintFilter | None = None
     min_interruptions: int = 0
+    keywords: tuple[str, ...] = ()
+    keyword_mode: Literal["any", "all"] = "any"
+    annotation_project_slug: str | None = None
+    primary_domain: str | None = None
+    annotation_status: Literal["policy", "non-policy"] | None = None
 
 
 def _is_within(path: Path, parent: Path) -> bool:
@@ -102,6 +107,23 @@ def _validate_options(options: ReviewExportOptions) -> None:
         raise ValueError("date_from must be on or before date_to")
     if options.year is not None and not 1901 <= options.year <= 9999:
         raise ValueError("year must be between 1901 and 9999")
+    if options.keyword_mode not in {"any", "all"}:
+        raise ValueError("keyword_mode must be any or all")
+    if any(not keyword.strip() for keyword in options.keywords):
+        raise ValueError("keywords must not be empty")
+    if (
+        options.primary_domain or options.annotation_status
+    ) and not options.annotation_project_slug:
+        raise ValueError("human-label filters require annotation_project_slug")
+    if options.primary_domain and not (
+        options.primary_domain == "AU_OTHER_REVIEW"
+        or (
+            len(options.primary_domain) == 4
+            and options.primary_domain.startswith("AU")
+            and options.primary_domain[2:].isdigit()
+        )
+    ):
+        raise ValueError("primary_domain must be an AU policy-domain code")
 
 
 def _hint_condition(column: str, value: HintFilter) -> sql.Composed:
@@ -139,9 +161,7 @@ def write_review_csv(
             for database_row in rows:
                 row = dict(database_row)
                 row["interrupted"] = _format_nullable_bool(row["interrupted"])
-                row["is_orphan_continuation"] = _format_nullable_bool(
-                    row["is_orphan_continuation"]
-                )
+                row["is_orphan_continuation"] = _format_nullable_bool(row["is_orphan_continuation"])
                 row["procedural_hint"] = _format_nullable_bool(row["procedural_hint"])
                 row["ceremonial_hint"] = _format_nullable_bool(row["ceremonial_hint"])
                 writer.writerow(row)
@@ -190,6 +210,41 @@ def export_review_sample(
     ):
         if value is not None:
             conditions.append(_hint_condition(column, value))
+    if options.keywords:
+        keyword_conditions: list[sql.Composable] = []
+        for keyword in options.keywords:
+            keyword_conditions.append(sql.SQL("text_clean ILIKE %s"))
+            parameters.append(f"%{keyword.strip()}%")
+        joiner = sql.SQL(" OR ") if options.keyword_mode == "any" else sql.SQL(" AND ")
+        conditions.append(sql.SQL("({})").format(joiner.join(keyword_conditions)))
+    if options.annotation_project_slug:
+        annotation_conditions: list[sql.Composable] = [
+            sql.SQL("project.slug=%s"),
+            sql.SQL("turn.turn_key=current_annotation_ready_turns.turn_key"),
+            sql.SQL("annotation.status IN ('submitted','revised')"),
+        ]
+        parameters.append(options.annotation_project_slug)
+        if options.primary_domain:
+            annotation_conditions.append(sql.SQL("version.values->>'primary_australian_domain'=%s"))
+            parameters.append(options.primary_domain)
+        if options.annotation_status:
+            annotation_conditions.append(
+                sql.SQL("COALESCE((version.values->>'is_non_policy')::boolean,false)=%s")
+            )
+            parameters.append(options.annotation_status == "non-policy")
+        conditions.append(
+            sql.SQL(
+                """EXISTS (
+                  SELECT 1 FROM projects project
+                  JOIN tasks task ON task.project_id=project.id
+                  JOIN speaker_turns turn ON turn.id=task.speaker_turn_id
+                  JOIN assignments assignment ON assignment.task_id=task.id
+                  JOIN annotations annotation ON annotation.assignment_id=assignment.id
+                  JOIN annotation_versions version ON version.id=annotation.current_version_id
+                  WHERE {}
+                )"""
+            ).format(sql.SQL(" AND ").join(annotation_conditions))
+        )
 
     selected = sql.SQL(
         """

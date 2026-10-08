@@ -166,6 +166,11 @@ Git and cannot be written under raw XML, accepted processed-run, or backup direc
 The hint fields are contextual preprocessing output, not gold or human labels; `NULL`
 is exported as `unknown`.
 
+Phase 4A human/LLM evaluation and targeted read-only sampling are documented in
+[`docs/PHASE_4A_LLM_EVALUATION.md`](docs/PHASE_4A_LLM_EVALUATION.md). The evaluator consumes
+the existing AI-codebook package, checkpoints every request, validates structured output,
+and keeps predictions separate from production human annotation tables.
+
 ## Phase 2.5 product foundation
 
 After applying Alembic revision `20260724_02`, inspect and load product metadata:
