@@ -37,6 +37,11 @@ diagnostic reason. Unknown fields/codes, contradictory non-policy/domain combina
 other schema violations are recorded as `invalid`, never coerced. Provider failures are
 separately `api_failure`; absent checkpoints are `missing`.
 
+Invalid responses retain bounded, secret-redacted diagnostics: parsed top-level JSON type,
+JSON parse status, content presence/length, provider finish reason, a structured-response
+preview, and the schema-validation error. These fields diagnose provider/schema failures
+without treating invalid values as annotations.
+
 Policy metrics treat **policy** as the positive class and report accuracy, precision, recall,
 F1, and confusion counts. Primary-domain metrics apply to human-policy records and report
 exact match, per-domain precision/recall/F1/support, macro-F1, and a confusion matrix. Every
@@ -62,7 +67,9 @@ messages and configured secret values are defensively redacted.
 
 Every request records provider-reported input, cached-input, output, reasoning/thinking and
 total tokens when available, plus latency, retries, status, and returned model. Cost reports
-project cost per speech, 1,000 speeches, and 160,000 speeches.
+separate cost per request attempt from cost per valid annotation and provide mechanical
+1,000/160,000-unit extrapolations for both. Invalid responses and provider failures remain
+billable when the provider reports usage.
 
 Pricing is never hidden in scoring code. Before a paid run, add verified current prices to
 `config/llm_eval/pricing.yaml` under an exact `provider:model` key:
@@ -76,6 +83,7 @@ models:
     input_per_million_usd: 0.0
     cached_input_per_million_usd: 0.0
     output_per_million_usd: 0.0
+    reasoning_billed_as_output: true
 ```
 
 Without an exact entry, token totals remain available and monetary estimates are `null`,
@@ -117,6 +125,9 @@ Use `--provider openai` with an OpenAI model for the same pipeline. `--subset-se
 deterministic hash-based selection before `--limit`; repeatable `--record-id` selects explicit
 records. Resume is on by default. `--no-resume` rejects an existing run. Provider-specific
 thinking settings are `--reasoning-effort` (OpenAI) and `--thinking-budget` (Gemini).
+For Gemini 2.5 Flash, omitting `--thinking-budget` records
+`provider_default_dynamic` without sending a thinking override; `--thinking-budget 0` records
+`disabled` and sends `thinkingBudget: 0`. These settings produce different run identities.
 
 Each run contains `run_metadata.json`, `predictions.jsonl`, `metrics.json`,
 `cost_report.json`, `mismatches.jsonl`, `mismatches.csv`, and `report.md`. Mismatches include

@@ -108,8 +108,13 @@ Human annotations are the evaluation reference. A mismatch does not establish th
 ## Cost
 
 - Estimated total USD: {costs["estimated_cost_usd"] if costs["estimated_cost_usd"] is not None else "unavailable (no matching pricing entry)"}
-- Cost per speech USD: {costs["cost_per_speech_usd"] if costs["cost_per_speech_usd"] is not None else "unavailable"}
-- Projected 1,000 speeches USD: {costs["projected_cost_1k_speeches_usd"] if costs["projected_cost_1k_speeches_usd"] is not None else "unavailable"}
-- Projected 160,000 speeches USD: {costs["projected_cost_160k_speeches_usd"] if costs["projected_cost_160k_speeches_usd"] is not None else "unavailable"}
+- Cost per attempt USD: {costs["cost_per_attempt_usd"] if costs["cost_per_attempt_usd"] is not None else "unavailable"}
+- Cost per valid annotation USD: {costs["cost_per_valid_annotation_usd"] if costs["cost_per_valid_annotation_usd"] is not None else "unavailable"}
+- Projected 1,000 attempts USD: {costs["projected_cost_1k_attempts_usd"] if costs["projected_cost_1k_attempts_usd"] is not None else "unavailable"}
+- Projected 160,000 attempts USD: {costs["projected_cost_160k_attempts_usd"] if costs["projected_cost_160k_attempts_usd"] is not None else "unavailable"}
+- Projected 1,000 valid annotations USD: {costs["projected_cost_1k_valid_annotations_usd"] if costs["projected_cost_1k_valid_annotations_usd"] is not None else "unavailable"}
+- Projected 160,000 valid annotations USD: {costs["projected_cost_160k_valid_annotations_usd"] if costs["projected_cost_160k_valid_annotations_usd"] is not None else "unavailable"}
+
+{costs["projection_note"]}
 """
     (output / "report.md").write_text(report, encoding="utf-8")

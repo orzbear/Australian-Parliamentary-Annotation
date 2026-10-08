@@ -118,6 +118,20 @@ def _safe_message(error: Exception) -> str:
     return "provider request failed"
 
 
+def _sum_usage(values: list[TokenUsage]) -> TokenUsage:
+    def total(field: str) -> int | None:
+        present = [getattr(value, field) for value in values if getattr(value, field) is not None]
+        return sum(present) if present else None
+
+    return TokenUsage(
+        total("input_tokens"),
+        total("cached_input_tokens"),
+        total("output_tokens"),
+        total("reasoning_tokens"),
+        total("total_tokens"),
+    )
+
+
 def evaluate(
     package: EvaluationPackage,
     records: tuple[dict[str, Any], ...],
@@ -146,6 +160,7 @@ def evaluate(
             response = None
             error: Exception | None = None
             retries = 0
+            attempt_usage: list[TokenUsage] = []
             for attempt in range(max_retries + 1):
                 try:
                     response = provider.generate(
@@ -155,25 +170,32 @@ def evaluate(
                         schema=schema,
                         generation=generation,
                     )
+                    attempt_usage.append(response.usage)
                     error = None
                     break
                 except Exception as caught:
                     error = caught
+                    if isinstance(caught, ProviderError):
+                        attempt_usage.append(caught.usage)
                     if attempt < max_retries:
                         retries += 1
                         sleeper(retry_delay * (attempt + 1))
             latency = round((time.perf_counter() - started) * 1000)
             if response is None:
+                failure_usage = _sum_usage(attempt_usage)
+                failure_model = error.returned_model if isinstance(error, ProviderError) else None
+                failure_diagnostics = error.diagnostics if isinstance(error, ProviderError) else {}
                 result = RequestResult(
                     record_id,
                     "api_failure",
                     None,
-                    TokenUsage(),
+                    failure_usage,
                     latency,
                     retries,
-                    None,
+                    failure_model,
                     type(error).__name__ if error else "ProviderError",
                     _safe_message(error or ProviderError("provider request failed")),
+                    failure_diagnostics,
                 )
             else:
                 try:
@@ -182,22 +204,26 @@ def evaluate(
                         record_id,
                         "success",
                         prediction,
-                        response.usage,
+                        _sum_usage(attempt_usage),
                         latency,
                         retries,
                         response.returned_model,
+                        diagnostics=response.diagnostics,
                     )
                 except InvalidPrediction as invalid:
+                    diagnostics = dict(response.diagnostics)
+                    diagnostics["schema_validation_error"] = str(invalid)
                     result = RequestResult(
                         record_id,
                         "invalid",
                         None,
-                        response.usage,
+                        _sum_usage(attempt_usage),
                         latency,
                         retries,
                         response.returned_model,
                         type(invalid).__name__,
                         str(invalid),
+                        diagnostics,
                     )
             value = result.to_dict()
             destination.write(json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n")

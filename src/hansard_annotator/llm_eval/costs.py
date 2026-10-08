@@ -41,17 +41,22 @@ def aggregate_costs(
         for field in fields
     }
     successful = sum(result.get("status") == "success" for result in results)
+    attempts = len(results)
     entry = pricing["models"].get(f"{provider}:{model}")
     estimated: float | None = None
+    billable_output_tokens = tokens["output_tokens"]
     if isinstance(entry, dict):
+        if entry.get("reasoning_billed_as_output") is True:
+            billable_output_tokens += tokens["reasoning_tokens"]
         input_uncached = max(0, tokens["input_tokens"] - tokens["cached_input_tokens"])
         estimated = (
             input_uncached * _price(entry, "input_per_million_usd")
             + tokens["cached_input_tokens"]
             * _price(entry, "cached_input_per_million_usd", _price(entry, "input_per_million_usd"))
-            + tokens["output_tokens"] * _price(entry, "output_per_million_usd")
+            + billable_output_tokens * _price(entry, "output_per_million_usd")
         ) / 1_000_000
-    per_speech = estimated / successful if estimated is not None and successful else None
+    per_attempt = estimated / attempts if estimated is not None and attempts else None
+    per_valid = estimated / successful if estimated is not None and successful else None
     return {
         "pricing_format_version": pricing["format_version"],
         "pricing_effective_date": pricing.get("effective_date"),
@@ -59,13 +64,35 @@ def aggregate_costs(
         "pricing_model_key": f"{provider}:{model}",
         "pricing_found": entry is not None,
         "tokens": tokens,
+        "billable_tokens": {
+            "uncached_input_tokens": max(0, tokens["input_tokens"] - tokens["cached_input_tokens"]),
+            "cached_input_tokens": tokens["cached_input_tokens"],
+            "output_tokens": billable_output_tokens,
+            "reasoning_tokens_billed_as_output": (
+                tokens["reasoning_tokens"]
+                if isinstance(entry, dict) and entry.get("reasoning_billed_as_output") is True
+                else 0
+            ),
+        },
+        "attempted_requests": attempts,
         "successful_requests": successful,
         "estimated_cost_usd": estimated,
-        "cost_per_speech_usd": per_speech,
-        "projected_cost_1k_speeches_usd": per_speech * 1_000 if per_speech is not None else None,
-        "projected_cost_160k_speeches_usd": per_speech * 160_000
-        if per_speech is not None
+        "cost_per_attempt_usd": per_attempt,
+        "cost_per_valid_annotation_usd": per_valid,
+        "projected_cost_1k_attempts_usd": per_attempt * 1_000 if per_attempt is not None else None,
+        "projected_cost_160k_attempts_usd": per_attempt * 160_000
+        if per_attempt is not None
         else None,
+        "projected_cost_1k_valid_annotations_usd": per_valid * 1_000
+        if per_valid is not None
+        else None,
+        "projected_cost_160k_valid_annotations_usd": per_valid * 160_000
+        if per_valid is not None
+        else None,
+        "projection_note": (
+            "Mechanical linear extrapolations from this run; small samples are not reliable "
+            "production forecasts."
+        ),
         "total_latency_ms": sum(int(result.get("latency_ms", 0)) for result in results),
         "total_retries": sum(int(result.get("retry_count", 0)) for result in results),
     }

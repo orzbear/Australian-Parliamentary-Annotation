@@ -36,6 +36,7 @@ class ProviderResponse:
     raw_prediction: object
     usage: TokenUsage = field(default_factory=TokenUsage)
     returned_model: str | None = None
+    diagnostics: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,7 @@ class RequestResult:
     returned_model: str | None
     error_type: str | None = None
     error_message: str | None = None
+    diagnostics: dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)

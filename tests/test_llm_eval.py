@@ -212,24 +212,54 @@ def test_usage_and_cost_aggregation() -> None:
                 "reasoning_tokens": 30,
                 "total_tokens": 1100,
             },
-        }
+        },
+        {
+            "status": "invalid",
+            "latency_ms": 10,
+            "retry_count": 0,
+            "usage": {
+                "input_tokens": 500,
+                "cached_input_tokens": 100,
+                "output_tokens": 20,
+                "reasoning_tokens": 50,
+                "total_tokens": 570,
+            },
+        },
+        {
+            "status": "api_failure",
+            "latency_ms": 10,
+            "retry_count": 0,
+            "usage": {
+                "input_tokens": 100,
+                "cached_input_tokens": 0,
+                "output_tokens": 0,
+                "reasoning_tokens": 10,
+                "total_tokens": 110,
+            },
+        },
     ]
     pricing = {
         "format_version": 1,
         "effective_date": "2026-01-01",
         "source": "fixture",
         "models": {
-            "openai:test": {
+            "gemini:test": {
                 "input_per_million_usd": 2,
                 "cached_input_per_million_usd": 1,
                 "output_per_million_usd": 10,
+                "reasoning_billed_as_output": True,
             }
         },
     }
-    report = aggregate_costs(results, "openai", "test", pricing)
-    assert report["tokens"]["reasoning_tokens"] == 30
-    assert report["estimated_cost_usd"] == pytest.approx(0.0028)
-    assert report["projected_cost_160k_speeches_usd"] == pytest.approx(448.0)
+    report = aggregate_costs(results, "gemini", "test", pricing)
+    assert report["tokens"]["reasoning_tokens"] == 90
+    assert report["billable_tokens"]["output_tokens"] == 210
+    assert report["estimated_cost_usd"] == pytest.approx(0.0050)
+    assert report["attempted_requests"] == 3
+    assert report["successful_requests"] == 1
+    assert report["cost_per_attempt_usd"] == pytest.approx(0.0050 / 3)
+    assert report["cost_per_valid_annotation_usd"] == pytest.approx(0.0050)
+    assert "Mechanical" in report["projection_note"]
 
 
 class FakeProvider:
@@ -259,7 +289,10 @@ class FakeProvider:
 def test_incremental_resume_retry_and_incompatible_configuration(tmp_path: Path) -> None:
     package = load_evaluation_package(_package_dir(tmp_path, [_record(1)]))
     output = tmp_path / "run"
-    provider = FakeProvider(failures=1)
+    provider = FakeProvider(
+        failures=1,
+        error=ProviderError("billed retry", usage=TokenUsage(5, 1, 0, 2, 7)),
+    )
     first = evaluate(
         package,
         package.records,
@@ -272,6 +305,13 @@ def test_incremental_resume_retry_and_incompatible_configuration(tmp_path: Path)
         sleeper=lambda _: None,
     )
     assert first[0]["status"] == "success" and first[0]["retry_count"] == 1
+    assert first[0]["usage"] == {
+        "input_tokens": 15,
+        "cached_input_tokens": 3,
+        "output_tokens": 3,
+        "reasoning_tokens": 3,
+        "total_tokens": 20,
+    }
     assert provider.calls == 2
     evaluate(package, package.records, provider, "model-a", output, {"temperature": 0})
     assert provider.calls == 2
@@ -287,9 +327,19 @@ def test_provider_failure_checkpoint_is_retryable_and_secret_is_redacted(
     secret = "super-secret-api-value"
     monkeypatch.setenv("OPENAI_API_KEY", secret)
     output = tmp_path / "run"
-    failed_provider = FakeProvider(failures=10, error=ProviderError(f"request rejected {secret}"))
+    failed_provider = FakeProvider(
+        failures=10,
+        error=ProviderError(
+            f"request rejected {secret}",
+            usage=TokenUsage(10, 2, 0, 3, 13),
+            returned_model="billed-failure-model",
+            diagnostics={"provider_finish_reason": "SAFETY"},
+        ),
+    )
     failed = evaluate(package, package.records, failed_provider, "model", output, {}, max_retries=0)
     assert failed[0]["status"] == "api_failure"
+    assert failed[0]["usage"]["reasoning_tokens"] == 3
+    assert failed[0]["returned_model"] == "billed-failure-model"
     assert secret not in (output / "predictions.jsonl").read_text(encoding="utf-8")
     successful_provider = FakeProvider()
     resumed = evaluate(package, package.records, successful_provider, "model", output, {})
@@ -326,6 +376,55 @@ def test_invalid_response_and_deterministic_mismatches(tmp_path: Path) -> None:
         mismatches(package.records, valid_results, snippet_chars=10)[0]["human_primary_domain"]
         == "AU01"
     )
+
+
+@pytest.mark.parametrize(
+    ("response_text", "expected_type", "parsed"),
+    (("[]", "array", True), ('"wrapped"', "string", True), ("{malformed", "string", False)),
+)
+def test_gemini_invalid_top_level_shapes_persist_bounded_diagnostics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    response_text: str,
+    expected_type: str,
+    parsed: bool,
+) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "fixture-secret")
+    package = load_evaluation_package(_package_dir(tmp_path, [_record(1)]))
+
+    def transport(
+        _url: str, _headers: dict[str, str], payload: dict[str, Any], _timeout: float
+    ) -> dict[str, Any]:
+        assert payload["generationConfig"]["responseMimeType"] == "application/json"
+        assert payload["generationConfig"]["responseJsonSchema"]["type"] == "object"
+        return {
+            "modelVersion": "gemini-2.5-flash",
+            "candidates": [
+                {
+                    "finishReason": "STOP",
+                    "content": {"parts": [{"text": response_text}]},
+                }
+            ],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 2,
+                "thoughtsTokenCount": 3,
+                "totalTokenCount": 15,
+            },
+        }
+
+    provider = GeminiProvider(transport=transport)
+    output = tmp_path / f"run-{expected_type}-{parsed}"
+    results = evaluate(package, package.records, provider, "gemini-2.5-flash", output, {})
+    assert results[0]["status"] == "invalid"
+    diagnostics = results[0]["diagnostics"]
+    assert diagnostics["parsed_top_level_json_type"] == expected_type
+    assert diagnostics["json_parse_succeeded"] is parsed
+    assert diagnostics["provider_finish_reason"] == "STOP"
+    assert diagnostics["response_content_exists"] is True
+    assert diagnostics["native_structured_output_requested"] is True
+    assert diagnostics["schema_validation_error"] == "response is not an object"
+    assert len(diagnostics["structured_response_preview"]) <= 2000
 
 
 def test_openai_and_gemini_adapters_parse_usage(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -380,10 +479,11 @@ def test_openai_and_gemini_adapters_parse_usage(monkeypatch: pytest.MonkeyPatch)
         system_prompt="system",
         user_prompt="user",
         schema={"type": "object"},
-        generation={},
+        generation={"thinking_mode": "disabled", "thinking_budget": 0},
     )
     assert gemini.returned_model == "returned-gemini" and gemini.usage.reasoning_tokens == 1
     assert "gemini-secret" not in json.dumps(captured[1][2])
+    assert captured[1][2]["generationConfig"]["thinkingConfig"] == {"thinkingBudget": 0}
 
 
 def test_run_identity_changes_with_material_configuration(tmp_path: Path) -> None:
@@ -391,3 +491,16 @@ def test_run_identity_changes_with_material_configuration(tmp_path: Path) -> Non
     first, _ = make_configuration(package, "openai", "one", {"temperature": 0})
     second, _ = make_configuration(package, "openai", "two", {"temperature": 0})
     assert first.identity() != second.identity()
+    dynamic, _ = make_configuration(
+        package,
+        "gemini",
+        "gemini-2.5-flash",
+        {"thinking_mode": "provider_default_dynamic"},
+    )
+    disabled, _ = make_configuration(
+        package,
+        "gemini",
+        "gemini-2.5-flash",
+        {"thinking_mode": "disabled", "thinking_budget": 0},
+    )
+    assert dynamic.identity() != disabled.identity()

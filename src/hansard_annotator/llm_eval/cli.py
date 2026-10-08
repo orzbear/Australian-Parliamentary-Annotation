@@ -80,8 +80,12 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("max_output_tokens must be positive")
         if arguments.snippet_chars < 0:
             raise ValueError("snippet_chars must be non-negative")
-        if arguments.thinking_budget is not None and arguments.thinking_budget < 0:
-            raise ValueError("thinking_budget must be non-negative")
+        if arguments.thinking_budget not in {None, 0}:
+            raise ValueError("Phase 4A currently supports only thinking_budget=0")
+        if arguments.provider != "gemini" and arguments.thinking_budget is not None:
+            raise ValueError("thinking_budget is only valid for Gemini")
+        if arguments.provider != "openai" and arguments.reasoning_effort is not None:
+            raise ValueError("reasoning_effort is only valid for OpenAI")
         package = load_evaluation_package(arguments.input)
         records = _select(
             package.records, arguments.record_id, arguments.subset_seed, arguments.limit
@@ -92,8 +96,12 @@ def main(argv: list[str] | None = None) -> int:
         }
         if arguments.reasoning_effort is not None:
             generation["reasoning_effort"] = arguments.reasoning_effort
-        if arguments.thinking_budget is not None:
-            generation["thinking_budget"] = arguments.thinking_budget
+        if arguments.provider == "gemini":
+            generation["thinking_mode"] = (
+                "disabled" if arguments.thinking_budget == 0 else "provider_default_dynamic"
+            )
+            if arguments.thinking_budget == 0:
+                generation["thinking_budget"] = 0
         provider = provider_for(arguments.provider)
         configuration, _ = make_configuration(
             package, arguments.provider, arguments.model, generation
@@ -107,6 +115,7 @@ def main(argv: list[str] | None = None) -> int:
                         "records": len(records),
                         "provider": arguments.provider,
                         "model": arguments.model,
+                        "generation": generation,
                         "run_identity": configuration.identity(),
                         "package_snapshot_sha256": package.manifest["snapshot_sha256"],
                         "schema_version": package.schema["version"],

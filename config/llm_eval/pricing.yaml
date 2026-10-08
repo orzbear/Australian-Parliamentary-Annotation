@@ -1,4 +1,9 @@
 format_version: 1
-effective_date: null
-source: "Researcher-maintained. Verify provider pricing before each paid run."
-models: {}
+effective_date: "2026-10-08"
+source: "Standard API pricing verified by researcher on 2026-10-08."
+models:
+  "gemini:gemini-2.5-flash":
+    input_per_million_usd: 0.30
+    cached_input_per_million_usd: 0.03
+    output_per_million_usd: 2.50
+    reasoning_billed_as_output: true
