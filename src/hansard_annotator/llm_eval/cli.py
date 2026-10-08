@@ -16,6 +16,7 @@ from hansard_annotator.llm_eval.prompt import DEFAULT_PROMPT_VERSION, available_
 from hansard_annotator.llm_eval.providers import provider_for
 from hansard_annotator.llm_eval.reporting import mismatches, write_reports
 from hansard_annotator.llm_eval.runner import evaluate, make_configuration
+from hansard_annotator.llm_eval.selection import ExclusionSet, load_exclusion_set
 
 
 def parser() -> argparse.ArgumentParser:
@@ -36,6 +37,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--output", type=Path, required=True)
     result.add_argument("--limit", type=int)
     result.add_argument("--record-id", action="append", default=[])
+    result.add_argument("--exclude-record-ids", type=Path)
     result.add_argument("--subset-seed", type=int)
     result.add_argument("--temperature", type=float, default=0.0)
     result.add_argument("--max-output-tokens", type=int, default=1000)
@@ -51,11 +53,19 @@ def parser() -> argparse.ArgumentParser:
 
 
 def _select(
-    records: tuple[dict[str, Any], ...], record_ids: list[str], seed: int | None, limit: int | None
+    records: tuple[dict[str, Any], ...],
+    record_ids: list[str],
+    seed: int | None,
+    limit: int | None,
+    exclusions: ExclusionSet | None = None,
 ) -> tuple[dict[str, Any], ...]:
     if limit is not None and limit < 1:
         raise ValueError("limit must be positive")
-    selected = records
+    selected = tuple(
+        record
+        for record in records
+        if exclusions is None or str(record["record_id"]) not in exclusions.record_ids
+    )
     if record_ids:
         wanted = set(record_ids)
         selected = tuple(record for record in records if record["record_id"] in wanted)
@@ -93,9 +103,24 @@ def main(argv: list[str] | None = None) -> int:
         if arguments.provider != "openai" and arguments.reasoning_effort is not None:
             raise ValueError("reasoning_effort is only valid for OpenAI")
         package = load_evaluation_package(arguments.input)
-        records = _select(
-            package.records, arguments.record_id, arguments.subset_seed, arguments.limit
+        exclusions = (
+            load_exclusion_set(
+                arguments.exclude_record_ids,
+                package_snapshot_sha256=str(package.manifest["snapshot_sha256"]),
+                package_record_ids={str(record["record_id"]) for record in package.records},
+            )
+            if arguments.exclude_record_ids is not None
+            else None
         )
+        records = _select(
+            package.records,
+            arguments.record_id,
+            arguments.subset_seed,
+            arguments.limit,
+            exclusions,
+        )
+        excluded_count = exclusions.count if exclusions is not None else 0
+        exclusion_sha256 = exclusions.sha256 if exclusions is not None else None
         generation = {
             "temperature": arguments.temperature,
             "max_output_tokens": arguments.max_output_tokens,
@@ -115,6 +140,8 @@ def main(argv: list[str] | None = None) -> int:
             arguments.model,
             generation,
             arguments.prompt_version,
+            excluded_count,
+            exclusion_sha256,
         )
         if arguments.dry_run:
             print(
@@ -123,6 +150,10 @@ def main(argv: list[str] | None = None) -> int:
                         "ok": True,
                         "dry_run": True,
                         "records": len(records),
+                        "package_records": len(package.records),
+                        "excluded_records": excluded_count,
+                        "selected_records": len(records),
+                        "exclusion_set_sha256": exclusion_sha256,
                         "provider": arguments.provider,
                         "model": arguments.model,
                         "prompt_version": arguments.prompt_version,
@@ -149,6 +180,8 @@ def main(argv: list[str] | None = None) -> int:
             max_retries=arguments.max_retries,
             retry_delay=arguments.retry_delay,
             prompt_version=arguments.prompt_version,
+            exclusion_record_count=excluded_count,
+            exclusion_set_sha256=exclusion_sha256,
         )
         metric_values = compute_metrics(records, results, package.domain_codes)
         cost_values = aggregate_costs(results, arguments.provider, arguments.model, pricing)

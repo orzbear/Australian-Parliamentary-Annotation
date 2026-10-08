@@ -8,12 +8,14 @@ from zipfile import ZipFile
 
 import pytest
 
+from hansard_annotator.llm_eval.cli import _select
 from hansard_annotator.llm_eval.costs import aggregate_costs
 from hansard_annotator.llm_eval.metrics import compute_metrics
 from hansard_annotator.llm_eval.models import ProviderResponse, TokenUsage
 from hansard_annotator.llm_eval.package import EvaluationPackage, load_evaluation_package
 from hansard_annotator.llm_eval.prompt import (
     DEFAULT_PROMPT_VERSION,
+    PROMPT_V2,
     available_prompt_versions,
     build_system_prompt,
     prompt_hash,
@@ -21,6 +23,7 @@ from hansard_annotator.llm_eval.prompt import (
 from hansard_annotator.llm_eval.providers import GeminiProvider, OpenAIProvider, ProviderError
 from hansard_annotator.llm_eval.reporting import mismatches
 from hansard_annotator.llm_eval.runner import evaluate, make_configuration
+from hansard_annotator.llm_eval.selection import exclusion_hash, load_exclusion_set
 from hansard_annotator.llm_eval.validation import InvalidPrediction, validate_prediction
 
 DOMAINS = ("AU01", "AU02", "AU03", "AU_OTHER_REVIEW")
@@ -40,7 +43,7 @@ def _record(
         "annotation_notes": None,
     }
     return {
-        "record_id": f"annotation:{number}:revision:1",
+        "record_id": (f"annotation:00000000-0000-0000-0000-{number:012d}:revision:1"),
         "speech": {
             "turn_key": f"turn-{number}",
             "text": f"Speech {number} about hospitals",
@@ -550,3 +553,91 @@ def test_v2_encodes_policy_first_hierarchy_and_research_rules(tmp_path: Path) ->
     assert "AU_OTHER_REVIEW is not a general uncertainty" in prompt
     assert "ceremonial remarks" in prompt
     assert "Government funding does not automatically pass the policy gate" in prompt
+
+
+def test_v2_prompt_text_is_frozen() -> None:
+    assert (
+        hashlib.sha256(PROMPT_V2.encode("utf-8")).hexdigest()
+        == "b98b37d248e3b990e6a2feb1f9f6057ccb985471f6ed6e92e39900238076c744"
+    )
+
+
+def test_explicit_exclusion_is_compatible_deterministic_and_changes_run_identity(
+    tmp_path: Path,
+) -> None:
+    package = load_evaluation_package(_package_dir(tmp_path, [_record(1), _record(2), _record(3)]))
+    excluded_id = str(package.records[1]["record_id"])
+    exclusion_path = tmp_path / "development.txt"
+    exclusion_path.write_text(excluded_id + "\n", encoding="utf-8")
+    manifest = {
+        "development_record_count": 1,
+        "record_ids_sha256": exclusion_hash({excluded_id}),
+        "source_package_snapshot_sha256": package.manifest["snapshot_sha256"],
+    }
+    exclusion_path.with_suffix(".manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    exclusions = load_exclusion_set(
+        exclusion_path,
+        package_snapshot_sha256=str(package.manifest["snapshot_sha256"]),
+        package_record_ids={str(record["record_id"]) for record in package.records},
+    )
+    first = _select(package.records, [], 17, None, exclusions)
+    second = _select(package.records, [], 17, None, exclusions)
+    assert first == second
+    assert len(first) == 2
+    assert excluded_id not in {record["record_id"] for record in first}
+    baseline, _ = make_configuration(package, "gemini", "model", {})
+    held_out, _ = make_configuration(
+        package,
+        "gemini",
+        "model",
+        {},
+        exclusion_record_count=exclusions.count,
+        exclusion_set_sha256=exclusions.sha256,
+    )
+    assert held_out.exclusion_record_count == 1
+    assert held_out.exclusion_set_sha256 == exclusions.sha256
+    assert baseline.identity() != held_out.identity()
+
+
+@pytest.mark.parametrize(
+    "content",
+    (
+        "not-a-record-id\n",
+        "annotation:00000000-0000-0000-0000-000000000001:revision:0\n",
+        "annotation:00000000-0000-0000-0000-000000000001:revision:1\n"
+        "annotation:00000000-0000-0000-0000-000000000001:revision:1\n",
+    ),
+)
+def test_malformed_or_duplicate_exclusion_files_fail(tmp_path: Path, content: str) -> None:
+    package = load_evaluation_package(_package_dir(tmp_path, [_record(1)]))
+    path = tmp_path / "bad.txt"
+    path.write_text(content, encoding="utf-8")
+    with pytest.raises(ValueError, match=r"malformed|duplicate"):
+        load_exclusion_set(
+            path,
+            package_snapshot_sha256=str(package.manifest["snapshot_sha256"]),
+            package_record_ids={str(package.records[0]["record_id"])},
+        )
+
+
+def test_exclusion_manifest_rejects_an_incompatible_package(tmp_path: Path) -> None:
+    package = load_evaluation_package(_package_dir(tmp_path, [_record(1)]))
+    record_id = str(package.records[0]["record_id"])
+    path = tmp_path / "development.txt"
+    path.write_text(record_id + "\n", encoding="utf-8")
+    path.with_suffix(".manifest.json").write_text(
+        json.dumps(
+            {
+                "development_record_count": 1,
+                "record_ids_sha256": exclusion_hash({record_id}),
+                "source_package_snapshot_sha256": "different-snapshot",
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="incompatible"):
+        load_exclusion_set(
+            path,
+            package_snapshot_sha256=str(package.manifest["snapshot_sha256"]),
+            package_record_ids={record_id},
+        )

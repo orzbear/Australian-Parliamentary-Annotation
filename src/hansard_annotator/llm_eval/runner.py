@@ -36,9 +36,15 @@ class RunConfiguration:
     prompt_version: str
     prompt_sha256: str
     generation: dict[str, Any]
+    exclusion_record_count: int = 0
+    exclusion_set_sha256: str | None = None
 
     def identity(self) -> str:
-        payload = json.dumps(asdict(self), sort_keys=True, separators=(",", ":"))
+        values = asdict(self)
+        if self.exclusion_record_count == 0 and self.exclusion_set_sha256 is None:
+            values.pop("exclusion_record_count")
+            values.pop("exclusion_set_sha256")
+        payload = json.dumps(values, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -57,6 +63,8 @@ def make_configuration(
     model: str,
     generation: dict[str, Any],
     prompt_version: str = DEFAULT_PROMPT_VERSION,
+    exclusion_record_count: int = 0,
+    exclusion_set_sha256: str | None = None,
 ) -> tuple[RunConfiguration, str]:
     system = build_system_prompt(package.context, prompt_version)
     schema = package.schema
@@ -69,6 +77,8 @@ def make_configuration(
         prompt_version,
         prompt_hash(system),
         generation,
+        exclusion_record_count,
+        exclusion_set_sha256,
     ), system
 
 
@@ -149,9 +159,17 @@ def evaluate(
     retry_delay: float = 1.0,
     sleeper: Callable[[float], None] = time.sleep,
     prompt_version: str = DEFAULT_PROMPT_VERSION,
+    exclusion_record_count: int = 0,
+    exclusion_set_sha256: str | None = None,
 ) -> list[dict[str, Any]]:
     configuration, system_prompt = make_configuration(
-        package, provider.name, model, generation, prompt_version
+        package,
+        provider.name,
+        model,
+        generation,
+        prompt_version,
+        exclusion_record_count,
+        exclusion_set_sha256,
     )
     initialise_run(output, configuration, resume=resume)
     checkpoint_path = output / "predictions.jsonl"

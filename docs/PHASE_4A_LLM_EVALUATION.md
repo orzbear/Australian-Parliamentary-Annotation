@@ -67,10 +67,22 @@ policy-first hierarchy, ceremonial/descriptive and grant-only exclusions, vetera
 disaster-recovery (`AU07`) precedence, stricter secondary-domain rules, and restricted use of
 `AU_OTHER_REVIEW`. It does not replace the formal taxonomy.
 
+`phase4a-policy-v1` is the historical baseline. `phase4a-policy-v2` is frozen for held-out
+Phase 4A validation: its text and substantive rules must not be changed in response to held-out
+results. Any later substantive prompt change requires a new version such as
+`phase4a-policy-v3`.
+
 The first 30 human-annotated records were used to diagnose v1 and design v2. They are therefore
 a development sample; subsequent v2 performance on those records is not an unbiased final
 evaluation. The remaining human-annotated records should remain untouched as a later validation
 sample until v2 is frozen.
+
+The exact development records are stored one stable ID per line in the ignored research file
+`data/review/phase4a-development-record-ids.txt`. Its adjacent manifest pins the package
+snapshot, count, purpose, creation date, and canonical ID-set hash. Held-out runs use
+`--exclude-record-ids` rather than a numeric offset. The evaluator rejects malformed,
+duplicate, unknown, hash-mismatched, or package-incompatible exclusions. Exclusion count and
+hash are part of run metadata and identity.
 
 The header-only research artifact
 `data/review/phase4a-development-adjudication.csv` supports manual development-set review. Its
