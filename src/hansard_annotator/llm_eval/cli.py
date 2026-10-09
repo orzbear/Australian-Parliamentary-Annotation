@@ -39,9 +39,11 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--record-id", action="append", default=[])
     result.add_argument("--exclude-record-ids", type=Path)
     result.add_argument("--subset-seed", type=int)
-    result.add_argument("--temperature", type=float, default=0.0)
+    result.add_argument("--temperature", type=float)
     result.add_argument("--max-output-tokens", type=int, default=1000)
-    result.add_argument("--reasoning-effort", choices=("minimal", "low", "medium", "high"))
+    result.add_argument(
+        "--reasoning-effort", choices=("none", "minimal", "low", "medium", "high")
+    )
     result.add_argument("--thinking-budget", type=int)
     result.add_argument("--max-retries", type=int, default=2)
     result.add_argument("--retry-delay", type=float, default=1.0)
@@ -121,10 +123,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         excluded_count = exclusions.count if exclusions is not None else 0
         exclusion_sha256 = exclusions.sha256 if exclusions is not None else None
-        generation = {
-            "temperature": arguments.temperature,
-            "max_output_tokens": arguments.max_output_tokens,
-        }
+        generation = {"max_output_tokens": arguments.max_output_tokens}
+        if arguments.temperature is not None:
+            generation["temperature"] = arguments.temperature
+        elif arguments.provider == "gemini":
+            generation["temperature"] = 0.0
         if arguments.reasoning_effort is not None:
             generation["reasoning_effort"] = arguments.reasoning_effort
         if arguments.provider == "gemini":
@@ -143,7 +146,9 @@ def main(argv: list[str] | None = None) -> int:
             excluded_count,
             exclusion_sha256,
         )
+        pricing = load_pricing(arguments.pricing)
         if arguments.dry_run:
+            pricing_check = aggregate_costs([], arguments.provider, arguments.model, pricing)
             print(
                 json.dumps(
                     {
@@ -162,13 +167,17 @@ def main(argv: list[str] | None = None) -> int:
                         "package_snapshot_sha256": package.manifest["snapshot_sha256"],
                         "schema_version": package.schema["version"],
                         "schema_sha256": package.schema["content_sha256"],
+                        "provider_prediction_schema_sha256": (
+                            configuration.provider_prediction_schema_sha256
+                        ),
+                        "pricing_found": pricing_check["pricing_found"],
+                        "pricing_effective_date": pricing_check["pricing_effective_date"],
                     },
                     indent=2,
                     sort_keys=True,
                 )
             )
             return 0
-        pricing = load_pricing(arguments.pricing)
         results = evaluate(
             package,
             records,

@@ -22,7 +22,11 @@ from hansard_annotator.llm_eval.prompt import (
     prediction_json_schema,
     prompt_hash,
 )
-from hansard_annotator.llm_eval.providers import ModelProvider, ProviderError
+from hansard_annotator.llm_eval.providers import (
+    ModelProvider,
+    ProviderError,
+    provider_prediction_schema_hash,
+)
 from hansard_annotator.llm_eval.validation import InvalidPrediction, validate_prediction
 
 
@@ -38,12 +42,15 @@ class RunConfiguration:
     generation: dict[str, Any]
     exclusion_record_count: int = 0
     exclusion_set_sha256: str | None = None
+    provider_prediction_schema_sha256: str | None = None
 
     def identity(self) -> str:
         values = asdict(self)
         if self.exclusion_record_count == 0 and self.exclusion_set_sha256 is None:
             values.pop("exclusion_record_count")
             values.pop("exclusion_set_sha256")
+        if self.provider_prediction_schema_sha256 is None:
+            values.pop("provider_prediction_schema_sha256")
         payload = json.dumps(values, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -68,6 +75,7 @@ def make_configuration(
 ) -> tuple[RunConfiguration, str]:
     system = build_system_prompt(package.context, prompt_version)
     schema = package.schema
+    prediction_schema = prediction_json_schema(package.domain_codes)
     return RunConfiguration(
         provider,
         model,
@@ -79,6 +87,11 @@ def make_configuration(
         generation,
         exclusion_record_count,
         exclusion_set_sha256,
+        (
+            provider_prediction_schema_hash(provider, prediction_schema)
+            if provider == "openai"
+            else None
+        ),
     ), system
 
 
@@ -202,9 +215,12 @@ def evaluate(
                     error = caught
                     if isinstance(caught, ProviderError):
                         attempt_usage.append(caught.usage)
-                    if attempt < max_retries:
+                    retryable = isinstance(caught, ProviderError) and caught.retryable
+                    if attempt < max_retries and retryable:
                         retries += 1
                         sleeper(retry_delay * (attempt + 1))
+                    else:
+                        break
             latency = round((time.perf_counter() - started) * 1000)
             if response is None:
                 failure_usage = _sum_usage(attempt_usage)

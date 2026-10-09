@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError
 from zipfile import ZipFile
 
 import pytest
 
+import hansard_annotator.llm_eval.providers as provider_module
 from hansard_annotator.llm_eval.cli import _select
 from hansard_annotator.llm_eval.costs import aggregate_costs
 from hansard_annotator.llm_eval.metrics import compute_metrics
@@ -18,9 +21,15 @@ from hansard_annotator.llm_eval.prompt import (
     PROMPT_V2,
     available_prompt_versions,
     build_system_prompt,
+    prediction_json_schema,
     prompt_hash,
 )
-from hansard_annotator.llm_eval.providers import GeminiProvider, OpenAIProvider, ProviderError
+from hansard_annotator.llm_eval.providers import (
+    GeminiProvider,
+    OpenAIProvider,
+    ProviderError,
+    provider_prediction_schema,
+)
 from hansard_annotator.llm_eval.reporting import mismatches
 from hansard_annotator.llm_eval.runner import evaluate, make_configuration
 from hansard_annotator.llm_eval.selection import exclusion_hash, load_exclusion_set
@@ -167,6 +176,16 @@ def test_structured_prediction_validation() -> None:
             },
             DOMAINS,
         )
+    with pytest.raises(InvalidPrediction, match="must be unique"):
+        validate_prediction(
+            {
+                "is_non_policy": False,
+                "primary_australian_domain": "AU01",
+                "secondary_australian_domains": ["AU02", "AU02"],
+                "reasoning": "Duplicate domains.",
+            },
+            DOMAINS,
+        )
 
 
 def test_metrics_confusions_failures_and_zero_support() -> None:
@@ -271,6 +290,27 @@ def test_usage_and_cost_aggregation() -> None:
     assert "Mechanical" in report["projection_note"]
 
 
+def test_model_specific_pricing_metadata_is_reported() -> None:
+    pricing = {
+        "format_version": 1,
+        "effective_date": "historical-date",
+        "source": "historical-source",
+        "models": {
+            "openai:gpt-6-luna": {
+                "input_per_million_usd": 0.10,
+                "cached_input_per_million_usd": 0.01,
+                "output_per_million_usd": 0.50,
+                "effective_date": "2026-10-08",
+                "source": "OpenAI Standard API pricing",
+            }
+        },
+    }
+    report = aggregate_costs([], "openai", "gpt-6-luna", pricing)
+    assert report["pricing_found"] is True
+    assert report["pricing_effective_date"] == "2026-10-08"
+    assert report["pricing_source"] == "OpenAI Standard API pricing"
+
+
 class FakeProvider:
     name = "fake"
 
@@ -300,7 +340,9 @@ def test_incremental_resume_retry_and_incompatible_configuration(tmp_path: Path)
     output = tmp_path / "run"
     provider = FakeProvider(
         failures=1,
-        error=ProviderError("billed retry", usage=TokenUsage(5, 1, 0, 2, 7)),
+        error=ProviderError(
+            "billed retry", usage=TokenUsage(5, 1, 0, 2, 7), retryable=True
+        ),
     )
     first = evaluate(
         package,
@@ -447,7 +489,15 @@ def test_openai_and_gemini_adapters_parse_usage(monkeypatch: pytest.MonkeyPatch)
         captured.append((url, headers, payload))
         return {
             "model": "returned-openai",
-            "output_text": json.dumps({"ok": True}),
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {"type": "output_text", "text": json.dumps({"ok": True})}
+                    ],
+                }
+            ],
             "usage": {
                 "input_tokens": 10,
                 "output_tokens": 2,
@@ -457,14 +507,33 @@ def test_openai_and_gemini_adapters_parse_usage(monkeypatch: pytest.MonkeyPatch)
             },
         }
 
+    canonical_schema = prediction_json_schema(DOMAINS)
     openai = OpenAIProvider(transport=openai_transport).generate(
         model="configured",
         system_prompt="system",
         user_prompt="user",
-        schema={"type": "object"},
-        generation={},
+        schema=canonical_schema,
+        generation={"reasoning_effort": "none"},
     )
     assert openai.returned_model == "returned-openai" and openai.usage.cached_input_tokens == 3
+    assert openai.usage.reasoning_tokens == 1
+    assert openai.diagnostics["native_structured_output_requested"] is True
+    assert captured[0][0] == "https://api.openai.com/v1/responses"
+    assert captured[0][2]["instructions"] == "system"
+    assert captured[0][2]["input"] == "user"
+    assert captured[0][2]["reasoning"] == {"effort": "none"}
+    assert captured[0][2]["max_output_tokens"] == 1000
+    assert "temperature" not in captured[0][2] and "top_p" not in captured[0][2]
+    request_schema = captured[0][2]["text"]["format"]["schema"]
+    assert captured[0][2]["text"]["format"]["name"] == "phase4a_prediction"
+    assert captured[0][2]["text"]["format"]["strict"] is True
+    assert "uniqueItems" not in request_schema["properties"]["secondary_australian_domains"]
+    assert request_schema["properties"]["secondary_australian_domains"]["maxItems"] == 2
+    assert request_schema["properties"]["reasoning"]["maxLength"] == 1000
+    assert canonical_schema["properties"]["secondary_australian_domains"]["uniqueItems"] is True
+    expected_openai_schema = provider_prediction_schema("openai", canonical_schema)
+    assert request_schema == expected_openai_schema
+    assert provider_prediction_schema("gemini", canonical_schema) == canonical_schema
     assert "openai-secret" not in json.dumps(captured[0][2])
 
     def gemini_transport(
@@ -495,6 +564,78 @@ def test_openai_and_gemini_adapters_parse_usage(monkeypatch: pytest.MonkeyPatch)
     assert captured[1][2]["generationConfig"]["thinkingConfig"] == {"thinkingBudget": 0}
 
 
+def test_openai_http_400_preserves_safe_error_details(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "never-persist-this-key"
+    monkeypatch.setenv("OPENAI_API_KEY", secret)
+    body = json.dumps(
+        {
+            "error": {
+                "message": f"Unsupported parameter: temperature; key={secret}",
+                "type": "invalid_request_error",
+                "param": "temperature",
+                "code": "unsupported_parameter",
+            }
+        }
+    ).encode()
+
+    def reject(*_: object, **__: object) -> object:
+        raise HTTPError(
+            "https://api.openai.com/v1/responses",
+            400,
+            "Bad Request",
+            {},
+            io.BytesIO(body),
+        )
+
+    monkeypatch.setattr(provider_module, "urlopen", reject)
+    with pytest.raises(ProviderError) as caught:
+        provider_module._http_json(
+            "https://api.openai.com/v1/responses",
+            {"Authorization": f"Bearer {secret}"},
+            {"model": "gpt-6-luna"},
+            1.0,
+        )
+    error = caught.value
+    assert error.retryable is False
+    assert error.diagnostics == {
+        "http_status": 400,
+        "api_error_type": "invalid_request_error",
+        "api_error_code": "unsupported_parameter",
+        "api_error_parameter": "temperature",
+        "api_error_message": "Unsupported parameter: temperature; key=[REDACTED]",
+    }
+    assert secret not in json.dumps(error.diagnostics)
+    assert "Authorization" not in json.dumps(error.diagnostics)
+
+
+def test_deterministic_http_400_is_not_retried(tmp_path: Path) -> None:
+    package = load_evaluation_package(_package_dir(tmp_path, [_record(1)]))
+    provider = FakeProvider(
+        failures=10,
+        error=ProviderError(
+            "provider HTTP error 400",
+            diagnostics={"http_status": 400, "api_error_parameter": "temperature"},
+            retryable=False,
+        ),
+    )
+    results = evaluate(
+        package,
+        package.records,
+        provider,
+        "gpt-6-luna",
+        tmp_path / "run-400",
+        {"reasoning_effort": "none"},
+        max_retries=2,
+        retry_delay=0,
+        sleeper=lambda _: None,
+    )
+    assert provider.calls == 1
+    assert results[0]["retry_count"] == 0
+    assert results[0]["diagnostics"]["http_status"] == 400
+
+
 def test_run_identity_changes_with_material_configuration(tmp_path: Path) -> None:
     package: EvaluationPackage = load_evaluation_package(_package_dir(tmp_path))
     first, _ = make_configuration(package, "openai", "one", {"temperature": 0})
@@ -513,6 +654,19 @@ def test_run_identity_changes_with_material_configuration(tmp_path: Path) -> Non
         {"thinking_mode": "disabled", "thinking_budget": 0},
     )
     assert dynamic.identity() != disabled.identity()
+    luna_none, _ = make_configuration(
+        package,
+        "openai",
+        "gpt-6-luna",
+        {"reasoning_effort": "none"},
+    )
+    luna_low, _ = make_configuration(
+        package,
+        "openai",
+        "gpt-6-luna",
+        {"reasoning_effort": "low"},
+    )
+    assert luna_none.identity() != luna_low.identity()
 
 
 def test_prompt_versions_coexist_with_distinct_hashes_and_run_identities(tmp_path: Path) -> None:

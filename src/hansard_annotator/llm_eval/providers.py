@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
@@ -13,6 +15,28 @@ from urllib.request import Request, urlopen
 from hansard_annotator.llm_eval.models import ProviderResponse, TokenUsage
 
 JsonTransport = Callable[[str, dict[str, str], dict[str, Any], float], dict[str, Any]]
+
+
+def provider_prediction_schema(provider: str, schema: dict[str, Any]) -> dict[str, Any]:
+    """Return a provider-compatible copy without changing the canonical schema."""
+    transformed = deepcopy(schema)
+    if provider == "openai":
+        properties = transformed.get("properties")
+        if isinstance(properties, dict):
+            secondary = properties.get("secondary_australian_domains")
+            if isinstance(secondary, dict):
+                secondary.pop("uniqueItems", None)
+    return transformed
+
+
+def provider_prediction_schema_hash(provider: str, schema: dict[str, Any]) -> str:
+    payload = json.dumps(
+        provider_prediction_schema(provider, schema),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 class ProviderError(RuntimeError):
@@ -25,11 +49,13 @@ class ProviderError(RuntimeError):
         usage: TokenUsage | None = None,
         returned_model: str | None = None,
         diagnostics: dict[str, object] | None = None,
+        retryable: bool = False,
     ) -> None:
         super().__init__(message)
         self.usage = usage or TokenUsage()
         self.returned_model = returned_model
         self.diagnostics = diagnostics or {}
+        self.retryable = retryable
 
 
 class ModelProvider(Protocol):
@@ -54,9 +80,28 @@ def _http_json(
         with urlopen(request, timeout=timeout) as response:
             value = json.loads(response.read().decode("utf-8"))
     except HTTPError as error:
-        raise ProviderError(f"provider HTTP error {error.code}") from None
+        diagnostics: dict[str, object] = {"http_status": error.code}
+        try:
+            error_value = json.loads(error.read().decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            error_value = None
+        error_object = _dict(_dict(error_value).get("error"))
+        for source, target in (
+            ("type", "api_error_type"),
+            ("code", "api_error_code"),
+            ("param", "api_error_parameter"),
+            ("message", "api_error_message"),
+        ):
+            value = error_object.get(source)
+            if value is not None:
+                diagnostics[target] = _bounded(value, 1000).strip('"')
+        raise ProviderError(
+            f"provider HTTP error {error.code}",
+            diagnostics=diagnostics,
+            retryable=error.code == 429 or 500 <= error.code < 600,
+        ) from None
     except (URLError, TimeoutError):
-        raise ProviderError("provider network request failed") from None
+        raise ProviderError("provider network request failed", retryable=True) from None
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise ProviderError("provider returned malformed JSON") from None
     if not isinstance(value, dict):
@@ -142,6 +187,7 @@ class OpenAIProvider:
         key = os.environ.get("OPENAI_API_KEY")
         if not key:
             raise ProviderError("OPENAI_API_KEY is not set")
+        request_schema = provider_prediction_schema(self.name, schema)
         payload: dict[str, Any] = {
             "model": model,
             "instructions": system_prompt,
@@ -149,14 +195,15 @@ class OpenAIProvider:
             "text": {
                 "format": {
                     "type": "json_schema",
-                    "name": "policy_annotation",
+                    "name": "phase4a_prediction",
                     "strict": True,
-                    "schema": schema,
+                    "schema": request_schema,
                 }
             },
-            "temperature": generation.get("temperature", 0.0),
             "max_output_tokens": generation.get("max_output_tokens", 1000),
         }
+        if generation.get("temperature") is not None:
+            payload["temperature"] = generation["temperature"]
         if generation.get("reasoning_effort") is not None:
             payload["reasoning"] = {"effort": generation["reasoning_effort"]}
         data = self.transport(
@@ -165,20 +212,23 @@ class OpenAIProvider:
             payload,
             self.timeout,
         )
-        text = data.get("output_text")
-        if not isinstance(text, str):
-            output = data.get("output")
-            if isinstance(output, list):
-                text = next(
-                    (
-                        part.get("text")
-                        for item in output
-                        if isinstance(item, dict)
-                        for part in item.get("content", [])
-                        if isinstance(part, dict) and isinstance(part.get("text"), str)
-                    ),
-                    None,
-                )
+        output = data.get("output")
+        text = None
+        if isinstance(output, list):
+            text = next(
+                (
+                    part.get("text")
+                    for item in output
+                    if isinstance(item, dict) and item.get("type") == "message"
+                    for part in item.get("content", [])
+                    if isinstance(part, dict)
+                    and part.get("type") == "output_text"
+                    and isinstance(part.get("text"), str)
+                ),
+                None,
+            )
+        if not isinstance(text, str) and isinstance(data.get("output_text"), str):
+            text = data["output_text"]
         usage = _dict(data.get("usage"))
         input_details = _dict(usage.get("input_tokens_details"))
         output_details = _dict(usage.get("output_tokens_details"))
@@ -191,6 +241,8 @@ class OpenAIProvider:
         )
         returned_model = str(data["model"]) if data.get("model") else None
         raw, diagnostics = _parse_structured_text(text, finish_reason=data.get("status"))
+        diagnostics["native_structured_output_requested"] = True
+        diagnostics["structured_output_format"] = "json_schema"
         if not isinstance(text, str):
             raise ProviderError(
                 "provider response contains no structured output",
