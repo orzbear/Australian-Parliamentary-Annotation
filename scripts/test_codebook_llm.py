@@ -13,13 +13,13 @@ Outputs:
 """
 
 import argparse
-from datetime import datetime, timezone
 import json
 import os
-from pathlib import Path
 import sys
 import time
-from typing import Any, Dict, List, Literal, Optional
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any, Literal
 
 # Attempt to load dotenv if available
 try:
@@ -28,7 +28,7 @@ try:
 except ImportError:
     pass
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field
 
 # Detect GenAI SDK: prefer google-genai (new official SDK), fallback to google-generativeai
 HAVE_NEW_GENAI = False
@@ -59,11 +59,11 @@ class PolicyAnnotation(BaseModel):
     is_non_policy: bool = Field(
         description="True if the turn is procedural, ceremonial, condolence, personal tribute, or contains no substantive public-policy discussion; False otherwise."
     )
-    primary_australian_domain: Optional[DomainCode] = Field(
+    primary_australian_domain: DomainCode | None = Field(
         default=None,
         description="The primary policy domain code (AU01 to AU14, or AU_OTHER_REVIEW) representing the main topic, or null if is_non_policy is True."
     )
-    secondary_australian_domains: List[DomainCode] = Field(
+    secondary_australian_domains: list[DomainCode] = Field(
         default_factory=list,
         description="Up to 2 additional substantive domain codes (AU01 to AU14, excluding AU_OTHER_REVIEW); empty if none or if is_non_policy is True."
     )
@@ -72,24 +72,24 @@ class PolicyAnnotation(BaseModel):
     )
 
 
-def load_codebook_context(path: Path) -> Dict[str, Any]:
+def load_codebook_context(path: Path) -> dict[str, Any]:
     """Load CODEBOOK_CONTEXT.json and validate structure."""
     if not path.is_file():
         raise FileNotFoundError(f"Codebook context file not found: {path}")
 
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         data = json.load(f)
 
     return data
 
 
-def load_annotations(path: Path, max_records: int = 30) -> List[Dict[str, Any]]:
+def load_annotations(path: Path, max_records: int = 30) -> list[dict[str, Any]]:
     """Load the first `max_records` from annotations.jsonl."""
     if not path.is_file():
         raise FileNotFoundError(f"Annotations file not found: {path}")
 
-    records: List[Dict[str, Any]] = []
-    with open(path, "r", encoding="utf-8") as f:
+    records: list[dict[str, Any]] = []
+    with open(path, encoding="utf-8") as f:
         for idx, line in enumerate(f):
             if idx >= max_records:
                 break
@@ -102,21 +102,21 @@ def load_annotations(path: Path, max_records: int = 30) -> List[Dict[str, Any]]:
     return records
 
 
-def build_system_prompt(codebook_context: Dict[str, Any]) -> str:
+def build_system_prompt(codebook_context: dict[str, Any]) -> str:
     """
     Construct a comprehensive system prompt containing role definition,
     non-policy rules, domain definitions, and boundary guidelines.
     """
     # Extract labels from the taxonomy
     taxonomies = codebook_context.get("taxonomies", [])
-    labels: List[Dict[str, Any]] = []
+    labels: list[dict[str, Any]] = []
     for tax in taxonomies:
         if tax.get("slug") == "australian_policy_domains" or "labels" in tax:
             labels = tax.get("labels", [])
             break
 
     # Format domain sections
-    domain_sections: List[str] = []
+    domain_sections: list[str] = []
     for item in labels:
         code = item.get("code", "")
         label = item.get("label", "")
@@ -193,7 +193,7 @@ You must output strictly valid JSON conforming to this schema:
     return prompt.strip()
 
 
-def build_speech_user_prompt(record: Dict[str, Any]) -> str:
+def build_speech_user_prompt(record: dict[str, Any]) -> str:
     """Format speech turn metadata and speech text into user prompt."""
     speech = record.get("speech", {})
     speaker = speech.get("speaker_name", "Unknown Speaker")
@@ -308,7 +308,7 @@ def classify_speech_with_retry(
     raise RuntimeError("Unexpected loop exit in classify_speech_with_retry")
 
 
-def mock_classify_speech(record: Dict[str, Any]) -> PolicyAnnotation:
+def mock_classify_speech(record: dict[str, Any]) -> PolicyAnnotation:
     """Mock classifier for offline dry-runs and pipeline testing."""
     vals = record.get("human_annotation", {}).get("values", {})
     # Return simulated prediction
@@ -321,9 +321,9 @@ def mock_classify_speech(record: Dict[str, Any]) -> PolicyAnnotation:
 
 
 def compare_record(
-    record: Dict[str, Any],
+    record: dict[str, Any],
     prediction: PolicyAnnotation,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Compare single model output against human ground truth."""
     record_id = record.get("record_id", "unknown")
     human_vals = record.get("human_annotation", {}).get("values", {})
@@ -374,7 +374,7 @@ def compare_record(
     }
 
 
-def compute_metrics(comparisons: List[Dict[str, Any]]) -> Dict[str, Any]:
+def compute_metrics(comparisons: list[dict[str, Any]]) -> dict[str, Any]:
     """Calculate overall accuracy metrics and confusion matrices."""
     total = len(comparisons)
     if total == 0:
@@ -391,11 +391,11 @@ def compute_metrics(comparisons: List[Dict[str, Any]]) -> Dict[str, Any]:
         all_domains.add(str(c["model"]["primary_australian_domain"]))
 
     sorted_domains = sorted(all_domains)
-    confusion_matrix: Dict[str, Dict[str, int]] = {
+    confusion_matrix: dict[str, dict[str, int]] = {
         h: {m: 0 for m in sorted_domains} for h in sorted_domains
     }
 
-    domain_stats: Dict[str, Dict[str, Any]] = {
+    domain_stats: dict[str, dict[str, Any]] = {
         d: {"human_count": 0, "model_count": 0, "true_positives": 0}
         for d in sorted_domains
     }
@@ -425,7 +425,7 @@ def compute_metrics(comparisons: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def print_summary_table(metrics: Dict[str, Any], comparisons: List[Dict[str, Any]]) -> None:
+def print_summary_table(metrics: dict[str, Any], comparisons: list[dict[str, Any]]) -> None:
     """Print clean formatted CLI tables for evaluation results."""
     total = metrics["total_samples"]
     np_acc = metrics["non_policy_accuracy"]
@@ -633,7 +633,7 @@ def main() -> None:
 
     # Step 4 & 5: Run classifications and comparisons
     print(f"\n[3/4] Evaluating {len(records)} samples against {args.model}...")
-    comparisons: List[Dict[str, Any]] = []
+    comparisons: list[dict[str, Any]] = []
 
     for i, record in enumerate(records, 1):
         rec_id = record.get("record_id", "unknown")
@@ -686,7 +686,7 @@ def main() -> None:
 
     results_payload = {
         "metadata": {
-            "evaluation_timestamp": datetime.now(timezone.utc).isoformat(),
+            "evaluation_timestamp": datetime.now(UTC).isoformat(),
             "model_name": args.model if not args.mock else "mock-simulator",
             "codebook_path": str(args.codebook),
             "annotations_path": str(args.annotations),
