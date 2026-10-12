@@ -88,3 +88,21 @@ Full-corpus estimates now extrapolate only token-processing cost per valid recor
 add the configured shared cache-storage lifetime once. Reports label this as a
 mechanical estimate because a real production campaign may require multiple cache
 lifetimes.
+
+## Post-review audit
+
+The read-only Phase 4C audit is a diagnostic analysis performed after human review.
+It compares immutable predictions with the exact human annotation versions linked by
+the latest terminal review events and reports codebook flags independently, because a
+flag may coexist with either an accepted or edited decision. An acceptance rate is a
+measure of this assisted-review workflow and is not automatically equivalent to
+independent benchmark accuracy.
+
+The audit never updates predictions, annotations, review history, V2, or the taxonomy,
+and it does not create a V3 prompt. It provides factual inputs for a later human
+decision. Run it with an explicit prediction run or explicitly select the latest run:
+
+```powershell
+python -m hansard_annotator.llm_eval.review_audit --latest `
+  --output-dir data/review/phase4c/review_audit_100
+```
