@@ -59,6 +59,30 @@ def schema_form(
             """,
             (assignment_id,),
         ).fetchone()
+        ai_prediction = connection.execute(
+            """
+            SELECT mp.id,mp.public_id,mp.is_non_policy,mp.primary_australian_domain,
+                   mp.secondary_australian_domains,mp.reasoning,mp.created_at,
+                   mpr.public_id AS run_public_id,mpr.configured_model,
+                   mpr.prompt_version,mpr.execution_mode
+            FROM assignments a JOIN tasks t ON t.id=a.task_id
+            JOIN model_predictions mp ON mp.speaker_turn_id=t.speaker_turn_id
+            JOIN model_prediction_runs mpr ON mpr.id=mp.run_id
+            WHERE a.id=%s
+            ORDER BY mpr.imported_at DESC,mp.id DESC LIMIT 1
+            """,
+            (assignment_id,),
+        ).fetchone()
+        ai_review = None
+        if ai_prediction:
+            ai_review = connection.execute(
+                """
+                SELECT review_status,note,reviewed_at FROM model_prediction_reviews
+                WHERE model_prediction_id=%s AND reviewer_user_id=%s
+                ORDER BY reviewed_at DESC,id DESC LIMIT 1
+                """,
+                (ai_prediction["id"], principal.user_id),
+            ).fetchone()
         return {
             "fields": fields,
             "labels": labels,
@@ -67,6 +91,8 @@ def schema_form(
             "annotation_status": current["status"] if current else None,
             "schema_name": assignment["schema_name"],
             "schema_version": assignment["schema_version"],
+            "ai_prediction": dict(ai_prediction) if ai_prediction else None,
+            "ai_review": dict(ai_review) if ai_review else None,
         }
 
 
@@ -226,6 +252,7 @@ def save_annotation(
         )
         return {
             "annotation_id": annotation["id"],
+            "annotation_version_id": version["id"],
             "revision_number": revision_number,
             "sha256": outcome.sha256,
             "reused": False,

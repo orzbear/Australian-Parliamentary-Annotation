@@ -1,0 +1,484 @@
+{
+  "schema": {
+    "content_sha256": "9c94bab9cd2976559c79b1c31991aef4138a2071a5d3b3d6186a26448f117126",
+    "fields": [
+      {
+        "display_order": 1,
+        "field_key": "is_non_policy",
+        "field_type": "boolean",
+        "help_text": "Check only when the whole turn is procedural, ceremonial or otherwise contains no substantive public-policy discussion.",
+        "label": "Entirely non-policy",
+        "maximum_items": null,
+        "minimum_items": null,
+        "required": true,
+        "requirement_rules": {},
+        "taxonomy_version_id": null,
+        "validation_rules": {
+          "default": false
+        },
+        "visibility_rules": {}
+      },
+      {
+        "display_order": 2,
+        "field_key": "primary_australian_domain",
+        "field_type": "single_taxonomy",
+        "help_text": "Select the one general Australian policy domain that best represents the turn.",
+        "label": "Primary policy topic",
+        "maximum_items": null,
+        "minimum_items": null,
+        "required": false,
+        "requirement_rules": {
+          "null_unless": {
+            "field_equals": {
+              "field": "is_non_policy",
+              "value": false
+            }
+          },
+          "required_when": {
+            "field_equals": {
+              "field": "is_non_policy",
+              "value": false
+            }
+          }
+        },
+        "taxonomy_version_id": 2,
+        "validation_rules": {},
+        "visibility_rules": {}
+      },
+      {
+        "display_order": 3,
+        "field_key": "secondary_australian_domains",
+        "field_type": "multiple_taxonomy",
+        "help_text": "Optionally select up to two additional substantive domains; do not code passing references.",
+        "label": "Secondary policy topics",
+        "maximum_items": 2,
+        "minimum_items": 0,
+        "required": false,
+        "requirement_rules": {
+          "null_unless": {
+            "field_equals": {
+              "field": "is_non_policy",
+              "value": false
+            }
+          }
+        },
+        "taxonomy_version_id": 2,
+        "validation_rules": {
+          "different_from_field": "primary_australian_domain",
+          "excluded_codes": [
+            "AU_OTHER_REVIEW"
+          ],
+          "unique_items": true
+        },
+        "visibility_rules": {}
+      },
+      {
+        "display_order": 4,
+        "field_key": "fallback_explanation",
+        "field_type": "long_text",
+        "help_text": "Briefly explain why none of the listed general domains applies.",
+        "label": "Other-topic explanation",
+        "maximum_items": null,
+        "minimum_items": null,
+        "required": false,
+        "requirement_rules": {
+          "required_when": {
+            "taxonomy_code_equals": {
+              "field": "primary_australian_domain",
+              "value": "AU_OTHER_REVIEW"
+            }
+          }
+        },
+        "taxonomy_version_id": null,
+        "validation_rules": {},
+        "visibility_rules": {}
+      },
+      {
+        "display_order": 5,
+        "field_key": "annotation_notes",
+        "field_type": "long_text",
+        "help_text": "Optional coder notes.",
+        "label": "Annotation notes",
+        "maximum_items": null,
+        "minimum_items": null,
+        "required": false,
+        "requirement_rules": {},
+        "taxonomy_version_id": null,
+        "validation_rules": {},
+        "visibility_rules": {}
+      }
+    ],
+    "name": "Australian Policy Annotation",
+    "slug": "australian_policy_annotation",
+    "status": "draft",
+    "version": "0.2.0"
+  },
+  "taxonomies": [
+    {
+      "content_sha256": "275c2f292038036e3ee351b66b2f78b0b3f989aeed8475fbe3beb447be5fbede",
+      "labels": [
+        {
+          "borderline_examples": [],
+          "code": "AU01",
+          "exclusion_rules": [
+            "Workplace relations or industry support belongs in AU02.",
+            "Welfare payment design belongs in AU05.",
+            "Housing affordability belongs in AU06."
+          ],
+          "full_definition": null,
+          "inclusion_rules": [
+            "Use for broad cost-of-living management."
+          ],
+          "is_fallback": false,
+          "label": "Macroeconomy, budget and taxation",
+          "negative_examples": [],
+          "positive_examples": [
+            "Federal budget balance",
+            "Income-tax reform",
+            "Inflation",
+            "Reserve Bank interest-rate decisions",
+            "Public debt",
+            "General productivity policy"
+          ],
+          "requires_review": false,
+          "short_definition": "Whole-economy fiscal and monetary policy, public revenue, taxation, budgets, debt, inflation, interest rates and productivity."
+        },
+        {
+          "borderline_examples": [],
+          "code": "AU02",
+          "exclusion_rules": [
+            "Economy-wide taxation or inflation belongs in AU01.",
+            "Technology research policy belongs in AU04.",
+            "Energy generation or mining environmental policy belongs in AU07."
+          ],
+          "full_definition": null,
+          "inclusion_rules": [],
+          "is_fallback": false,
+          "label": "Employment, industry, business and trade",
+          "negative_examples": [],
+          "positive_examples": [
+            "Industrial relations",
+            "Minimum wage",
+            "Manufacturing subsidies",
+            "Competition policy",
+            "Banking regulation",
+            "Export and trade agreements"
+          ],
+          "requires_review": false,
+          "short_definition": "Employment, workplace relations, wages, unions, industry, corporations, competition, banking, business and international trade."
+        },
+        {
+          "borderline_examples": [],
+          "code": "AU03",
+          "exclusion_rules": [
+            "Aged-care services belong in AU05.",
+            "Indigenous-specific institutions and recognition belong in AU11."
+          ],
+          "full_definition": null,
+          "inclusion_rules": [
+            "Indigenous health may be secondary AU03 when Indigenous policy is the central concern."
+          ],
+          "is_fallback": false,
+          "label": "Health",
+          "negative_examples": [],
+          "positive_examples": [
+            "Medicare bulk billing",
+            "Hospital funding",
+            "Mental-health services",
+            "Pharmaceutical Benefits Scheme",
+            "Pandemic health measures"
+          ],
+          "requires_review": false,
+          "short_definition": "Healthcare services, Medicare, hospitals, primary care, public and mental health, pharmaceuticals, workforce and system funding."
+        },
+        {
+          "borderline_examples": [],
+          "code": "AU04",
+          "exclusion_rules": [
+            "Defence technology and military cybersecurity belong in AU12.",
+            "Online criminal enforcement belongs in AU10."
+          ],
+          "full_definition": null,
+          "inclusion_rules": [],
+          "is_fallback": false,
+          "label": "Education, science, technology and communications",
+          "negative_examples": [],
+          "positive_examples": [
+            "School funding",
+            "University policy",
+            "Vocational education",
+            "National Broadband Network",
+            "AI regulation",
+            "Telecommunications policy"
+          ],
+          "requires_review": false,
+          "short_definition": "Schools, universities, vocational education, research, science, AI, digital regulation, telecommunications and technology development."
+        },
+        {
+          "borderline_examples": [],
+          "code": "AU05",
+          "exclusion_rules": [
+            "Healthcare delivery belongs in AU03.",
+            "Housing supply or homelessness policy belongs in AU06."
+          ],
+          "full_definition": null,
+          "inclusion_rules": [],
+          "is_fallback": false,
+          "label": "Welfare, families, disability and ageing",
+          "negative_examples": [],
+          "positive_examples": [
+            "JobSeeker",
+            "Age Pension",
+            "National Disability Insurance Scheme",
+            "Childcare subsidies",
+            "Paid parental leave",
+            "Aged-care funding"
+          ],
+          "requires_review": false,
+          "short_definition": "Income support, pensions, disability support, childcare, parental leave, aged care, poverty reduction and family assistance."
+        },
+        {
+          "borderline_examples": [],
+          "code": "AU06",
+          "exclusion_rules": [
+            "Telecommunications infrastructure belongs in AU04.",
+            "Energy infrastructure belongs in AU07.",
+            "Farm irrigation or rural water infrastructure belongs in AU08."
+          ],
+          "full_definition": null,
+          "inclusion_rules": [],
+          "is_fallback": false,
+          "label": "Housing, infrastructure and transport",
+          "negative_examples": [],
+          "positive_examples": [
+            "Social housing",
+            "Housing affordability",
+            "Homelessness programs",
+            "Motorways",
+            "Rail projects",
+            "Airport policy",
+            "Public transport"
+          ],
+          "requires_review": false,
+          "short_definition": "Housing, homelessness, urban development, roads, rail, aviation, ports, public transport and general public infrastructure."
+        },
+        {
+          "borderline_examples": [],
+          "code": "AU07",
+          "exclusion_rules": [
+            "Farm production or irrigation belongs in AU08.",
+            "Industrial employment transition belongs primarily in AU02 with AU07 possibly secondary."
+          ],
+          "full_definition": null,
+          "inclusion_rules": [],
+          "is_fallback": false,
+          "label": "Climate, environment, energy and natural resources",
+          "negative_examples": [],
+          "positive_examples": [
+            "Emissions trading",
+            "Carbon pricing",
+            "Renewable-energy targets",
+            "Electricity markets",
+            "Coal and gas policy",
+            "Environmental protection",
+            "Biodiversity conservation"
+          ],
+          "requires_review": false,
+          "short_definition": "Climate, emissions, biodiversity, pollution, conservation, electricity, renewable energy, fossil fuels, mining and natural resources."
+        },
+        {
+          "borderline_examples": [],
+          "code": "AU08",
+          "exclusion_rules": [
+            "Environmental river protection belongs in AU07.",
+            "General transport infrastructure belongs in AU06."
+          ],
+          "full_definition": null,
+          "inclusion_rules": [],
+          "is_fallback": false,
+          "label": "Agriculture, fisheries, water and rural affairs",
+          "negative_examples": [],
+          "positive_examples": [
+            "Farm subsidies",
+            "Drought assistance",
+            "Murray-Darling irrigation",
+            "Fisheries regulation",
+            "Agricultural biosecurity",
+            "Rural community policy"
+          ],
+          "requires_review": false,
+          "short_definition": "Farming, fisheries, drought, irrigation, agricultural water, biosecurity, food safety, rural industries and communities."
+        },
+        {
+          "borderline_examples": [],
+          "code": "AU09",
+          "exclusion_rules": [
+            "Military or national-security operations belong in AU12.",
+            "Criminal law unrelated to migration belongs in AU10."
+          ],
+          "full_definition": null,
+          "inclusion_rules": [],
+          "is_fallback": false,
+          "label": "Immigration, asylum and citizenship",
+          "negative_examples": [],
+          "positive_examples": [
+            "Skilled migration",
+            "Refugee intake",
+            "Offshore processing",
+            "Immigration detention",
+            "Citizenship requirements",
+            "Visa policy"
+          ],
+          "requires_review": false,
+          "short_definition": "Migration, refugees, asylum, offshore processing, detention, visas, citizenship, settlement and border-entry policy."
+        },
+        {
+          "borderline_examples": [],
+          "code": "AU10",
+          "exclusion_rules": [
+            "Parliamentary procedure is content_status procedural.",
+            "Electoral administration belongs in AU13.",
+            "National-security intelligence belongs in AU12."
+          ],
+          "full_definition": null,
+          "inclusion_rules": [],
+          "is_fallback": false,
+          "label": "Law, crime, justice and civil liberties",
+          "negative_examples": [],
+          "positive_examples": [
+            "Criminal sentencing",
+            "Federal policing",
+            "Privacy law",
+            "Anti-discrimination law",
+            "Court administration",
+            "Family law",
+            "Online criminal enforcement"
+          ],
+          "requires_review": false,
+          "short_definition": "Courts, policing, prisons, criminal and civil law, privacy, discrimination, human rights, expression and family law."
+        },
+        {
+          "borderline_examples": [],
+          "code": "AU11",
+          "exclusion_rules": [],
+          "full_definition": null,
+          "inclusion_rules": [
+            "Use as primary when Indigenous status",
+            "institutions",
+            "rights or communities are the central organising concern.",
+            "Other substantive domains may be secondary."
+          ],
+          "is_fallback": false,
+          "label": "Indigenous affairs, recognition and reconciliation",
+          "negative_examples": [],
+          "positive_examples": [
+            "Closing the Gap",
+            "Native title",
+            "Constitutional recognition",
+            "The Voice referendum",
+            "Indigenous land rights",
+            "Treaty processes"
+          ],
+          "requires_review": false,
+          "short_definition": "Aboriginal and Torres Strait Islander policy, Closing the Gap, native title, land rights, recognition, treaty and cultural heritage."
+        },
+        {
+          "borderline_examples": [],
+          "code": "AU12",
+          "exclusion_rules": [
+            "International trade belongs in AU02.",
+            "General technology or telecommunications belongs in AU04.",
+            "Domestic criminal law belongs in AU10."
+          ],
+          "full_definition": null,
+          "inclusion_rules": [],
+          "is_fallback": false,
+          "label": "Defence, national security and international affairs",
+          "negative_examples": [],
+          "positive_examples": [
+            "AUKUS",
+            "Defence procurement",
+            "Australian Defence Force operations",
+            "Intelligence agencies",
+            "Terrorism policy",
+            "Foreign aid",
+            "Diplomatic relations"
+          ],
+          "requires_review": false,
+          "short_definition": "Defence forces, military procurement, intelligence, national-security cybersecurity, terrorism, diplomacy, aid and foreign relations."
+        },
+        {
+          "borderline_examples": [],
+          "code": "AU13",
+          "exclusion_rules": [
+            "Speaker rulings are procedural.",
+            "Points of order are procedural.",
+            "Routine scheduling and division administration are procedural."
+          ],
+          "full_definition": null,
+          "inclusion_rules": [],
+          "is_fallback": false,
+          "label": "Government operations, democracy and federalism",
+          "negative_examples": [],
+          "positive_examples": [
+            "Electoral reform",
+            "Australian Electoral Commission",
+            "Public-service reform",
+            "Integrity commissions",
+            "Federal-state relations",
+            "Constitutional reform"
+          ],
+          "requires_review": false,
+          "short_definition": "Elections, public administration, integrity, constitutional reform, federal relations, public service and substantive accountability policy."
+        },
+        {
+          "borderline_examples": [],
+          "code": "AU14",
+          "exclusion_rules": [
+            "Pure tribute or commemoration without policy content is ceremonial_nonpolicy."
+          ],
+          "full_definition": null,
+          "inclusion_rules": [],
+          "is_fallback": false,
+          "label": "Culture, media, sport and national identity",
+          "negative_examples": [],
+          "positive_examples": [
+            "ABC and SBS policy",
+            "Arts funding",
+            "Museum policy",
+            "Sports funding",
+            "Cultural heritage",
+            "National commemorations with a substantive policy argument"
+          ],
+          "requires_review": false,
+          "short_definition": "Arts, museums, heritage, public broadcasting, media, sport, cultural industries, national symbols and identity."
+        },
+        {
+          "borderline_examples": [],
+          "code": "AU_OTHER_REVIEW",
+          "exclusion_rules": [
+            "Do not use merely because coding is difficult.",
+            "Do not use as a general uncertainty category.",
+            "Cannot be a secondary domain."
+          ],
+          "full_definition": null,
+          "inclusion_rules": [
+            "Permitted only for substantive_policy.",
+            "Explanation is required.",
+            "Monitor for taxonomy revision."
+          ],
+          "is_fallback": true,
+          "label": "Other substantive policy",
+          "negative_examples": [],
+          "positive_examples": [],
+          "requires_review": true,
+          "short_definition": "Clearly substantive public policy for which no current analytical Australian domain applies defensibly."
+        }
+      ],
+      "name": "Australian Policy Domains",
+      "slug": "australian_policy_domains",
+      "status": "draft",
+      "version": "0.1.0"
+    }
+  ]
+}

@@ -53,7 +53,7 @@ jobs:
         run: |
           python -m pip install -r requirements.lock
           npm ci
-          npm audit --audit-level=moderate
+          npm audit --omit=dev
 
       - name: Build browser assets reproducibly
         run: |

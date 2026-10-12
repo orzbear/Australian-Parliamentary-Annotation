@@ -2,6 +2,16 @@
   const form = document.querySelector("[data-dirty-form]");
   if (!form) return;
 
+  const correctionToggle = document.querySelector("[data-correction-toggle]");
+  const correctionForm = document.querySelector("[data-correction-form]");
+  if (correctionToggle && correctionForm) {
+    correctionForm.hidden = !correctionToggle.checked;
+    correctionToggle.addEventListener("change", () => {
+      correctionForm.hidden = !correctionToggle.checked;
+      if (correctionToggle.checked) correctionForm.querySelector("input,textarea,select")?.focus();
+    });
+  }
+
   let dirty = false;
   form.addEventListener("input", () => { dirty = true; updateConditionalFields(); });
   form.addEventListener("change", () => { dirty = true; updateCounts(); updateConditionalFields(); });
@@ -41,7 +51,7 @@
     if (form.querySelector('input[name="is_non_policy"]')) {
       const nonPolicy = selected("is_non_policy") === "true";
       const submit = form.querySelector("[data-submit-next]");
-      if (submit) submit.textContent = nonPolicy ? "Mark non-policy & next" : "Submit & next";
+      if (submit && !submit.hasAttribute("data-ai-edit-submit")) submit.textContent = nonPolicy ? "Mark non-policy & next" : "Submit & next";
       setVisible("primary_australian_domain", !nonPolicy);
       setVisible("secondary_australian_domains", !nonPolicy);
       setVisible("fallback_explanation", !nonPolicy && selected("primary_australian_domain") === "AU_OTHER_REVIEW");

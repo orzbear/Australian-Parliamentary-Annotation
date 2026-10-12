@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from hansard_annotator.web.annotations.ai_review import ai_review_summary
 from hansard_annotator.web.auth.models import Principal
 from hansard_annotator.web.auth.routes import router as auth_router
 from hansard_annotator.web.config import WebSettings
@@ -75,6 +76,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
             {
                 "principal": principal,
                 **personal_dashboard(web_settings, principal),
+                "ai_review": ai_review_summary(web_settings),
                 "projects": list_projects(web_settings, principal),
             },
         )

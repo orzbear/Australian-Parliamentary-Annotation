@@ -5,7 +5,19 @@
 <div class="flex flex-wrap items-end justify-between gap-4">
   <div><p class="eyebrow">Personal workspace</p><h1 class="mt-2 text-4xl font-semibold tracking-tight">Good to see you, {{ principal.display_name }}</h1><p class="mt-2 text-muted">Continue your assigned research work or inspect recent progress.</p></div>
 </div>
-<section class="stats-grid mt-8" aria-label="Task summary">
+<section class="surface mt-8 overflow-hidden" aria-labelledby="ai-review-heading">
+  <div class="flex flex-wrap items-center justify-between gap-4 border-b bg-indigo-50/60 p-6">
+    <div><p class="eyebrow">AI-assisted review</p><h2 id="ai-review-heading" class="mt-1 text-2xl font-semibold">Review model suggestions</h2><p class="mt-1 text-muted">Confirm, correct, flag, or skip imported predictions while preserving both AI and human records.</p></div>
+    <a class="btn btn-primary" href="{% if ai_review.next_prediction_id %}/ai-reviews/{{ ai_review.next_prediction_id }}{% else %}/ai-reviews?status=unreviewed{% endif %}">Continue AI review</a>
+  </div>
+  <div class="grid grid-cols-2 gap-3 p-5 sm:grid-cols-3 lg:grid-cols-6">
+    {% for key, label in [('predictions','AI predictions'),('unreviewed','Unreviewed'),('accepted','Accepted'),('edited','Edited'),('flagged_codebook','Codebook flagged'),('skipped','Skipped')] %}
+    <a class="stat card-link" href="/ai-reviews?status={{ 'reviewed' if key == 'predictions' else key }}"><span>{{ label }}</span><strong>{{ ai_review[key] or 0 }}</strong></a>
+    {% endfor %}
+  </div>
+</section>
+<div class="mt-8"><p class="eyebrow">Human annotation tasks</p><h2 class="mt-1 text-2xl font-semibold">Assigned work</h2></div>
+<section class="stats-grid mt-4" aria-label="Human annotation task summary">
   {% for key, label in [('assigned','Assigned'),('drafts','Drafts'),('submitted','Submitted'),('skipped','Skipped'),('flagged','Flagged')] %}
   <article class="stat"><span>{{ label }}</span><strong>{{ counts[key] or 0 }}</strong></article>
   {% endfor %}

@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% from "components/macros.html" import badge %}
+{% block title %}AI review queue{% endblock %}
+{% block content %}
+<header class="page-header">
+  <div><p class="eyebrow">Human review</p><h1>AI prediction queue</h1><p class="text-muted">{{ rows|length }} prediction{{ '' if rows|length == 1 else 's' }}</p></div>
+</header>
+<nav class="flex flex-wrap gap-2 my-4" aria-label="Review filters">
+  {% for value, label in [('unreviewed','Unreviewed'),('reviewed','Reviewed'),('accepted','Accepted'),('edited','Edited'),('flagged_codebook','Codebook flagged'),('skipped','Skipped')] %}
+    <a class="btn {{ 'btn-primary' if active_filter == value else 'btn-quiet' }}" href="/ai-reviews?status={{ value }}">{{ label }}</a>
+  {% endfor %}
+</nav>
+<div class="surface overflow-x-auto">
+  {% if rows %}
+  <table>
+    <thead><tr><th>Speech</th><th>Policy status</th><th>Domains</th><th>Run</th><th>Review</th><th></th></tr></thead>
+    <tbody>
+    {% for row in rows %}
+      <tr class="review-table-row">
+        <td><a class="font-semibold text-brand" href="/ai-reviews/{{ row.prediction_id }}">{{ row.speaker_name_raw or 'Unknown speaker' }}</a><br><small>{{ row.speech_date }} · {{ row.major_heading_original }}</small></td>
+        <td>{{ 'Non-Policy' if row.is_non_policy else 'Policy' }}</td>
+        <td><strong>{{ row.primary_domain_display }}</strong>{% if row.secondary_domain_displays %}<br><small>{{ row.secondary_domain_displays|join(', ') }}</small>{% endif %}</td>
+        <td>{{ row.configured_model }}<br><small>{{ row.prompt_version }}</small></td>
+        <td>{{ badge(row.review_status or 'unreviewed') }}</td>
+        <td><a class="btn btn-primary" href="/ai-reviews/{{ row.prediction_id }}">Review</a></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}<div class="empty-state m-6"><p>No predictions match this queue.</p></div>{% endif %}
+</div>
+{% endblock %}

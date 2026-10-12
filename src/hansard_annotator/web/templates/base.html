@@ -7,9 +7,9 @@
   <meta name="color-scheme" content="light">
   <meta name="htmx-config" content='{"includeIndicatorStyles":false}'>
   <title>{% block title %}Hansard Research Workspace{% endblock %}</title>
-  <link rel="stylesheet" href="/static/dist/app.css">
+  <link rel="stylesheet" href="/static/dist/app.css?v=20261011-ai-correction-2">
   <script src="/static/dist/htmx-2.0.6.min.js" defer></script>
-  <script src="/static/src/app.js" defer></script>
+  <script src="/static/src/app.js?v=20261011-ai-correction-2" defer></script>
 </head>
 <body class="min-h-screen bg-canvas text-ink antialiased">
   <a class="skip-link" href="#main">Skip to content</a>
@@ -21,6 +21,7 @@
       </a>
       <nav aria-label="Primary" class="flex items-center gap-1 sm:gap-3">
         <a class="nav-link" href="/">Dashboard</a>
+        <a class="nav-link" href="/ai-reviews?status=unreviewed">AI Reviews</a>
         <a class="nav-link" href="/projects">Projects</a>
         {% if principal.is_admin %}<a class="nav-link" href="/admin/users">Admin</a>{% endif %}
         <form method="post" action="/logout">

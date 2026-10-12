@@ -7,6 +7,8 @@ import pytest
 
 from hansard_annotator.db.review_export import (
     EXPORT_COLUMNS,
+    ReviewExportOptions,
+    _validate_options,
     validate_output_path,
     write_review_csv,
 )
@@ -65,3 +67,17 @@ def test_csv_writer_preserves_punctuation_multiline_and_column_alignment(
 def test_review_path_rejects_protected_trees(tmp_path: Path, relative: Path) -> None:
     with pytest.raises(ValueError, match="forbidden directory"):
         validate_output_path(tmp_path / relative, repository_root=tmp_path)
+
+
+def test_human_label_filters_require_a_source_project() -> None:
+    with pytest.raises(ValueError, match="require annotation_project_slug"):
+        _validate_options(ReviewExportOptions(output=Path("review.csv"), primary_domain="AU12"))
+    with pytest.raises(ValueError, match="require annotation_project_slug"):
+        _validate_options(
+            ReviewExportOptions(output=Path("review.csv"), annotation_status="non-policy")
+        )
+
+
+def test_keyword_validation_rejects_empty_terms() -> None:
+    with pytest.raises(ValueError, match="must not be empty"):
+        _validate_options(ReviewExportOptions(output=Path("review.csv"), keywords=(" ",)))
