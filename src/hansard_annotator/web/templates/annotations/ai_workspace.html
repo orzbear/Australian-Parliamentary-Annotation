@@ -1,0 +1,110 @@
+{% extends "base.html" %}
+{% from "components/macros.html" import csrf, badge, error_summary %}
+{% block title %}Review {{ prediction.speaker_name_raw or 'Hansard turn' }}{% endblock %}
+{% block main_class %}workspace-shell{% endblock %}
+{% block content %}
+<header class="workspace-header">
+  <div><a class="text-sm font-medium text-brand" href="/ai-reviews?status=unreviewed">← Back to queue</a><h1 class="mt-1 text-xl font-semibold">AI-assisted review</h1></div>
+  <div>{{ badge(effective_review.review_status if effective_review else 'unreviewed') }}</div>
+</header>
+{% if request.query_params.get('flagged') %}<div class="alert alert-success mb-4">Codebook issue recorded. You may still save a human annotation.</div>{% endif %}
+{{ error_summary(errors) }}
+<div class="workspace-grid ai-review-grid">
+  <article class="speech-panel" aria-labelledby="speech-heading">
+    <div class="speech-context">
+      <p class="eyebrow">Hansard turn · {{ prediction.chamber }} · {{ prediction.speech_date }}</p>
+      <h2 id="speech-heading" class="mt-2 text-3xl font-semibold">{{ prediction.speaker_name_raw or 'Unknown speaker' }}</h2>
+      <p class="mt-2 text-lg">{{ prediction.major_heading_original }}{% if prediction.minor_heading_original %} · {{ prediction.minor_heading_original }}{% endif %}</p>
+      {% if prediction.business_type %}<p class="mt-2 text-sm text-muted">{{ prediction.business_type }}</p>{% endif %}
+    </div>
+    <div class="speech-text">{{ prediction.text_clean }}</div>
+  </article>
+
+  <aside class="ai-review-sidebar">
+    <section class="ai-suggestion-panel" aria-labelledby="ai-heading">
+      <p class="eyebrow">AI suggestion — not yet human approved</p>
+      <h2 id="ai-heading" class="mt-1 text-2xl font-semibold">{{ 'Non-Policy' if prediction.is_non_policy else 'Policy' }}</h2>
+      <dl class="metadata mt-3">
+        <div><dt>Primary domain</dt><dd>{{ prediction.primary_domain_display }}</dd></div>
+        <div><dt>Secondary domains</dt><dd>{{ prediction.secondary_domain_displays|join(', ') or 'None' }}</dd></div>
+      </dl>
+      <div class="model-reasoning"><strong>Model reasoning</strong><p>{{ prediction.reasoning }}</p></div>
+      <details class="provenance mt-4">
+        <summary>Model provenance</summary>
+        <dl class="metadata mt-2">
+          <div><dt>Model</dt><dd>{{ prediction.configured_model }}</dd></div>
+          <div><dt>Prompt</dt><dd>{{ prediction.prompt_version }}</dd></div>
+          <div><dt>Run</dt><dd>{{ prediction.run_public_id }}</dd></div>
+          <div><dt>Execution</dt><dd>{{ prediction.execution_mode }}</dd></div>
+          <div><dt>Predicted</dt><dd>{{ prediction.created_at }}</dd></div>
+        </dl>
+      </details>
+    </section>
+
+    {% if human_annotation %}
+    <section class="human-result-panel" aria-labelledby="human-result-heading">
+      <p class="eyebrow">Recorded human annotation</p>
+      <h2 id="human-result-heading" class="mt-1 text-xl font-semibold">AI versus human</h2>
+      <div class="comparison-grid mt-3">
+        <div><span>Policy</span><strong>AI: {{ 'Non-Policy' if prediction.is_non_policy else 'Policy' }}</strong><strong>Human: {{ 'Non-Policy' if human_annotation.values.is_non_policy else 'Policy' }}</strong></div>
+        <div><span>Primary</span><strong>AI: {{ prediction.primary_domain_display }}</strong><strong>Human: {{ human_annotation.primary_domain_display }}</strong></div>
+        <div><span>Secondary</span><strong>AI: {{ prediction.secondary_domain_displays|join(', ') or 'None' }}</strong><strong>Human: {{ human_annotation.secondary_domain_displays|join(', ') or 'None' }}</strong></div>
+      </div>
+      <p class="mt-3 text-sm text-muted">Revision {{ human_annotation.revision_number }} by {{ human_annotation.display_name }}</p>
+    </section>
+    {% endif %}
+
+    {% if codebook_flag %}
+    <section class="alert alert-error" aria-labelledby="codebook-flag-heading">
+      <h2 id="codebook-flag-heading" class="font-semibold">Codebook issue recorded</h2>
+      <p class="mt-2">{{ codebook_flag.note }}</p>
+      <p class="mt-2 text-sm">Flagged {{ codebook_flag.reviewed_at }}</p>
+    </section>
+    {% endif %}
+
+    <section class="human-review-panel" aria-labelledby="human-form-heading">
+      <div class="annotation-title"><p class="eyebrow">Human review</p><h2 id="human-form-heading" class="mt-1 text-2xl font-semibold">Confirm or correct</h2><p class="mt-2 text-sm text-muted">Controls begin with the AI suggestion. Submitted values become a normal human annotation revision.</p></div>
+      <div class="secondary-actions">
+        <form method="post" action="/ai-reviews/{{ prediction.public_id }}/flag">{{ csrf(principal) }}<label for="flag-note">Codebook issue note</label><textarea id="flag-note" name="note" rows="2" maxlength="2000" placeholder="AU07/AU08 boundary unclear" required></textarea><button class="btn btn-danger mt-2" type="submit">Flag codebook issue</button></form>
+        <div class="flex flex-wrap gap-2">
+          <form method="post" action="/ai-reviews/{{ prediction.public_id }}/skip">{{ csrf(principal) }}<button class="btn btn-quiet" type="submit">Skip &amp; next</button></form>
+          <a class="btn btn-quiet" href="/ai-reviews?status=unreviewed">Back to queue</a>
+        </div>
+      </div>
+      <form class="primary-review-action" method="post" action="/ai-reviews/{{ prediction.public_id }}/accept">
+        {{ csrf(principal) }}
+        <button class="btn btn-primary" type="submit">Accept AI &amp; next</button>
+      </form>
+      <input id="correction-toggle" class="correction-toggle-input" type="checkbox" data-correction-toggle {% if errors %}checked{% endif %}>
+      <div class="correction-toggle-wrap">
+        <label class="choice-card" for="correction-toggle"><span><strong>I want to correct the annotation</strong><small>Open the human controls to change policy status or categories.</small></span></label>
+      </div>
+      <form id="annotation-form" method="post" action="/ai-reviews/{{ prediction.public_id }}/edit" data-dirty-form data-correction-form>
+        {{ csrf(principal) }}
+        <div class="annotation-fields">
+        {% for field in fields %}
+          {% set current = values.get(field.field_key) %}
+          <fieldset class="field-wrap {% if errors.get(field.field_key) %}field-error{% endif %}" data-field="{{ field.field_key }}">
+            <legend>{{ field.label }}{% if field.required %}<span aria-hidden="true"> *</span>{% endif %}</legend>
+            <p class="help">{{ field.help_text }}</p>
+            {% if field.field_type == 'single_taxonomy' %}
+              <div class="choice-stack">{% for option in labels[field.taxonomy_version_id] %}<label class="choice-card"><input type="radio" name="{{ field.field_key }}" value="{{ option.code }}" {% if current == option.code %}checked{% endif %}><span><strong>{{ option.label }}</strong><small>{{ option.short_definition }}</small></span></label>{% endfor %}</div>
+            {% elif field.field_type == 'multiple_taxonomy' %}
+              {% if field.ui_hints.get('reveal_control_label') %}<label class="inline-control mt-3"><input type="checkbox" data-reveal-toggle="{{ field.field_key }}" {% if current %}checked{% endif %}> {{ field.ui_hints.get('reveal_control_label') }}</label>{% endif %}
+              <div data-reveal-content="{{ field.field_key }}" {% if field.ui_hints.get('reveal_control_label') and not current %}hidden{% endif %}><div class="flex items-center justify-between"><span class="help">Choose up to {{ field.maximum_items }}</span><output data-choice-count>0 of {{ field.maximum_items }}</output></div><div class="chip-grid" data-max="{{ field.maximum_items }}">{% for option in labels[field.taxonomy_version_id] %}<label class="choice-chip"><input type="checkbox" name="{{ field.field_key }}" value="{{ option.code }}" {% if option.code in (current or []) %}checked{% endif %}><span>{{ option.label }}</span></label>{% endfor %}</div></div>
+            {% elif field.field_type in ['boolean','uncertainty'] %}
+              {% if field.ui_hints.get('control') == 'checkbox' %}<input type="hidden" name="{{ field.field_key }}" value="false"><label class="choice-card mt-3"><input type="checkbox" name="{{ field.field_key }}" value="true" {% if current is sameas true %}checked{% endif %}><span><strong>{{ field.ui_hints.get('checked_label', field.label) }}</strong></span></label>{% else %}<div class="inline-choices"><label><input type="radio" name="{{ field.field_key }}" value="false" {% if current is sameas false %}checked{% endif %}> No</label><label><input type="radio" name="{{ field.field_key }}" value="true" {% if current is sameas true %}checked{% endif %}> Yes</label></div>{% endif %}
+            {% elif field.field_type == 'short_text' %}<input name="{{ field.field_key }}" value="{{ current or '' }}" maxlength="500">
+            {% elif field.field_type == 'long_text' %}<textarea name="{{ field.field_key }}" rows="3" maxlength="5000">{{ current or '' }}</textarea>{% endif %}
+            {% for message in errors.get(field.field_key, []) %}<p class="error-text">{{ message }}</p>{% endfor %}
+          </fieldset>
+        {% endfor %}
+        </div>
+        <div class="annotation-actions">
+          <button class="btn btn-secondary w-full" type="submit" data-submit-next data-ai-edit-submit>Save edited annotation &amp; next</button>
+        </div>
+      </form>
+    </section>
+  </aside>
+</div>
+{% endblock %}

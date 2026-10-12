@@ -1,0 +1,47 @@
+{
+  "corpus": {
+    "inventory_sha256": "7121a0fb10676b7bd68d582c5985671b71343ded51343b3f5f2b35bb474144e2",
+    "manifest_sha256": "1d7698829d9d1cdceb0373c5d2fc55a719f2a43e6d5242e38bd99067215680df",
+    "name": "Australian House of Representatives Hansard",
+    "pipeline_version": "1.0.0",
+    "public_id": "385a0089-7e50-59c7-bfc6-02ada0e4a139",
+    "run_name": "phase1-full-20260723-v4",
+    "slug": "australian-house-representatives-hansard"
+  },
+  "files": {
+    "AI_INSTRUCTIONS.md": {
+      "bytes": 1326,
+      "sha256": "c6c613c16f1e8af8a2625a755bb79b8dc625807160b15164429b6e8ebe545cbb"
+    },
+    "CODEBOOK_CONTEXT.json": {
+      "bytes": 18152,
+      "sha256": "518dae22e93fdba2c5202b256530ec3b7ead2de1e255b9a466240d0978aa5bd9"
+    },
+    "annotations.csv": {
+      "bytes": 627419,
+      "sha256": "3951b64eeecb3e028487a8142dbf5af6b0519929033b58647a220590d0d74179"
+    },
+    "annotations.jsonl": {
+      "bytes": 664092,
+      "sha256": "201d1f061163b1870517e6dab7b7dccea2578cb879f067f0854809e0c5857d54"
+    }
+  },
+  "format": "hansard-ai-codebook-input",
+  "format_version": 1,
+  "privacy": {
+    "annotation_notes_included": true,
+    "annotator_identity_included": false,
+    "draft_annotations_included": false,
+    "raw_xml_included": false,
+    "warning": "Review annotation notes before uploading to an external AI service."
+  },
+  "project": {
+    "mode": "pilot",
+    "name": "Conference codebook pilot 01",
+    "public_id": "c9546919-0893-4905-9cfc-2068c2e56666",
+    "slug": "conference-codebook-pilot-01"
+  },
+  "record_count": 150,
+  "selection": "current submitted or revised human annotation version",
+  "snapshot_sha256": "d1d13e8957052622ba5dfc552dcef28888e42dab67bce321fcd63e8e9461b31a"
+}

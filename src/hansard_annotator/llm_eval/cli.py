@@ -37,6 +37,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--output", type=Path, required=True)
     result.add_argument("--limit", type=int)
     result.add_argument("--record-id", action="append", default=[])
+    result.add_argument("--include-record-ids", type=Path)
     result.add_argument("--exclude-record-ids", type=Path)
     result.add_argument("--subset-seed", type=int)
     result.add_argument("--temperature", type=float)
@@ -45,6 +46,7 @@ def parser() -> argparse.ArgumentParser:
         "--reasoning-effort", choices=("none", "minimal", "low", "medium", "high")
     )
     result.add_argument("--thinking-budget", type=int)
+    result.add_argument("--thinking-level", choices=("minimal", "low", "medium", "high"))
     result.add_argument("--max-retries", type=int, default=2)
     result.add_argument("--retry-delay", type=float, default=1.0)
     result.add_argument("--snippet-chars", type=int, default=1000)
@@ -60,13 +62,15 @@ def _select(
     seed: int | None,
     limit: int | None,
     exclusions: ExclusionSet | None = None,
+    inclusions: ExclusionSet | None = None,
 ) -> tuple[dict[str, Any], ...]:
     if limit is not None and limit < 1:
         raise ValueError("limit must be positive")
     selected = tuple(
         record
         for record in records
-        if exclusions is None or str(record["record_id"]) not in exclusions.record_ids
+        if (inclusions is None or str(record["record_id"]) in inclusions.record_ids)
+        and (exclusions is None or str(record["record_id"]) not in exclusions.record_ids)
     )
     if record_ids:
         wanted = set(record_ids)
@@ -102,14 +106,32 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("Phase 4A currently supports only thinking_budget=0")
         if arguments.provider != "gemini" and arguments.thinking_budget is not None:
             raise ValueError("thinking_budget is only valid for Gemini")
+        if arguments.provider != "gemini" and arguments.thinking_level is not None:
+            raise ValueError("thinking_level is only valid for Gemini")
+        if arguments.thinking_budget is not None and arguments.thinking_level is not None:
+            raise ValueError("thinking_budget and thinking_level are mutually exclusive")
         if arguments.provider != "openai" and arguments.reasoning_effort is not None:
             raise ValueError("reasoning_effort is only valid for OpenAI")
         package = load_evaluation_package(arguments.input)
+        if arguments.include_record_ids is not None and arguments.record_id:
+            raise ValueError("--include-record-ids and --record-id are mutually exclusive")
+        if arguments.include_record_ids is not None and arguments.exclude_record_ids is not None:
+            raise ValueError("inclusion and exclusion files are mutually exclusive")
+        package_record_ids = {str(record["record_id"]) for record in package.records}
+        inclusions = (
+            load_exclusion_set(
+                arguments.include_record_ids,
+                package_snapshot_sha256=str(package.manifest["snapshot_sha256"]),
+                package_record_ids=package_record_ids,
+            )
+            if arguments.include_record_ids is not None
+            else None
+        )
         exclusions = (
             load_exclusion_set(
                 arguments.exclude_record_ids,
                 package_snapshot_sha256=str(package.manifest["snapshot_sha256"]),
-                package_record_ids={str(record["record_id"]) for record in package.records},
+                package_record_ids=package_record_ids,
             )
             if arguments.exclude_record_ids is not None
             else None
@@ -120,9 +142,12 @@ def main(argv: list[str] | None = None) -> int:
             arguments.subset_seed,
             arguments.limit,
             exclusions,
+            inclusions,
         )
         excluded_count = exclusions.count if exclusions is not None else 0
         exclusion_sha256 = exclusions.sha256 if exclusions is not None else None
+        included_count = inclusions.count if inclusions is not None else 0
+        inclusion_sha256 = inclusions.sha256 if inclusions is not None else None
         generation = {"max_output_tokens": arguments.max_output_tokens}
         if arguments.temperature is not None:
             generation["temperature"] = arguments.temperature
@@ -131,9 +156,13 @@ def main(argv: list[str] | None = None) -> int:
         if arguments.reasoning_effort is not None:
             generation["reasoning_effort"] = arguments.reasoning_effort
         if arguments.provider == "gemini":
-            generation["thinking_mode"] = (
-                "disabled" if arguments.thinking_budget == 0 else "provider_default_dynamic"
-            )
+            if arguments.thinking_level is not None:
+                generation["thinking_mode"] = "explicit_level"
+                generation["thinking_level"] = arguments.thinking_level
+            else:
+                generation["thinking_mode"] = (
+                    "disabled" if arguments.thinking_budget == 0 else "provider_default_dynamic"
+                )
             if arguments.thinking_budget == 0:
                 generation["thinking_budget"] = 0
         provider = provider_for(arguments.provider)
@@ -145,6 +174,8 @@ def main(argv: list[str] | None = None) -> int:
             arguments.prompt_version,
             excluded_count,
             exclusion_sha256,
+            included_count,
+            inclusion_sha256,
         )
         pricing = load_pricing(arguments.pricing)
         if arguments.dry_run:
@@ -159,9 +190,12 @@ def main(argv: list[str] | None = None) -> int:
                         "excluded_records": excluded_count,
                         "selected_records": len(records),
                         "exclusion_set_sha256": exclusion_sha256,
+                        "included_records": included_count,
+                        "inclusion_set_sha256": inclusion_sha256,
                         "provider": arguments.provider,
                         "model": arguments.model,
                         "prompt_version": arguments.prompt_version,
+                        "prompt_sha256": configuration.prompt_sha256,
                         "generation": generation,
                         "run_identity": configuration.identity(),
                         "package_snapshot_sha256": package.manifest["snapshot_sha256"],
@@ -191,6 +225,8 @@ def main(argv: list[str] | None = None) -> int:
             prompt_version=arguments.prompt_version,
             exclusion_record_count=excluded_count,
             exclusion_set_sha256=exclusion_sha256,
+            inclusion_record_count=included_count,
+            inclusion_set_sha256=inclusion_sha256,
         )
         metric_values = compute_metrics(records, results, package.domain_codes)
         cost_values = aggregate_costs(results, arguments.provider, arguments.model, pricing)

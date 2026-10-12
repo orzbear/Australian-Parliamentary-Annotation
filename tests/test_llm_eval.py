@@ -12,7 +12,7 @@ import pytest
 
 import hansard_annotator.llm_eval.providers as provider_module
 from hansard_annotator.llm_eval.cli import _select
-from hansard_annotator.llm_eval.costs import aggregate_costs
+from hansard_annotator.llm_eval.costs import aggregate_costs, load_pricing
 from hansard_annotator.llm_eval.metrics import compute_metrics
 from hansard_annotator.llm_eval.models import ProviderResponse, TokenUsage
 from hansard_annotator.llm_eval.package import EvaluationPackage, load_evaluation_package
@@ -311,6 +311,28 @@ def test_model_specific_pricing_metadata_is_reported() -> None:
     assert report["pricing_source"] == "OpenAI Standard API pricing"
 
 
+@pytest.mark.parametrize(
+    ("provider", "model", "expected"),
+    (
+        ("gemini", "gemini-2.5-flash-lite", 0.10),
+        ("gemini", "gemini-3.5-flash-lite", 0.30),
+        ("openai", "gpt-5.4-mini", 0.75),
+    ),
+)
+def test_final_candidate_pricing_is_recognized(
+    provider: str, model: str, expected: float
+) -> None:
+    pricing = load_pricing(Path("config/llm_eval/pricing.yaml"))
+    report = aggregate_costs(
+        [{"status": "success", "usage": {"input_tokens": 1_000_000}}],
+        provider,
+        model,
+        pricing,
+    )
+    assert report["pricing_found"] is True
+    assert report["estimated_cost_usd"] == expected
+
+
 class FakeProvider:
     name = "fake"
 
@@ -562,6 +584,16 @@ def test_openai_and_gemini_adapters_parse_usage(monkeypatch: pytest.MonkeyPatch)
     assert gemini.returned_model == "returned-gemini" and gemini.usage.reasoning_tokens == 1
     assert "gemini-secret" not in json.dumps(captured[1][2])
     assert captured[1][2]["generationConfig"]["thinkingConfig"] == {"thinkingBudget": 0}
+    GeminiProvider(transport=gemini_transport).generate(
+        model="gemini-3.5-flash-lite",
+        system_prompt="system",
+        user_prompt="user",
+        schema={"type": "object"},
+        generation={"thinking_mode": "explicit_level", "thinking_level": "minimal"},
+    )
+    assert captured[2][2]["generationConfig"]["thinkingConfig"] == {
+        "thinkingLevel": "minimal"
+    }
 
 
 def test_openai_http_400_preserves_safe_error_details(
@@ -667,6 +699,19 @@ def test_run_identity_changes_with_material_configuration(tmp_path: Path) -> Non
         {"reasoning_effort": "low"},
     )
     assert luna_none.identity() != luna_low.identity()
+    gemini_minimal, _ = make_configuration(
+        package,
+        "gemini",
+        "gemini-3.5-flash-lite",
+        {"thinking_mode": "explicit_level", "thinking_level": "minimal"},
+    )
+    gemini_default, _ = make_configuration(
+        package,
+        "gemini",
+        "gemini-3.5-flash-lite",
+        {"thinking_mode": "provider_default_dynamic"},
+    )
+    assert gemini_minimal.identity() != gemini_default.identity()
 
 
 def test_prompt_versions_coexist_with_distinct_hashes_and_run_identities(tmp_path: Path) -> None:
@@ -751,6 +796,45 @@ def test_explicit_exclusion_is_compatible_deterministic_and_changes_run_identity
     assert held_out.exclusion_record_count == 1
     assert held_out.exclusion_set_sha256 == exclusions.sha256
     assert baseline.identity() != held_out.identity()
+
+
+def test_explicit_inclusion_selects_only_manifest_records_and_changes_identity(
+    tmp_path: Path,
+) -> None:
+    package = load_evaluation_package(_package_dir(tmp_path, [_record(1), _record(2), _record(3)]))
+    included_ids = {str(package.records[0]["record_id"]), str(package.records[2]["record_id"])}
+    inclusion_path = tmp_path / "development.txt"
+    inclusion_path.write_text("".join(f"{value}\n" for value in sorted(included_ids)), encoding="utf-8")
+    inclusion_path.with_suffix(".manifest.json").write_text(
+        json.dumps(
+            {
+                "development_record_count": 2,
+                "record_ids_sha256": exclusion_hash(included_ids),
+                "source_package_snapshot_sha256": package.manifest["snapshot_sha256"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    inclusions = load_exclusion_set(
+        inclusion_path,
+        package_snapshot_sha256=str(package.manifest["snapshot_sha256"]),
+        package_record_ids={str(record["record_id"]) for record in package.records},
+    )
+    selected = _select(package.records, [], None, None, inclusions=inclusions)
+    assert {str(record["record_id"]) for record in selected} == included_ids
+    assert len(selected) == 2
+    baseline, _ = make_configuration(package, "openai", "gpt-6-luna", {})
+    development, _ = make_configuration(
+        package,
+        "openai",
+        "gpt-6-luna",
+        {},
+        inclusion_record_count=inclusions.count,
+        inclusion_set_sha256=inclusions.sha256,
+    )
+    assert development.inclusion_record_count == 2
+    assert development.inclusion_set_sha256 == exclusion_hash(included_ids)
+    assert baseline.identity() != development.identity()
 
 
 @pytest.mark.parametrize(

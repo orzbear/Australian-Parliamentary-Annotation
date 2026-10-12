@@ -276,19 +276,12 @@ class GeminiProvider:
         key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
         if not key:
             raise ProviderError("GEMINI_API_KEY or GOOGLE_API_KEY is not set")
-        config = {
-            "responseMimeType": "application/json",
-            "responseJsonSchema": schema,
-            "temperature": generation.get("temperature", 0.0),
-            "maxOutputTokens": generation.get("max_output_tokens", 1000),
-        }
-        if generation.get("thinking_budget") is not None:
-            config["thinkingConfig"] = {"thinkingBudget": generation["thinking_budget"]}
-        payload = {
-            "systemInstruction": {"parts": [{"text": system_prompt}]},
-            "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-            "generationConfig": config,
-        }
+        payload = gemini_request_payload(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            schema=schema,
+            generation=generation,
+        )
         data = self.transport(
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
             {"x-goog-api-key": key, "Content-Type": "application/json"},
@@ -329,6 +322,31 @@ class GeminiProvider:
             returned_model,
             diagnostics,
         )
+
+
+def gemini_request_payload(
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    schema: dict[str, Any],
+    generation: dict[str, Any],
+) -> dict[str, Any]:
+    """Construct the known-good synchronous Gemini request without performing I/O."""
+    config: dict[str, Any] = {
+            "responseMimeType": "application/json",
+            "responseJsonSchema": schema,
+            "temperature": generation.get("temperature", 0.0),
+            "maxOutputTokens": generation.get("max_output_tokens", 1000),
+        }
+    if generation.get("thinking_budget") is not None:
+        config["thinkingConfig"] = {"thinkingBudget": generation["thinking_budget"]}
+    elif generation.get("thinking_level") is not None:
+        config["thinkingConfig"] = {"thinkingLevel": generation["thinking_level"]}
+    return {
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
+        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+        "generationConfig": config,
+    }
 
 
 def provider_for(name: str) -> ModelProvider:

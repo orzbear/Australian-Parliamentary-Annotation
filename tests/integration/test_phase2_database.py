@@ -114,6 +114,11 @@ PHASE3_TABLES = {
     "annotation_versions",
     "audit_events",
 }
+PHASE4C_TABLES = {
+    "model_prediction_runs",
+    "model_predictions",
+    "model_prediction_reviews",
+}
 
 
 @pytest.fixture
@@ -126,6 +131,9 @@ def database_url(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     yield TEST_URL
     cleanup_url = TEST_URL.replace("postgresql+psycopg://", "postgresql://")
     with psycopg.connect(cleanup_url, autocommit=True) as connection:
+        connection.execute(
+            "TRUNCATE model_prediction_reviews,model_predictions,model_prediction_runs"
+        )
         connection.execute("TRUNCATE users,projects CASCADE")
         connection.execute("TRUNCATE annotation_schemas,taxonomies CASCADE")
     command.downgrade(config, "base")
@@ -933,7 +941,7 @@ def test_annotation_ready_views_are_explicitly_current_run_aware(
 def test_phase3_relations_roles_and_empty_round_trip(database_url: str) -> None:
     settings = DatabaseSettings(url=database_url, processed_data_root=Path("data/processed"))
     inspector = inspect(create_database_engine(settings))
-    assert set(inspector.get_table_names()) >= PHASE3_TABLES
+    assert set(inspector.get_table_names()) >= PHASE3_TABLES | PHASE4C_TABLES
     url = database_url.replace("postgresql+psycopg://", "postgresql://")
     with psycopg.connect(url) as connection:
         assert (
@@ -956,6 +964,51 @@ def test_phase3_relations_roles_and_empty_round_trip(database_url: str) -> None:
         assert (
             connection.execute("SELECT count(*) FROM speaker_turns").fetchone()[0] == corpus_before
         )
+
+
+def test_phase4c_prediction_runs_allow_same_turn_across_immutable_runs(
+    database_url: str, tmp_path: Path
+) -> None:
+    settings = DatabaseSettings(url=database_url, processed_data_root=Path("data/processed"))
+    import_validated_run(settings, _fixture_run(tmp_path, run_id="phase4c-fixture"))
+    url = database_url.replace("postgresql+psycopg://", "postgresql://")
+    with psycopg.connect(url) as connection:
+        turn_id = connection.execute("SELECT id FROM speaker_turns ORDER BY id LIMIT 1").fetchone()[0]
+        run_ids = []
+        for marker in ("a", "b"):
+            run_ids.append(
+                connection.execute(
+                    """
+                    INSERT INTO model_prediction_runs
+                      (artifact_sha256,provider,configured_model,prompt_version,prompt_sha256,
+                       canonical_schema_sha256,execution_mode,record_set_sha256,
+                       requested_count,provider_success_count,provider_failure_count,
+                       valid_count,invalid_count,status)
+                    VALUES (%s,'gemini','gemini-2.5-flash','phase4a-policy-v2',%s,%s,
+                            'batch',%s,1,1,0,1,0,'imported') RETURNING id
+                    """,
+                    (marker * 64, "1" * 64, "2" * 64, "3" * 64),
+                ).fetchone()[0]
+            )
+        for index, run_id in enumerate(run_ids):
+            connection.execute(
+                """
+                INSERT INTO model_predictions
+                  (run_id,speaker_turn_id,record_id,is_non_policy,
+                   primary_australian_domain,secondary_australian_domains,
+                   reasoning,validation_status)
+                VALUES (%s,%s,%s,false,'AU06','{}','Transport policy.','success')
+                """,
+                (run_id, turn_id, f"turn:fixture-{index}"),
+            )
+        assert connection.execute(
+            "SELECT count(*) FROM model_predictions WHERE speaker_turn_id=%s", (turn_id,)
+        ).fetchone()[0] == 2
+        with pytest.raises(psycopg.Error), connection.transaction():
+            connection.execute(
+                "UPDATE model_predictions SET reasoning='changed' WHERE run_id=%s",
+                (run_ids[0],),
+            )
 
 
 def test_phase3_authentication_lockout_sessions_and_disable(

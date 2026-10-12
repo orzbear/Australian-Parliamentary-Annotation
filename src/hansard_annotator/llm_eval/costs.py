@@ -59,8 +59,16 @@ def aggregate_costs(
     per_valid = estimated / successful if estimated is not None and successful else None
     return {
         "pricing_format_version": pricing["format_version"],
-        "pricing_effective_date": pricing.get("effective_date"),
-        "pricing_source": pricing.get("source"),
+        "pricing_effective_date": (
+            entry.get("effective_date", pricing.get("effective_date"))
+            if isinstance(entry, dict)
+            else pricing.get("effective_date")
+        ),
+        "pricing_source": (
+            entry.get("source", pricing.get("source"))
+            if isinstance(entry, dict)
+            else pricing.get("source")
+        ),
         "pricing_model_key": f"{provider}:{model}",
         "pricing_found": entry is not None,
         "tokens": tokens,

@@ -41,6 +41,7 @@ hansard-db = "hansard_annotator.db.cli:main"
 hansard-product = "hansard_annotator.product.cli:main"
 hansard-web = "hansard_annotator.web.cli:main"
 hansard-llm-eval = "hansard_annotator.llm_eval.cli:main"
+hansard-llm-ops = "hansard_annotator.llm_eval.ops_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

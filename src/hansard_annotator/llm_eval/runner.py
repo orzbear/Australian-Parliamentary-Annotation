@@ -43,6 +43,8 @@ class RunConfiguration:
     exclusion_record_count: int = 0
     exclusion_set_sha256: str | None = None
     provider_prediction_schema_sha256: str | None = None
+    inclusion_record_count: int = 0
+    inclusion_set_sha256: str | None = None
 
     def identity(self) -> str:
         values = asdict(self)
@@ -51,6 +53,9 @@ class RunConfiguration:
             values.pop("exclusion_set_sha256")
         if self.provider_prediction_schema_sha256 is None:
             values.pop("provider_prediction_schema_sha256")
+        if self.inclusion_record_count == 0 and self.inclusion_set_sha256 is None:
+            values.pop("inclusion_record_count")
+            values.pop("inclusion_set_sha256")
         payload = json.dumps(values, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -72,6 +77,8 @@ def make_configuration(
     prompt_version: str = DEFAULT_PROMPT_VERSION,
     exclusion_record_count: int = 0,
     exclusion_set_sha256: str | None = None,
+    inclusion_record_count: int = 0,
+    inclusion_set_sha256: str | None = None,
 ) -> tuple[RunConfiguration, str]:
     system = build_system_prompt(package.context, prompt_version)
     schema = package.schema
@@ -92,6 +99,8 @@ def make_configuration(
             if provider == "openai"
             else None
         ),
+        inclusion_record_count,
+        inclusion_set_sha256,
     ), system
 
 
@@ -174,6 +183,8 @@ def evaluate(
     prompt_version: str = DEFAULT_PROMPT_VERSION,
     exclusion_record_count: int = 0,
     exclusion_set_sha256: str | None = None,
+    inclusion_record_count: int = 0,
+    inclusion_set_sha256: str | None = None,
 ) -> list[dict[str, Any]]:
     configuration, system_prompt = make_configuration(
         package,
@@ -183,6 +194,8 @@ def evaluate(
         prompt_version,
         exclusion_record_count,
         exclusion_set_sha256,
+        inclusion_record_count,
+        inclusion_set_sha256,
     )
     initialise_run(output, configuration, resume=resume)
     checkpoint_path = output / "predictions.jsonl"

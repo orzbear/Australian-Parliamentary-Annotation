@@ -1,0 +1,26 @@
+warning: in the working copy of 'config/llm_eval/pricing.yaml', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/hansard_annotator/llm_eval/cli.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/hansard_annotator/llm_eval/costs.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/hansard_annotator/llm_eval/providers.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/hansard_annotator/llm_eval/runner.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/hansard_annotator/web/static/src/app.css', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/hansard_annotator/web/templates/base.html', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/test_llm_eval.py', LF will be replaced by CRLF the next time Git touches it
+ config/llm_eval/pricing.yaml                       |  38 [32m+++[m
+ pyproject.toml                                     |   1 [32m+[m
+ src/hansard_annotator/llm_eval/cli.py              |  46 [32m+++[m[31m-[m
+ src/hansard_annotator/llm_eval/costs.py            |  12 [32m+[m[31m-[m
+ src/hansard_annotator/llm_eval/providers.py        |  44 [32m+++[m[31m-[m
+ src/hansard_annotator/llm_eval/runner.py           |  13 [32m+[m
+ src/hansard_annotator/web/annotations/service.py   |  27 [32m+++[m
+ src/hansard_annotator/web/app.py                   |   2 [32m+[m
+ src/hansard_annotator/web/static/dist/app.css      |   2 [32m+[m[31m-[m
+ src/hansard_annotator/web/static/src/app.css       |  17 [32m++[m
+ src/hansard_annotator/web/static/src/app.js        |  12 [32m+[m[31m-[m
+ src/hansard_annotator/web/tasks/routes.py          | 265 [32m++++++++++++++++++++[m[31m-[m
+ .../web/templates/annotations/workspace.html       |  31 [32m++[m[31m-[m
+ src/hansard_annotator/web/templates/base.html      |   5 [32m+[m[31m-[m
+ .../web/templates/dashboard/index.html             |  14 [32m+[m[31m-[m
+ tests/integration/test_phase2_database.py          |  55 [32m++++[m[31m-[m
+ tests/test_llm_eval.py                             |  86 [32m++++++[m[31m-[m
+ 17 files changed, 631 insertions(+), 39 deletions(-)

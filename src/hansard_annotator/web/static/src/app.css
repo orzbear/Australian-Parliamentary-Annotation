@@ -92,6 +92,23 @@
   .secondary-actions { @apply space-y-3 border-t bg-slate-50 p-5; }
   .secondary-actions .flex { grid-template-columns: minmax(0, 1fr) auto; }
   .secondary-actions input { min-width: 0; }
+  .ai-review-grid { @apply lg:grid-cols-[minmax(0,1.55fr)_minmax(24rem,1fr)]; }
+  .ai-review-sidebar { @apply space-y-4 self-start lg:sticky lg:top-[9.2rem] lg:max-h-[calc(100vh-10rem)] lg:overflow-y-auto; }
+  .ai-suggestion-panel { @apply rounded-2xl border border-indigo-200 bg-indigo-50/50 p-5 shadow-paper; }
+  .human-review-panel, .human-result-panel { @apply overflow-hidden rounded-2xl border bg-white shadow-paper; }
+  .human-result-panel { @apply p-5; }
+  .model-reasoning { @apply mt-4 rounded-xl border border-indigo-100 bg-white p-4 text-sm leading-relaxed; }
+  .model-reasoning p { @apply mt-2; }
+  .comparison-grid { @apply grid gap-3; }
+  .comparison-grid > div { @apply grid gap-1 rounded-xl border bg-slate-50 p-3; }
+  .comparison-grid span { @apply text-xs font-bold uppercase tracking-wide text-muted; }
+  .review-table-row { @apply transition hover:bg-indigo-50/40; }
+  .primary-review-action { @apply border-t bg-white p-5; }
+  .primary-review-action .btn { @apply w-full; }
+  .correction-toggle-wrap { @apply border-t bg-slate-50/70 p-5; }
+  .correction-toggle-input { @apply sr-only; }
+  .correction-toggle-input:not(:checked) ~ [data-correction-form] { display: none; }
+  .correction-toggle-input:checked + .correction-toggle-wrap .choice-card { @apply border-indigo-500 bg-indigo-50 ring-2 ring-indigo-100; }
   .progress { @apply mt-2 h-2 overflow-hidden rounded-full bg-slate-200; }
   .progress span { @apply block h-full rounded-full bg-brand; }
 }
