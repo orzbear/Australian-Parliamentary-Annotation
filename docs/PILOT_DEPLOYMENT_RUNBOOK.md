@@ -52,6 +52,8 @@ The release archive must contain only:
 
 - `Dockerfile`, `compose.production.yaml`, `alembic.ini`;
 - `deploy/`, `src/`, `migrations/`, `config/`;
+- the frozen runtime resource
+  `scripts/conference-codebook-pilot-01-ai-codebook-input-d1d13e895705/CODEBOOK_CONTEXT.json`;
 - `requirements.lock`, `pyproject.toml`, and `README.md`.
 
 It must not contain `.env`, raw XML, processed data, existing backups, exports, Git metadata,

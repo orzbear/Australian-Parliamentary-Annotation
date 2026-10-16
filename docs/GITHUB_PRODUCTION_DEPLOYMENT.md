@@ -46,6 +46,13 @@ The bootstrap creates `hansard-deploy`, disables forwarding and PTY allocation f
 gives it a private upload directory, and permits only `/usr/local/sbin/hansard-release` through
 passwordless sudo. The production environment file remains root-only.
 
+The installed release command is an independently deployed host control. If its archive
+allowlist or release preflight changes, reinstall the reviewed `deploy/host/hansard-release`
+with the bootstrap procedure before invoking the workflow that depends on the new archive
+shape. In particular, the Phase 4D release command must allow and verify the single frozen
+`scripts/conference-codebook-pilot-01-ai-codebook-input-d1d13e895705/CODEBOOK_CONTEXT.json`
+runtime resource.
+
 ## 3. Pin the VPS host identity
 
 On the VPS, record the authoritative Ed25519 fingerprint:

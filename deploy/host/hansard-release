@@ -43,6 +43,8 @@ tar -tzf "$archive" | while IFS= read -r entry; do
     /*|../*|*/../*|*/..) fail "unsafe archive path" ;;
     Dockerfile|compose.production.yaml|alembic.ini|requirements.lock|pyproject.toml|README.md) ;;
     deploy/*|src/*|migrations/*|config/*) ;;
+    scripts/|scripts/conference-codebook-pilot-01-ai-codebook-input-d1d13e895705/) ;;
+    scripts/conference-codebook-pilot-01-ai-codebook-input-d1d13e895705/CODEBOOK_CONTEXT.json) ;;
     *) fail "unexpected archive entry: $entry" ;;
   esac
 done
@@ -64,6 +66,9 @@ tar --extract --gzip --file "$archive" --directory "$release_dir" \
 for required in Dockerfile compose.production.yaml deploy/scripts/backup.sh deploy/scripts/migrate.sh deploy/scripts/verify.sh; do
   [ -f "$release_dir/$required" ] || fail "release is missing $required"
 done
+codebook_context=scripts/conference-codebook-pilot-01-ai-codebook-input-d1d13e895705/CODEBOOK_CONTEXT.json
+[ -f "$release_dir/$codebook_context" ] || \
+  fail "Required frozen V2 CODEBOOK_CONTEXT.json is missing from release artifact."
 
 HANSARD_ENV_FILE=$ENV_FILE sh "$release_dir/deploy/scripts/preflight.sh"
 HANSARD_IMAGE_TAG=$commit_sha docker compose \
