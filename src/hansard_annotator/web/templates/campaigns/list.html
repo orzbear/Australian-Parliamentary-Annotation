@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% from "components/macros.html" import badge %}
+{% block title %}AI Annotation{% endblock %}
+{% block content %}
+<div class="flex flex-wrap items-end justify-between gap-4">
+  <div>
+    <p class="eyebrow">Model annotation operations</p>
+    <h1 class="mt-2 text-4xl font-semibold">AI Annotation</h1>
+    <p class="mt-2 text-muted">Plan, submit, recover, validate, and import reproducible provider Batch campaigns.</p>
+  </div>
+  <a class="btn btn-primary" href="/ai-annotation/new">New campaign</a>
+</div>
+<section class="surface mt-7 p-5">
+  <h2 class="font-semibold">Server-side provider status</h2>
+  <div class="mt-4 grid gap-3 md:grid-cols-2">
+    {% for provider in credentials.values() %}
+    <article class="rounded-xl border bg-slate-50 p-4">
+      <div class="flex items-center justify-between gap-3">
+        <strong>{{ provider.name }}</strong>
+        <span class="badge {{ 'badge-active' if provider.configured else 'badge-warning' }}">{{ 'Configured' if provider.configured else 'Not configured' }}</span>
+      </div>
+      <p class="mt-2 text-sm text-muted">Server environment: <code>{{ provider.environment_variables|join(' or ') }}</code></p>
+      <p class="mt-1 text-sm text-muted">{{ provider.purpose }}</p>
+    </article>
+    {% endfor %}
+  </div>
+  <p class="mt-3 text-sm text-muted">Credential values are never rendered, submitted by a browser, or stored in campaign records. This status check makes no provider request.</p>
+</section>
+<div class="mt-7 grid gap-5 lg:grid-cols-2">
+  {% for campaign in campaigns %}
+  <a class="surface card-link p-6" href="/ai-annotation/{{ campaign.public_id }}">
+    <div class="flex justify-between gap-4">{{ badge(campaign.status) }}<span class="text-sm text-muted">{{ campaign.configuration_class|replace('_',' ') }}</span></div>
+    <h2 class="mt-4 text-xl font-semibold">{{ campaign.name }}</h2>
+    <p class="mt-2 text-muted">{{ campaign.corpus_name }} · {{ campaign.configured_model }} · {{ campaign.planned_count }} records</p>
+    <p class="mt-3 text-sm text-muted">{{ campaign.created_at }}</p>
+  </a>
+  {% else %}
+  <div class="empty-state lg:col-span-2"><h2>No AI campaigns</h2><p>Create a draft and plan it without making a provider call.</p></div>
+  {% endfor %}
+</div>
+{% endblock %}

@@ -118,13 +118,7 @@ def test_phase3_real_browser_workflow_and_screenshots() -> None:
         expect(page.get_by_text("Annotation submitted.")).to_be_visible()
         _safe_workspace(page)
         page.screenshot(path=SCREENSHOTS / "submitted-success.png", full_page=True)
-        page.get_by_role("button", name="Skip for now").click()
-
-        page.get_by_role("link", name="Projects").click()
-        page.locator("a.card-link", has_text="Conference general policy pass").click()
-        page.get_by_role("button", name="Claim next task").click()
-        page.get_by_label("Flag reason").fill("Synthetic browser test flag")
-        page.get_by_role("button", name="Flag").click()
+        page.get_by_role("button", name="Skip & next").click()
 
         mobile = browser.new_context(viewport=CONFIG["mobile_viewport"])
         mobile_page = mobile.new_page()

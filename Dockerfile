@@ -13,6 +13,7 @@ COPY requirements.lock pyproject.toml README.md ./
 COPY src ./src
 COPY migrations ./migrations
 COPY config ./config
+COPY scripts/conference-codebook-pilot-01-ai-codebook-input-d1d13e895705/CODEBOOK_CONTEXT.json ./scripts/conference-codebook-pilot-01-ai-codebook-input-d1d13e895705/CODEBOOK_CONTEXT.json
 COPY alembic.ini ./alembic.ini
 
 RUN python -m pip install --no-cache-dir -r requirements.lock && \

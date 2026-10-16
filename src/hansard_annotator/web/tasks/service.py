@@ -10,12 +10,14 @@ from psycopg import sql
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from hansard_annotator.web.annotations.renderer import load_schema
 from hansard_annotator.web.audit.service import record_event
 from hansard_annotator.web.auth.models import Principal
 from hansard_annotator.web.config import WebSettings
 from hansard_annotator.web.projects.permissions import (
     ANNOTATOR_ROLES,
     MANAGER_ROLES,
+    VIEW_ROLES,
     PermissionDenied,
     require_project_role,
 )
@@ -496,6 +498,362 @@ def set_assignment_outcome(
             entity_public_id=row["public_id"],
             project_id=row["project_id"],
             metadata={"reason_provided": bool(reason)},
+        )
+
+
+HUMAN_WORK_FILTERS = {"to_annotate", "in_progress", "completed", "skipped", "all"}
+
+
+def _human_work_cte() -> str:
+    return """
+        WITH human_work AS (
+          SELECT a.id AS assignment_id,a.public_id AS assignment_public_id,
+                 a.user_id,a.status AS assignment_status,a.updated_at,a.submitted_at,
+                 a.skipped_at,t.project_id,t.priority,st.turn_key,st.speech_date,
+                 st.speaker_name_raw,st.major_heading_original,
+                 an.status AS annotation_status,av.revision_number,av.values,
+                 av.created_at AS version_created_at,u.display_name AS annotator_name,
+                 CASE
+                   WHEN an.status IN ('submitted','revised') OR a.status='submitted'
+                     THEN 'completed'
+                   WHEN a.status='skipped' THEN 'skipped'
+                   WHEN an.status='draft' OR a.status='in_progress' THEN 'in_progress'
+                   ELSE 'to_annotate'
+                 END AS workflow_status,
+                 CASE
+                   WHEN av.values ? 'is_non_policy' THEN
+                     CASE WHEN (av.values->>'is_non_policy')::boolean
+                          THEN 'non_policy' ELSE 'policy' END
+                   WHEN av.values ? 'content_status' THEN
+                     CASE WHEN av.values->>'content_status'='substantive_policy'
+                          THEN 'policy' ELSE 'non_policy' END
+                   ELSE NULL
+                 END AS policy_status,
+                 av.values->>'primary_australian_domain' AS primary_domain
+          FROM assignments a JOIN tasks t ON t.id=a.task_id
+          JOIN speaker_turns st ON st.id=t.speaker_turn_id
+          LEFT JOIN users u ON u.id=a.user_id
+          LEFT JOIN annotations an ON an.assignment_id=a.id
+          LEFT JOIN annotation_versions av ON av.id=an.current_version_id
+          WHERE t.project_id=%s AND (%s=false OR a.user_id=%s)
+            AND a.status NOT IN ('withdrawn','flagged')
+        )
+    """
+
+
+def human_annotation_work(
+    settings: WebSettings,
+    principal: Principal,
+    project_id: int,
+    *,
+    status: str = "to_annotate",
+    policy_status: str | None = None,
+    primary_domain: str | None = None,
+    annotator: str | None = None,
+    query: str | None = None,
+    page: int = 1,
+    page_size: int = 25,
+) -> dict[str, object]:
+    """Return scoped counts plus one bounded page of Human Annotation work."""
+    if status not in HUMAN_WORK_FILTERS:
+        raise ValueError("invalid Human Annotation status filter")
+    if policy_status not in {None, "policy", "non_policy"}:
+        raise ValueError("invalid policy status filter")
+    if page < 1 or page_size < 1 or page_size > 100:
+        raise ValueError("invalid pagination")
+    cleaned_domain = (primary_domain or "").strip() or None
+    cleaned_annotator = (annotator or "").strip() or None
+    cleaned_query = (query or "").strip() or None
+    with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
+        project_role = require_project_role(connection, principal, project_id, VIEW_ROLES)
+        own_only = project_role == "annotator"
+        base_parameters: tuple[object, ...] = (
+            project_id,
+            own_only,
+            principal.user_id,
+        )
+        counts = connection.execute(
+            _human_work_cte()
+            + """
+              SELECT count(*) AS total,
+                     count(*) FILTER (WHERE workflow_status='to_annotate') AS to_annotate,
+                     count(*) FILTER (WHERE workflow_status='in_progress') AS in_progress,
+                     count(*) FILTER (WHERE workflow_status='completed') AS completed,
+                     count(*) FILTER (WHERE workflow_status='skipped') AS skipped
+              FROM human_work
+            """,
+            base_parameters,
+        ).fetchone()
+        rows = connection.execute(
+            _human_work_cte()
+            + """
+              SELECT *,count(*) OVER () AS filtered_count
+              FROM human_work
+              WHERE (%s='all' OR workflow_status=%s)
+                AND (%s::text IS NULL OR policy_status=%s)
+                AND (%s::text IS NULL OR primary_domain=%s)
+                AND (%s::text IS NULL OR annotator_name ILIKE '%%' || %s || '%%')
+                AND (%s::text IS NULL OR turn_key ILIKE '%%' || %s || '%%'
+                     OR speaker_name_raw ILIKE '%%' || %s || '%%')
+              ORDER BY
+                CASE workflow_status WHEN 'in_progress' THEN 0 WHEN 'to_annotate' THEN 1
+                  WHEN 'skipped' THEN 2 ELSE 3 END,
+                priority DESC,COALESCE(updated_at,version_created_at) DESC,assignment_id
+              LIMIT %s OFFSET %s
+            """,
+            (
+                *base_parameters,
+                status,
+                status,
+                policy_status,
+                policy_status,
+                cleaned_domain,
+                cleaned_domain,
+                cleaned_annotator,
+                cleaned_annotator,
+                cleaned_query,
+                cleaned_query,
+                cleaned_query,
+                page_size,
+                (page - 1) * page_size,
+            ),
+        ).fetchall()
+        domain_labels = connection.execute(
+            """
+            SELECT label.code,label.label FROM projects p
+            JOIN annotation_field_definitions field
+              ON field.annotation_schema_version_id=p.annotation_schema_version_id
+             AND field.field_key='primary_australian_domain'
+            JOIN taxonomy_labels label
+              ON label.taxonomy_version_id=field.taxonomy_version_id AND label.is_active
+            WHERE p.id=%s ORDER BY label.display_order,label.code
+            """,
+            (project_id,),
+        ).fetchall()
+    filtered_count = int(rows[0]["filtered_count"]) if rows else 0
+    label_map = {str(row["code"]): str(row["label"]) for row in domain_labels}
+    items: list[dict[str, object]] = []
+    for row in rows:
+        item = dict(row)
+        code = item.get("primary_domain")
+        item["primary_domain_display"] = (
+            f"{code} — {label_map.get(str(code), str(code))}" if code else None
+        )
+        item["can_edit"] = item.get("user_id") == principal.user_id
+        items.append(item)
+    return {
+        "counts": dict(counts or {}),
+        "rows": items,
+        "filtered_count": filtered_count,
+        "page": page,
+        "page_size": page_size,
+        "page_count": max(1, (filtered_count + page_size - 1) // page_size),
+        "active_status": status,
+        "policy_status": policy_status,
+        "primary_domain": cleaned_domain,
+        "annotator": cleaned_annotator,
+        "query": cleaned_query,
+        "domain_labels": [dict(row) for row in domain_labels],
+    }
+
+
+def _display_taxonomy_value(
+    value: object, field: dict[str, object], labels: dict[int, list[dict[str, object]]]
+) -> object:
+    taxonomy_id = field.get("taxonomy_version_id")
+    if taxonomy_id is None:
+        if isinstance(value, bool):
+            return "Yes" if value else "No"
+        return value
+    label_map = {
+        str(label["code"]): f"{label['code']} — {label['label']}"
+        for label in labels.get(int(str(taxonomy_id)), [])
+    }
+    if isinstance(value, list):
+        return [label_map.get(str(item), str(item)) for item in value]
+    return label_map.get(str(value), value) if value is not None else None
+
+
+def _version_summary(values: dict[str, object]) -> dict[str, object]:
+    if "is_non_policy" in values:
+        policy_label = "Non-Policy" if values.get("is_non_policy") else "Policy"
+    elif "content_status" in values:
+        policy_label = (
+            "Policy" if values.get("content_status") == "substantive_policy" else "Non-Policy"
+        )
+    else:
+        policy_label = "Not applicable"
+    return {
+        "policy_label": policy_label,
+        "primary_domain": values.get("primary_australian_domain"),
+        "secondary_domains": values.get("secondary_australian_domains") or [],
+    }
+
+
+def human_annotation_detail(
+    settings: WebSettings, principal: Principal, assignment_id: int
+) -> dict[str, object]:
+    """Read a completed annotation under existing project visibility rules."""
+    with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
+        scope = connection.execute(
+            "SELECT t.project_id FROM assignments a JOIN tasks t ON t.id=a.task_id WHERE a.id=%s",
+            (assignment_id,),
+        ).fetchone()
+        if scope is None:
+            raise LookupError("assignment not found")
+        project_id = int(scope["project_id"])
+        project_role = require_project_role(connection, principal, project_id, VIEW_ROLES)
+        own_only = project_role == "annotator"
+        row = connection.execute(
+            """
+            SELECT a.id,a.public_id,a.user_id,a.status AS assignment_status,a.submitted_at,
+                   a.updated_at,t.project_id,st.turn_key,st.speech_date,st.chamber,
+                   st.speaker_name_raw,st.major_heading_original,st.minor_heading_original,
+                   st.business_type,st.text_clean,st.calculated_word_count,p.name AS project_name,
+                   p.annotation_schema_version_id,an.status AS annotation_status,
+                   an.submitted_at AS annotation_submitted_at,an.updated_at AS annotation_updated_at,
+                   av.revision_number,av.event_type,av.values,av.created_at AS version_created_at,
+                   u.display_name AS annotator_name
+            FROM assignments a JOIN tasks t ON t.id=a.task_id
+            JOIN projects p ON p.id=t.project_id
+            JOIN speaker_turns st ON st.id=t.speaker_turn_id
+            JOIN users u ON u.id=a.user_id
+            JOIN annotations an ON an.assignment_id=a.id
+            JOIN annotation_versions av ON av.id=an.current_version_id
+            WHERE a.id=%s AND an.status IN ('submitted','revised')
+              AND (%s=false OR a.user_id=%s)
+            """,
+            (assignment_id, own_only, principal.user_id),
+        ).fetchone()
+        if row is None:
+            raise LookupError("completed annotation not found")
+        fields, labels = load_schema(connection, row["annotation_schema_version_id"])
+        history = connection.execute(
+            """
+            SELECT av.revision_number,av.event_type,av.values,av.created_at,
+                   u.display_name AS annotator_name
+            FROM annotation_versions av JOIN annotations an ON an.id=av.annotation_id
+            JOIN users u ON u.id=av.created_by_user_id
+            WHERE an.assignment_id=%s ORDER BY av.revision_number DESC
+            """,
+            (assignment_id,),
+        ).fetchall()
+    result = dict(row)
+    values = dict(row["values"])
+    result.update(_version_summary(values))
+    result["can_edit"] = row["user_id"] == principal.user_id
+    result["field_values"] = [
+        {
+            "field_key": field["field_key"],
+            "label": field["label"],
+            "value": _display_taxonomy_value(
+                values.get(str(field["field_key"])), field, labels
+            ),
+        }
+        for field in fields
+    ]
+    result["history"] = [
+        {**dict(version), **_version_summary(dict(version["values"]))}
+        for version in history
+    ]
+    return result
+
+
+def assignment_progress(
+    settings: WebSettings, principal: Principal, project_id: int
+) -> dict[str, int]:
+    with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
+        require_project_role(connection, principal, project_id, ANNOTATOR_ROLES)
+        row = connection.execute(
+            """
+            SELECT count(*) AS total,
+                   count(*) FILTER (WHERE status='submitted') AS completed
+            FROM assignments WHERE user_id=%s
+              AND task_id IN (SELECT id FROM tasks WHERE project_id=%s)
+              AND status <> 'withdrawn'
+            """,
+            (principal.user_id, project_id),
+        ).fetchone()
+        assert row is not None
+    return {"total": int(row["total"]), "completed": int(row["completed"])}
+
+
+def next_human_assignment(
+    settings: WebSettings,
+    principal: Principal,
+    project_id: int,
+    *,
+    exclude_assignment_id: int | None = None,
+) -> dict[str, object] | None:
+    """Prefer already-owned work, then atomically claim a new assignment."""
+    with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
+        require_project_role(connection, principal, project_id, ANNOTATOR_ROLES)
+        row = connection.execute(
+            """
+            SELECT a.id,a.public_id,a.task_id FROM assignments a
+            JOIN tasks t ON t.id=a.task_id
+            LEFT JOIN annotations an ON an.assignment_id=a.id
+            WHERE t.project_id=%s AND a.user_id=%s
+              AND a.status IN ('assigned','claimed','in_progress')
+              AND (%s IS NULL OR a.id<>%s)
+            ORDER BY CASE WHEN an.status='draft' THEN 0
+                          WHEN a.status='in_progress' THEN 1 ELSE 2 END,
+                     a.updated_at,a.id
+            LIMIT 1
+            """,
+            (
+                project_id,
+                principal.user_id,
+                exclude_assignment_id,
+                exclude_assignment_id,
+            ),
+        ).fetchone()
+        if row is not None:
+            return dict(row)
+    return claim_next(settings, principal, project_id)
+
+
+def reopen_skipped_assignment(
+    settings: WebSettings, principal: Principal, assignment_id: int
+) -> None:
+    with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
+        row = connection.execute(
+            """
+            SELECT a.public_id,t.id AS task_id,t.project_id FROM assignments a
+            JOIN tasks t ON t.id=a.task_id
+            WHERE a.id=%s AND a.user_id=%s AND a.status='skipped'
+            FOR UPDATE OF a,t
+            """,
+            (assignment_id, principal.user_id),
+        ).fetchone()
+        if row is None:
+            raise LookupError("skipped assignment not available")
+        require_project_role(connection, principal, int(row["project_id"]), ANNOTATOR_ROLES)
+        competing = connection.execute(
+            """
+            SELECT 1 FROM assignments WHERE task_id=%s AND id<>%s
+              AND status IN ('claimed','in_progress','submitted') LIMIT 1
+            """,
+            (row["task_id"], assignment_id),
+        ).fetchone()
+        if competing is not None:
+            raise ValueError("this skipped task is already being handled elsewhere")
+        connection.execute(
+            "UPDATE assignments SET status='in_progress',updated_at=now() WHERE id=%s",
+            (assignment_id,),
+        )
+        connection.execute(
+            "UPDATE tasks SET status='in_progress' WHERE id=%s",
+            (row["task_id"],),
+        )
+        record_event(
+            connection,
+            "assignment_reopened",
+            "assignment",
+            actor_user_id=principal.user_id,
+            entity_public_id=row["public_id"],
+            project_id=row["project_id"],
+            metadata={},
         )
 
 

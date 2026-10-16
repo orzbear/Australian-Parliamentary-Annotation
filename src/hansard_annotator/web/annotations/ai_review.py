@@ -20,6 +20,56 @@ REVIEW_FILTERS = {
     "flagged_codebook",
     "skipped",
 }
+RUN_FILTERS = {"needs_review", "completed", "all"}
+
+
+def ai_review_runs(
+    settings: WebSettings, *, run_filter: str = "all"
+) -> list[dict[str, object]]:
+    """Summarise immutable runs without collapsing their provenance."""
+    if run_filter not in RUN_FILTERS:
+        raise ValueError("invalid AI review run filter")
+    having = {
+        "needs_review": "count(prediction.id) FILTER (WHERE terminal.review_status IS NULL)>0",
+        "completed": "count(prediction.id)>0 AND count(prediction.id) FILTER "
+        "(WHERE terminal.review_status IS NULL)=0",
+        "all": "true",
+    }[run_filter]
+    with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
+        rows = connection.execute(
+            f"""
+            SELECT run.public_id,run.provider,run.configured_model,run.prompt_version,
+                   run.imported_at,campaign.name AS campaign_name,campaign.status AS campaign_status,
+                   count(prediction.id) AS prediction_count,
+                   count(prediction.id) FILTER (WHERE terminal.review_status IS NOT NULL)
+                     AS reviewed_count,
+                   count(prediction.id) FILTER (WHERE terminal.review_status IS NULL)
+                     AS unreviewed_count
+            FROM model_prediction_runs run
+            LEFT JOIN ai_annotation_campaigns campaign
+              ON campaign.model_prediction_run_id=run.id
+            LEFT JOIN model_predictions prediction ON prediction.run_id=run.id
+            LEFT JOIN LATERAL (
+              SELECT review_status FROM model_prediction_reviews review
+              WHERE review.model_prediction_id=prediction.id
+                AND review.review_status IN ('accepted','edited','skipped')
+              ORDER BY reviewed_at DESC,id DESC LIMIT 1
+            ) terminal ON true
+            GROUP BY run.id,campaign.id HAVING {having}
+            ORDER BY run.imported_at DESC NULLS LAST,run.id DESC
+            """
+        ).fetchall()
+    output: list[dict[str, object]] = []
+    for row in rows:
+        value = dict(row)
+        total = int(row["prediction_count"])
+        reviewed = int(row["reviewed_count"])
+        value["display_name"] = row["campaign_name"] or "Imported prediction run"
+        value["remaining_count"] = int(row["unreviewed_count"])
+        value["progress_percent"] = round(reviewed / total * 100) if total else 0
+        value["review_complete"] = total > 0 and reviewed == total
+        output.append(value)
+    return output
 
 
 def _domain_label_map(

@@ -1,4 +1,23 @@
 (() => {
+  document.addEventListener("submit", (event) => {
+    const progressForm = event.target.closest?.("form[data-progress-form]");
+    if (!progressForm) return;
+    if (progressForm.dataset.submitting === "true") {
+      event.preventDefault();
+      return;
+    }
+    progressForm.dataset.submitting = "true";
+    progressForm.setAttribute("aria-busy", "true");
+    progressForm.querySelectorAll('button[type="submit"], button:not([type])').forEach((button) => {
+      button.disabled = true;
+    });
+    const submitter = event.submitter;
+    if (submitter) {
+      submitter.textContent = submitter.dataset.progressText || "Working...";
+      submitter.classList.add("is-loading");
+    }
+  });
+
   const form = document.querySelector("[data-dirty-form]");
   if (!form) return;
 

@@ -55,6 +55,7 @@ from hansard_annotator.web.auth.service import (
     revoke_session,
     set_user_enabled,
 )
+from hansard_annotator.web.campaigns.service import create_campaign
 from hansard_annotator.web.config import WebSettings
 from hansard_annotator.web.exports.service import (
     build_ai_codebook_export,
@@ -72,6 +73,7 @@ from hansard_annotator.web.tasks.service import (
     claim_next,
     generate_batch,
     get_assignment,
+    human_annotation_work,
     preview_batch,
 )
 
@@ -119,6 +121,10 @@ PHASE4C_TABLES = {
     "model_predictions",
     "model_prediction_reviews",
 }
+PHASE4D_TABLES = {
+    "ai_annotation_campaigns",
+    "ai_annotation_campaign_records",
+}
 
 
 @pytest.fixture
@@ -132,7 +138,8 @@ def database_url(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     cleanup_url = TEST_URL.replace("postgresql+psycopg://", "postgresql://")
     with psycopg.connect(cleanup_url, autocommit=True) as connection:
         connection.execute(
-            "TRUNCATE model_prediction_reviews,model_predictions,model_prediction_runs"
+            "TRUNCATE ai_annotation_campaign_records,ai_annotation_campaigns,"
+            "model_prediction_reviews,model_predictions,model_prediction_runs"
         )
         connection.execute("TRUNCATE users,projects CASCADE")
         connection.execute("TRUNCATE annotation_schemas,taxonomies CASCADE")
@@ -941,7 +948,7 @@ def test_annotation_ready_views_are_explicitly_current_run_aware(
 def test_phase3_relations_roles_and_empty_round_trip(database_url: str) -> None:
     settings = DatabaseSettings(url=database_url, processed_data_root=Path("data/processed"))
     inspector = inspect(create_database_engine(settings))
-    assert set(inspector.get_table_names()) >= PHASE3_TABLES | PHASE4C_TABLES
+    assert set(inspector.get_table_names()) >= PHASE3_TABLES | PHASE4C_TABLES | PHASE4D_TABLES
     url = database_url.replace("postgresql+psycopg://", "postgresql://")
     with psycopg.connect(url) as connection:
         assert (
@@ -964,6 +971,155 @@ def test_phase3_relations_roles_and_empty_round_trip(database_url: str) -> None:
         assert (
             connection.execute("SELECT count(*) FROM speaker_turns").fetchone()[0] == corpus_before
         )
+
+
+def test_phase4d_migration_constraints_immutability_linkage_and_downgrade_guard(
+    database_url: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = Config("alembic.ini")
+    command.downgrade(config, "20261009_06")
+    settings = DatabaseSettings(url=database_url, processed_data_root=Path("data/processed"))
+    inspector = inspect(create_database_engine(settings))
+    assert set(inspector.get_table_names()) >= PHASE4C_TABLES
+    assert not (PHASE4D_TABLES & set(inspector.get_table_names()))
+
+    command.upgrade(config, "20261013_07")
+    inspector = inspect(create_database_engine(settings))
+    assert set(inspector.get_table_names()) >= PHASE4C_TABLES | PHASE4D_TABLES
+    campaign_fks = inspector.get_foreign_keys("ai_annotation_campaigns")
+    assert {fk["referred_table"] for fk in campaign_fks} >= {
+        "corpora",
+        "users",
+        "model_prediction_runs",
+    }
+    record_uniques = {
+        tuple(constraint["column_names"])
+        for constraint in inspector.get_unique_constraints("ai_annotation_campaign_records")
+    }
+    assert {
+        ("campaign_id", "speaker_turn_id"),
+        ("campaign_id", "record_id"),
+        ("campaign_id", "selection_order"),
+    } <= record_uniques
+
+    import_validated_run(settings, _fixture_run(tmp_path, run_id="phase4d-db-fixture"))
+    password = "phase4d database test password"
+    create_user(
+        _web_settings(database_url),
+        "phase4d-db-admin",
+        "Phase 4D DB Admin",
+        password,
+        admin=True,
+        must_change_password=False,
+    )
+    admin, _ = authenticate(_web_settings(database_url), "phase4d-db-admin", password)
+    url = database_url.replace("postgresql+psycopg://", "postgresql://")
+    frozen = "a41027b001f10b61074c196996606c86b5dac4c0788ae185a05ff68fcf3b7cc6"
+    schema = "9c94bab9cd2976559c79b1c31991aef4138a2071a5d3b3d6186a26448f117126"
+    with psycopg.connect(url) as connection:
+        corpus_id = connection.execute("SELECT id FROM corpora LIMIT 1").fetchone()[0]
+        turn_id = connection.execute("SELECT id FROM speaker_turns LIMIT 1").fetchone()[0]
+    campaign = create_campaign(
+        _web_settings(database_url), admin, name="DB acceptance", corpus_id=corpus_id
+    )
+    campaign_id = campaign["id"]
+    assert campaign["status"] == "DRAFT"
+    assert campaign["cache_status"] == "REQUIRED"
+    with psycopg.connect(url) as connection:
+        connection.execute(
+            """
+            INSERT INTO ai_annotation_campaign_records
+              (campaign_id,speaker_turn_id,record_id,selection_order,record_sha256)
+            VALUES (%s,%s,'turn:db-acceptance',0,%s)
+            """,
+            (campaign_id, turn_id, "1" * 64),
+        )
+        connection.execute(
+            """
+            UPDATE ai_annotation_campaigns SET status='PLANNED',planned_count=1,
+                   record_set_sha256=%s WHERE id=%s
+            """,
+            ("2" * 64, campaign_id),
+        )
+        connection.commit()
+
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            connection.execute(
+                """
+                INSERT INTO ai_annotation_campaign_records
+                  (campaign_id,speaker_turn_id,record_id,selection_order,record_sha256)
+                VALUES (%s,%s,'turn:duplicate',1,%s)
+                """,
+                (campaign_id, turn_id, "3" * 64),
+            )
+        connection.rollback()
+        with pytest.raises(psycopg.errors.ObjectNotInPrerequisiteState):
+            connection.execute(
+                "UPDATE ai_annotation_campaign_records SET selection_order=2 WHERE campaign_id=%s",
+                (campaign_id,),
+            )
+        connection.rollback()
+        with pytest.raises(psycopg.errors.ObjectNotInPrerequisiteState):
+            connection.execute(
+                "DELETE FROM ai_annotation_campaign_records WHERE campaign_id=%s",
+                (campaign_id,),
+            )
+        connection.rollback()
+
+        connection.execute(
+            """
+            UPDATE ai_annotation_campaigns SET status='SUBMITTED',provider_job_id='batches/db',
+              cache_status='REUSABLE',cache_identifier='cachedContents/db',
+              cache_content_sha256=%s,cache_model='models/gemini-2.5-flash',
+              cache_display_name='phase4d-phase4a-policy-v2-a41027b001f10b61',
+              cache_created_at=now(),cache_expires_at=now()+interval '24 hours',
+              cache_verified_at=now()
+            WHERE id=%s
+            """,
+            (frozen, campaign_id),
+        )
+        connection.commit()
+        with pytest.raises(psycopg.errors.RaiseException, match="provenance is immutable"):
+            connection.execute(
+                "UPDATE ai_annotation_campaigns SET prompt_sha256=%s WHERE id=%s",
+                ("4" * 64, campaign_id),
+            )
+        connection.rollback()
+        with pytest.raises(psycopg.errors.RaiseException, match="provenance is immutable"):
+            connection.execute(
+                "UPDATE ai_annotation_campaigns SET cache_identifier='cachedContents/other' WHERE id=%s",
+                (campaign_id,),
+            )
+        connection.rollback()
+
+        run_id = connection.execute(
+            """
+            INSERT INTO model_prediction_runs
+              (artifact_sha256,provider,configured_model,prompt_version,prompt_sha256,
+               canonical_schema_sha256,execution_mode,record_set_sha256,requested_count,
+               provider_success_count,provider_failure_count,valid_count,invalid_count,status)
+            VALUES (%s,'gemini','gemini-2.5-flash','phase4a-policy-v2',%s,%s,'batch',%s,
+                    1,1,0,1,0,'imported') RETURNING id
+            """,
+            ("5" * 64, frozen, schema, "2" * 64),
+        ).fetchone()[0]
+        connection.execute(
+            """
+            UPDATE ai_annotation_campaigns SET status='IMPORTED',model_prediction_run_id=%s,
+                   imported_at=now() WHERE id=%s
+            """,
+            (run_id, campaign_id),
+        )
+        connection.commit()
+        linked = connection.execute(
+            "SELECT status,model_prediction_run_id FROM ai_annotation_campaigns WHERE id=%s",
+            (campaign_id,),
+        ).fetchone()
+        assert linked == ("IMPORTED", run_id)
+
+    monkeypatch.setenv("HANSARD_DATABASE_URL", database_url)
+    with pytest.raises(RuntimeError, match="downgrade refused"):
+        command.downgrade(config, "20261009_06")
 
 
 def test_phase4c_prediction_runs_allow_same_turn_across_immutable_runs(
@@ -1096,7 +1252,7 @@ def test_phase3_project_batch_claim_annotation_and_permissions(
     )
     admin, _ = authenticate(settings, "phase3-admin", password)
     annotator_a, _ = authenticate(settings, "annotator-a", password)
-    annotator_b, _ = authenticate(settings, "annotator-b", password)
+    annotator_b, annotator_b_token = authenticate(settings, "annotator-b", password)
     url = database_url.replace("postgresql+psycopg://", "postgresql://")
     with psycopg.connect(url, row_factory=dict_row) as connection:
         options = connection.execute(
@@ -1167,6 +1323,241 @@ def test_phase3_project_batch_claim_annotation_and_permissions(
     assert assignment["project_id"] == project_id
     with pytest.raises(LookupError):
         get_assignment(settings, annotator_b, assignment_id)
+
+    browser_assignment_id = int(claims[1]["id"])
+    browser_payload = {
+        "csrf_token": annotator_b.csrf_token,
+        "expected_revision_number": "0",
+        "content_status": "substantive_policy",
+        "primary_australian_domain": "AU03",
+        "secondary_australian_domains": "AU05",
+        "specific_australian_issue": "Medicare",
+        "topic_uncertain": "false",
+        "fallback_explanation": "",
+        "unclassifiable_reason": "",
+        "annotation_notes": "First browser submission",
+    }
+    with TestClient(create_app(settings)) as client:
+        client.cookies.set(SESSION_COOKIE, annotator_b_token)
+        workspace = client.get(f"/assignments/{browser_assignment_id}")
+        assert workspace.status_code == 200
+        assert 'name="expected_revision_number" value="0"' in workspace.text
+        assert "Flag codebook issue" not in workspace.text
+        assert "Possible taxonomy/codebook ambiguity" not in workspace.text
+        assert "Save draft" in workspace.text
+        assert "Annotation notes" in workspace.text
+        assert "Revision history" in workspace.text
+
+        first_submission = client.post(
+            f"/assignments/{browser_assignment_id}/submit",
+            data=browser_payload,
+            follow_redirects=False,
+        )
+        assert first_submission.status_code == 303
+        assert first_submission.headers["location"].startswith("/assignments/")
+        next_assignment_id = int(
+            first_submission.headers["location"].split("/assignments/", 1)[1].split("?", 1)[0]
+        )
+
+        submitted_workspace = client.get(f"/assignments/{browser_assignment_id}")
+        assert submitted_workspace.status_code == 200
+        assert 'name="expected_revision_number" value="1"' in submitted_workspace.text
+        assert "Submit revision &amp; next" in submitted_workspace.text
+        assert "Save draft" not in submitted_workspace.text
+
+        revision_payload = {
+            **browser_payload,
+            "expected_revision_number": "1",
+            "annotation_notes": "Explicit browser revision",
+        }
+        revision = client.post(
+            f"/assignments/{browser_assignment_id}/submit",
+            data=revision_payload,
+            follow_redirects=False,
+        )
+        assert revision.status_code == 303
+        assert revision.headers["location"].startswith(
+            f"/assignments/{next_assignment_id}"
+        )
+
+        stale_revision = client.post(
+            f"/assignments/{browser_assignment_id}/submit",
+            data=revision_payload,
+            follow_redirects=False,
+        )
+        assert stale_revision.status_code == 409
+        assert "changed after the form was loaded" in stale_revision.text
+
+        malformed_revision = client.post(
+            f"/assignments/{browser_assignment_id}/submit",
+            data={**browser_payload, "expected_revision_number": "not-a-revision"},
+            follow_redirects=False,
+        )
+        assert malformed_revision.status_code == 422
+        assert "missing or malformed" in malformed_revision.text
+
+        history_page = client.get(f"/assignments/{browser_assignment_id}/history")
+        assert history_page.status_code == 200
+        assert "Revision 2" in history_page.text
+        assert "Revision 1" in history_page.text
+
+        completed_detail = client.get(f"/assignments/{browser_assignment_id}/detail")
+        assert completed_detail.status_code == 200
+        assert "Completed Human Annotation" in completed_detail.text
+        assert "Policy" in completed_detail.text
+        assert "AU03 — Health" in completed_detail.text
+        assert "First browser submission" in completed_detail.text
+        assert "Explicit browser revision" in completed_detail.text
+        assert "Revise Annotation" in completed_detail.text
+
+        with TestClient(create_app(settings)) as other_client:
+            other_client.cookies.set(SESSION_COOKIE, authenticate(
+                settings, "annotator-a", password
+            )[1])
+            assert (
+                other_client.get(f"/assignments/{browser_assignment_id}/detail").status_code
+                == 404
+            )
+
+        landing = client.get("/projects")
+        assert landing.status_code == 200
+        for label in ("To Annotate", "Draft", "Completed", "Skipped", "Total"):
+            assert label in landing.text
+
+        overview = client.get(f"/projects/{project_id}?status=completed")
+        assert overview.status_code == 200
+        assert "Browse annotation work" in overview.text
+        assert "To Annotate" in overview.text
+        assert "In Progress / Draft" in overview.text
+        assert "Completed" in overview.text
+        assert "Skipped" in overview.text
+        assert "First browser submission" not in overview.text
+        assert f"/assignments/{browser_assignment_id}/detail" in overview.text
+        assert "Flag codebook issue" not in overview.text
+
+        to_annotate = client.get(f"/projects/{project_id}?status=to_annotate")
+        assert to_annotate.status_code == 200
+        assert f"/assignments/{next_assignment_id}" in to_annotate.text
+        filtered_completed = client.get(
+            f"/projects/{project_id}?status=completed&policy_status=policy"
+            "&primary_domain=AU03"
+        )
+        assert f"/assignments/{browser_assignment_id}/detail" in filtered_completed.text
+
+        draft_payload = {
+            **browser_payload,
+            "expected_revision_number": "0",
+            "annotation_notes": "Pending draft",
+        }
+        draft_response = client.post(
+            f"/assignments/{next_assignment_id}/draft",
+            data=draft_payload,
+            follow_redirects=False,
+        )
+        assert draft_response.status_code == 303
+        assert draft_response.headers["location"] == (
+            f"/assignments/{next_assignment_id}?saved=1"
+        )
+        draft_page = client.get(draft_response.headers["location"])
+        assert "Draft saved. You remain on this annotation." in draft_page.text
+        in_progress = client.get(f"/projects/{project_id}?status=in_progress")
+        assert in_progress.status_code == 200
+        assert "Pending draft" not in in_progress.text
+        assert f"/assignments/{next_assignment_id}" in in_progress.text
+
+        first_skip = client.post(
+            f"/assignments/{next_assignment_id}/skip",
+            data={"csrf_token": annotator_b.csrf_token},
+            follow_redirects=False,
+        )
+        assert first_skip.status_code == 303
+        assert first_skip.headers["location"].startswith("/assignments/")
+        final_assignment_id = int(
+            first_skip.headers["location"].split("/assignments/", 1)[1].split("?", 1)[0]
+        )
+        assert final_assignment_id != next_assignment_id
+
+        final_skip = client.post(
+            f"/assignments/{final_assignment_id}/skip",
+            data={"csrf_token": annotator_b.csrf_token},
+            follow_redirects=False,
+        )
+        assert final_skip.status_code == 303
+        assert final_skip.headers["location"] == (
+            f"/projects/{project_id}?queue_complete=1&status=skipped"
+        )
+        skipped_list = client.get(final_skip.headers["location"])
+        assert "No more available Human Annotation tasks." in skipped_list.text
+        assert skipped_list.text.count("Annotate now") == 2
+
+        reopen = client.post(
+            f"/assignments/{next_assignment_id}/reopen",
+            data={"csrf_token": annotator_b.csrf_token},
+            follow_redirects=False,
+        )
+        assert reopen.status_code == 303
+        assert reopen.headers["location"] == f"/assignments/{next_assignment_id}?reopened=1"
+        reopened_page = client.get(reopen.headers["location"])
+        assert "Skipped annotation reopened." in reopened_page.text
+        assert "Pending draft" in reopened_page.text
+
+        recovered_submission = client.post(
+            f"/assignments/{next_assignment_id}/submit",
+            data={**draft_payload, "expected_revision_number": "1"},
+            follow_redirects=False,
+        )
+        assert recovered_submission.status_code == 303
+        assert recovered_submission.headers["location"] == (
+            f"/projects/{project_id}?queue_complete=1"
+        )
+        completed_list = client.get(f"/projects/{project_id}?status=completed")
+        assert f"/assignments/{next_assignment_id}/detail" in completed_list.text
+        remaining_skipped = client.get(f"/projects/{project_id}?status=skipped")
+        assert f"/assignments/{final_assignment_id}/reopen" in remaining_skipped.text
+
+    paged = human_annotation_work(
+        settings,
+        annotator_b,
+        project_id,
+        status="all",
+        page=1,
+        page_size=1,
+    )
+    second_page = human_annotation_work(
+        settings,
+        annotator_b,
+        project_id,
+        status="all",
+        page=2,
+        page_size=1,
+    )
+    assert paged["page_count"] == 3
+    assert len(paged["rows"]) == len(second_page["rows"]) == 1
+    assert paged["rows"][0]["assignment_id"] != second_page["rows"][0]["assignment_id"]
+    assert paged["counts"] == {
+        "total": 3,
+        "to_annotate": 0,
+        "in_progress": 0,
+        "completed": 2,
+        "skipped": 1,
+    }
+
+    with psycopg.connect(url, row_factory=dict_row) as connection:
+        browser_versions = connection.execute(
+            """
+            SELECT av.revision_number,av.event_type,av.values->>'annotation_notes' AS note
+            FROM annotations an JOIN annotation_versions av ON av.annotation_id=an.id
+            WHERE an.assignment_id=%s ORDER BY av.revision_number
+            """,
+            (browser_assignment_id,),
+        ).fetchall()
+    assert [row["event_type"] for row in browser_versions] == ["submitted", "revised"]
+    assert [row["revision_number"] for row in browser_versions] == [1, 2]
+    assert [row["note"] for row in browser_versions] == [
+        "First browser submission",
+        "Explicit browser revision",
+    ]
+
     draft = {
         "content_status": "substantive_policy",
         "primary_australian_domain": None,
@@ -1476,7 +1867,7 @@ def test_two_pass_aukus_derivation_pins_source_annotation_version(
         client.cookies.set(SESSION_COOKIE, admin_token)
         new_project_page = client.get("/projects/new")
         assert new_project_page.status_code == 200
-        assert "Create a pinned research project" in new_project_page.text
+        assert "Create a pinned Human Annotation Workspace" in new_project_page.text
         assert "Australian Policy Annotation 0.2.0" in new_project_page.text
         download = client.post(
             f"/projects/{general_id}/exports/annotations",

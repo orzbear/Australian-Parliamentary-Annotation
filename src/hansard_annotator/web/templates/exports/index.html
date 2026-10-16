@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% from "components/macros.html" import csrf, progress %}
+{% block title %}Exports{% endblock %}
+{% block content %}
+<div><p class="eyebrow">Research outputs</p><h1 class="mt-2 text-4xl font-semibold">Exports</h1><p class="mt-3 text-muted">Controlled access to canonical datasets, immutable model outputs, human-review audits, and codebook artifacts.</p></div>
+
+<section class="surface mt-7 p-6"><h2 class="text-2xl font-semibold">Human Annotation</h2><p class="mt-2 text-muted">Canonical submitted-annotation exports reuse the existing workspace exporter and its provenance/checksum rules.</p><div class="mt-4 space-y-3">{% for project in projects %}<div class="project-mini"><div><strong>{{ project.name }}</strong><p>{{ project.submitted_count }} submitted annotations</p></div><a class="btn btn-secondary" href="/projects/{{ project.id }}">Open export controls</a></div>{% else %}<p>No human annotation workspaces are available.</p>{% endfor %}</div></section>
+
+<section class="surface mt-7 p-6"><h2 class="text-2xl font-semibold">AI Predictions</h2><div class="mt-4 space-y-3">{% for run in runs %}<div class="rounded-xl border p-4"><strong>{{ run.campaign_name or 'Imported prediction run' }}</strong><p class="mt-1 text-sm text-muted">{{ run.configured_model|replace('-',' ')|title }} · {{ run.prompt_version }} · {{ run.prediction_count }} predictions · imported {{ run.imported_at }}</p><details class="provenance mt-3"><summary>Technical run details</summary><p class="hash mt-2">{{ run.public_id }}</p></details><form class="mt-3" method="post" action="/exports/predictions/{{ run.public_id }}.csv">{{ csrf(principal) }}<button class="btn btn-secondary">Download prediction CSV</button></form></div>{% else %}<p>No imported prediction runs.</p>{% endfor %}</div></section>
+
+<section class="surface mt-7 p-6" id="ai-review">
+  <h2 class="text-2xl font-semibold">AI Review</h2>
+  <p class="mt-2 text-muted">Full Review, edited-cases, and codebook-flags CSV files remain available as partial snapshots while review is incomplete. Final audit artifacts are enabled when every prediction in the run has a terminal review decision.</p>
+  <div class="mt-4 space-y-4">
+    {% for run in runs %}
+    {% set complete = run.unreviewed_count == 0 and run.prediction_count > 0 %}
+    <article class="rounded-xl border p-4" id="run-{{ run.public_id }}">
+      <div class="flex flex-wrap items-start justify-between gap-3"><div><strong>{{ run.campaign_name or 'Imported prediction run' }}</strong><p class="mt-1 text-sm text-muted">{{ run.configured_model|replace('-',' ')|title }} · {{ run.prompt_version }}</p></div><span class="badge {{ 'badge-active' if complete else 'badge-development' }}">{{ 'Review complete' if complete else 'Review incomplete' }}</span></div>
+      <div class="mt-4">{{ progress(run.reviewed_count, run.prediction_count, 'Reviewed') }}</div>
+      <p class="mt-2 text-sm text-muted">Remaining: {{ run.unreviewed_count }}</p>
+      <div class="mt-4 flex flex-wrap gap-2">
+        {% for value, label in [('full','Full Review CSV'),('edited','Edited cases CSV'),('flags','Codebook flags CSV')] %}<form method="post" action="/exports/reviews/{{ run.public_id }}">{{ csrf(principal) }}<input type="hidden" name="artifact" value="{{ value }}"><button class="btn btn-secondary">{{ label }}{% if not complete %} — Partial{% endif %}</button></form>{% endfor %}
+        {% for value, label in [('summary','Summary JSON'),('report','Audit Markdown'),('package','Audit package ZIP')] %}<form method="post" action="/exports/reviews/{{ run.public_id }}">{{ csrf(principal) }}<input type="hidden" name="artifact" value="{{ value }}"><button class="btn btn-secondary" {% if not complete %}disabled title="Final audit artifacts require zero unreviewed predictions"{% endif %}>{{ label }}</button></form>{% endfor %}
+      </div>
+      {% if not complete %}<p class="mt-3 text-sm text-muted">Partial — review incomplete. CSV downloads reflect decisions recorded so far and are not finalized audit artifacts.</p>{% endif %}
+      <details class="provenance mt-4"><summary>Technical run details</summary><p class="hash mt-2">{{ run.public_id }}</p></details>
+    </article>
+    {% else %}<p>No imported prediction runs.</p>{% endfor %}
+  </div>
+</section>
+
+<section class="surface mt-7 p-6"><h2 class="text-2xl font-semibold">Codebook &amp; Taxonomy</h2><p class="mt-2 text-muted">These are the exact allowlisted canonical sources used by the application.</p><div class="mt-4 flex flex-wrap gap-3"><a class="btn btn-secondary" href="/codebook/downloads/taxonomy-yaml">Taxonomy YAML</a><a class="btn btn-secondary" href="/codebook/downloads/schema-yaml">Schema YAML</a><a class="btn btn-secondary" href="/codebook/downloads/context-json">Frozen V2 context JSON</a></div></section>
+{% endblock %}

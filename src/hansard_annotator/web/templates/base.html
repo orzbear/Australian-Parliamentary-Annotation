@@ -6,24 +6,26 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <meta name="htmx-config" content='{"includeIndicatorStyles":false}'>
-  <title>{% block title %}Hansard Research Workspace{% endblock %}</title>
-  <link rel="stylesheet" href="/static/dist/app.css?v=20261011-ai-correction-2">
+  <title>{% block title %}Australian Hansard Policy Annotation{% endblock %}</title>
+  <link rel="stylesheet" href="/static/dist/app.css?v=20261015-campaign-ux-2">
   <script src="/static/dist/htmx-2.0.6.min.js" defer></script>
-  <script src="/static/src/app.js?v=20261011-ai-correction-2" defer></script>
+  <script src="/static/src/app.js?v=20261015-campaign-ux-2" defer></script>
 </head>
 <body class="min-h-screen bg-canvas text-ink antialiased">
   <a class="skip-link" href="#main">Skip to content</a>
   {% if principal %}
   <header class="app-header">
     <div class="page-shell flex items-center justify-between gap-4 py-3">
-      <a class="brand" href="/" aria-label="Hansard Research Workspace home">
-        <span class="brand-mark">H</span><span>Hansard workspace</span>
+      <a class="brand" href="/" aria-label="Australian Hansard Policy Annotation home">
+        <span class="brand-mark">H</span><span>Hansard Policy Annotation</span>
       </a>
       <nav aria-label="Primary" class="flex items-center gap-1 sm:gap-3">
         <a class="nav-link" href="/">Dashboard</a>
-        <a class="nav-link" href="/ai-reviews?status=unreviewed">AI Reviews</a>
-        <a class="nav-link" href="/projects">Projects</a>
-        {% if principal.is_admin %}<a class="nav-link" href="/admin/users">Admin</a>{% endif %}
+        <a class="nav-link" href="/projects">Human Annotation</a>
+        {% if principal.is_admin %}<a class="nav-link" href="/ai-annotation">AI Annotation</a>{% endif %}
+        <a class="nav-link" href="/ai-reviews?status=unreviewed">AI Review</a>
+        <a class="nav-link" href="/codebook">Codebook &amp; Taxonomy</a>
+        {% if principal.is_admin %}<a class="nav-link" href="/exports">Exports</a><a class="nav-link" href="/admin/users">Administration</a>{% endif %}
         <form method="post" action="/logout">
           {{ csrf(principal) }}
           <button class="btn btn-quiet" type="submit">Sign out</button>

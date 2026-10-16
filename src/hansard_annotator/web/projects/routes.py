@@ -32,6 +32,7 @@ from hansard_annotator.web.tasks.schemas import SelectionCriteria
 from hansard_annotator.web.tasks.service import (
     assign_to_user,
     generate_batch,
+    human_annotation_work,
     preview_batch,
 )
 
@@ -106,13 +107,34 @@ def project_detail(
     project_id: int,
     settings: Annotated[WebSettings, Depends(get_settings)],
     principal: Annotated[Principal, Depends(require_principal)],
+    status: str = "to_annotate",
+    policy_status: str | None = None,
+    primary_domain: str | None = None,
+    annotator: str | None = None,
+    q: str | None = None,
+    page: int = 1,
 ) -> object:
+    try:
+        human_work = human_annotation_work(
+            settings,
+            principal,
+            project_id,
+            status=status,
+            policy_status=policy_status,
+            primary_domain=primary_domain,
+            annotator=annotator,
+            query=q,
+            page=page,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
     return _templates(request).TemplateResponse(
         request,
         "projects/detail.html",
         {
             "principal": principal,
             "project": get_project(settings, principal, project_id),
+            "human_work": human_work,
         },
     )
 

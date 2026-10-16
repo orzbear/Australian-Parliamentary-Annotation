@@ -14,6 +14,7 @@ from hansard_annotator.llm_eval.review_audit import (
     _write_csv,
     analyse_review_rows,
     choose_run,
+    full_review_rows,
     render_markdown,
 )
 
@@ -168,6 +169,23 @@ def test_flag_without_terminal_decision_is_still_exported() -> None:
     assert summary["flag_analysis"]["by_final_human_primary_label"] == {
         "No terminal annotation": 1
     }
+
+
+def test_full_review_results_preserve_ai_human_and_review_provenance() -> None:
+    row = _row(1, status="edited", human_primary="AU08", flag_notes=["Boundary unclear"])
+    row.update(
+        terminal_reviewer_user_id=42,
+        terminal_reviewer="Researcher",
+        terminal_reviewed_at="2026-10-12T10:00:00Z",
+    )
+    result = full_review_rows([row])[0]
+    assert result["ai_primary_domain"] == "AU07"
+    assert result["human_primary_domain"] == "AU08"
+    assert result["terminal_review_action"] == "edited"
+    assert result["reviewer_user_id"] == 42
+    assert result["annotation_version_id"] == 1
+    assert result["codebook_flagged"] is True
+    assert result["codebook_flag_note"] == "Boundary unclear"
 
 
 def test_missing_or_mismatched_human_annotation_fails_loudly() -> None:

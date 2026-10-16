@@ -9,6 +9,8 @@ from fastapi import HTTPException
 
 from hansard_annotator.llm_eval.import_predictions import load_prediction_artifact
 from hansard_annotator.llm_eval.operations import (
+    APPROVED_PRODUCTION_GENERATION,
+    APPROVED_PRODUCTION_MODEL,
     FROZEN_CANONICAL_SCHEMA_SHA256,
     FROZEN_MODEL,
     FROZEN_PROMPT_SHA256,
@@ -67,6 +69,30 @@ def test_prediction_artifact_validation_and_stable_hash(tmp_path: Path) -> None:
     assert load_prediction_artifact(artifact)[2] == first_hash
 
 
+def test_prediction_artifact_accepts_new_production_identity_without_rewriting_history(
+    tmp_path: Path,
+) -> None:
+    historical = tmp_path / "historical"
+    current = tmp_path / "current"
+    _write_artifact(historical, record_id="turn:historical")
+    _write_artifact(current, record_id="turn:current")
+
+    current_summary_path = current / "operational_summary.json"
+    current_summary = json.loads(current_summary_path.read_text(encoding="utf-8"))
+    provenance = current_summary["provenance"]
+    provenance["model"] = APPROVED_PRODUCTION_MODEL
+    provenance.pop("thinking_budget")
+    provenance.update(APPROVED_PRODUCTION_GENERATION)
+    current_summary_path.write_text(json.dumps(current_summary), encoding="utf-8")
+
+    historical_summary, _, _ = load_prediction_artifact(historical)
+    current_loaded, _, _ = load_prediction_artifact(current)
+    assert historical_summary["provenance"]["model"] == FROZEN_MODEL
+    assert historical_summary["provenance"]["thinking_budget"] == 0
+    assert current_loaded["provenance"]["model"] == APPROVED_PRODUCTION_MODEL
+    assert current_loaded["provenance"]["thinking_level"] == "minimal"
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
@@ -120,14 +146,24 @@ def test_accept_ai_copies_only_prediction_fields_into_human_payload() -> None:
     }
 
 
-def test_workspace_distinguishes_ai_and_human_and_hides_raw_payload() -> None:
-    workspace = (ROOT / "src/hansard_annotator/web/templates/annotations/workspace.html").read_text(
+def test_human_workspace_is_separate_from_ai_review_controls() -> None:
+    workspace = (
+        ROOT / "src/hansard_annotator/web/templates/annotations/workspace.html"
+    ).read_text(encoding="utf-8")
+    assert "annotation-form" in workspace
+    assert "Save draft" in workspace
+    assert "Submit &amp; next" in workspace
+    assert "Revision history" in workspace
+    assert "expected_revision_number" in workspace
+    assert "Flag codebook issue" not in workspace
+    assert "Possible taxonomy/codebook ambiguity" not in workspace
+    assert "Accept AI &amp; next" not in workspace
+    assert "Machine provenance" not in workspace
+    assert "raw_provider_response" not in workspace
+    base = (ROOT / "src/hansard_annotator/web/templates/base.html").read_text(
         encoding="utf-8"
     )
-    assert "AI suggestion · not yet human-approved" in workspace
-    assert "Accept AI &amp; next" in workspace
-    assert "Save edited annotation &amp; next" in workspace
-    assert "raw_provider_response" not in workspace
+    assert ">Codebook &amp; Taxonomy</a>" in base
 
 
 def test_unreviewed_queue_is_prediction_based_and_requires_zero_review_events() -> None:
@@ -273,8 +309,34 @@ def test_correction_controls_are_opt_in_and_secondary_actions_precede_accept() -
     base = (ROOT / "src/hansard_annotator/web/templates/base.html").read_text(
         encoding="utf-8"
     )
-    assert "app.css?v=20261011-ai-correction-2" in base
-    assert "app.js?v=20261011-ai-correction-2" in base
+    assert "app.css?v=20261015-campaign-ux-2" in base
+    assert "app.js?v=20261015-campaign-ux-2" in base
+
+
+def test_ai_review_run_cards_are_human_readable_and_keep_technical_identity() -> None:
+    queue = (ROOT / "src/hansard_annotator/web/templates/annotations/ai_queue.html").read_text(
+        encoding="utf-8"
+    )
+    for text in (
+        "run.display_name",
+        "run.configured_model",
+        "run.prompt_version",
+        "Continue reviewing",
+        "Review complete",
+        "Remaining:",
+        "progress_percent",
+        "Immutable run UUID",
+        "run.public_id",
+        "Each AI campaign imports as a separate immutable prediction run",
+    ):
+        assert text in queue
+    assert "active_run_id == run.public_id|string" in queue
+    service = (
+        ROOT / "src/hansard_annotator/web/annotations/ai_review.py"
+    ).read_text(encoding="utf-8")
+    assert "campaign.name AS campaign_name" in service
+    assert 'row["campaign_name"] or "Imported prediction run"' in service
+    assert "ORDER BY run.imported_at DESC NULLS LAST,run.id DESC" in service
 
 
 def test_dashboard_and_navigation_make_ai_review_first_class() -> None:
@@ -285,7 +347,7 @@ def test_dashboard_and_navigation_make_ai_review_first_class() -> None:
     assert "Continue AI review" in dashboard
     for key in ("predictions", "unreviewed", "accepted", "edited", "flagged_codebook", "skipped"):
         assert key in dashboard
-    assert ">AI Reviews</a>" in base
+    assert ">AI Review</a>" in base
 
 
 def test_routes_include_individual_actions_and_next_redirect() -> None:

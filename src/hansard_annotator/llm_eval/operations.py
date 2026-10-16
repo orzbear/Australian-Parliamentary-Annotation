@@ -15,6 +15,8 @@ FROZEN_MODEL = "gemini-2.5-flash"
 FROZEN_PROMPT_VERSION = "phase4a-policy-v2"
 FROZEN_PROMPT_SHA256 = "a41027b001f10b61074c196996606c86b5dac4c0788ae185a05ff68fcf3b7cc6"
 FROZEN_CANONICAL_SCHEMA_SHA256 = "9c94bab9cd2976559c79b1c31991aef4138a2071a5d3b3d6186a26448f117126"
+APPROVED_PRODUCTION_MODEL = "gemini-3.1-flash-lite"
+APPROVED_PRODUCTION_GENERATION = {"thinking_level": "minimal"}
 PREDICTION_FIELDS = {
     "is_non_policy",
     "primary_australian_domain",
@@ -167,14 +169,24 @@ def gemini_batch_schema(schema: dict[str, Any]) -> dict[str, Any]:
 
 
 def gemini_generation_config(
-    schema: dict[str, Any], *, max_output_tokens: int = 1000
+    schema: dict[str, Any],
+    *,
+    max_output_tokens: int = 1000,
+    generation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    requested = {"thinking_budget": 0} if generation is None else generation
+    if requested == {"thinking_budget": 0}:
+        thinking: dict[str, Any] = {"thinkingBudget": 0}
+    elif requested == APPROVED_PRODUCTION_GENERATION:
+        thinking = {"thinkingLevel": "minimal"}
+    else:
+        raise ValueError("unsupported Gemini Batch thinking configuration")
     return {
         "responseMimeType": "application/json",
         "responseSchema": gemini_batch_schema(schema),
         "temperature": 0.0,
         "maxOutputTokens": max_output_tokens,
-        "thinkingConfig": {"thinkingBudget": 0},
+        "thinkingConfig": thinking,
     }
 
 
@@ -183,12 +195,17 @@ def validate_production_plan(plan: dict[str, Any]) -> None:
     provenance = plan.get("provenance")
     if not isinstance(provenance, dict):
         raise ValueError("Batch plan has no provenance")
+    model = provenance.get("model")
+    supported_generation = {
+        FROZEN_MODEL: {"thinking_budget": 0},
+        APPROVED_PRODUCTION_MODEL: APPROVED_PRODUCTION_GENERATION,
+    }
+    if not isinstance(model, str) or model not in supported_generation:
+        raise ValueError("paid Batch submission blocked: unexpected model")
     expected = {
-        "model": FROZEN_MODEL,
         "prompt_version": FROZEN_PROMPT_VERSION,
         "assembled_prompt_sha256": FROZEN_PROMPT_SHA256,
         "canonical_schema_sha256": FROZEN_CANONICAL_SCHEMA_SHA256,
-        "thinking_budget": 0,
     }
     for key, value in expected.items():
         if provenance.get(key) != value:
@@ -209,6 +226,19 @@ def validate_production_plan(plan: dict[str, Any]) -> None:
     )
     if not isinstance(requests, list) or not requests:
         raise ValueError("paid Batch submission blocked: plan has no requests")
+    expected_generation = supported_generation[model]
+    provenance_generation = {
+        key: provenance[key]
+        for key in ("thinking_budget", "thinking_level")
+        if key in provenance
+    }
+    if provenance_generation != expected_generation:
+        raise ValueError("paid Batch submission blocked: unexpected thinking configuration")
+    expected_thinking = (
+        {"thinkingBudget": 0}
+        if "thinking_budget" in expected_generation
+        else {"thinkingLevel": "minimal"}
+    )
     for item in requests:
         config = (
             item.get("request", {}).get("generationConfig", {}) if isinstance(item, dict) else {}
@@ -219,7 +249,7 @@ def validate_production_plan(plan: dict[str, Any]) -> None:
             raise ValueError("paid Batch submission blocked: unexpected prediction field set")
         if provenance.get("provider_schema_sha256") != canonical_hash(schema):
             raise ValueError("paid Batch submission blocked: provider schema hash mismatch")
-        if config.get("thinkingConfig") != {"thinkingBudget": 0}:
+        if config.get("thinkingConfig") != expected_thinking:
             raise ValueError("paid Batch submission blocked: unexpected thinking configuration")
 
 
@@ -244,12 +274,13 @@ def build_batch_create_request(
     schema: dict[str, Any],
     display_name: str,
     cached_content: str | None = None,
+    generation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     requests: list[dict[str, Any]] = []
     for record in records:
         request: dict[str, Any] = {
             "contents": [{"role": "user", "parts": [{"text": build_user_prompt(record)}]}],
-            "generationConfig": gemini_generation_config(schema),
+            "generationConfig": gemini_generation_config(schema, generation=generation),
         }
         if cached_content is None:
             request["systemInstruction"] = {"parts": [{"text": system_prompt}]}
