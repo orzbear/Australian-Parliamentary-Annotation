@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import inspect
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -27,7 +28,10 @@ from hansard_annotator.web.campaigns.service import (
     PAID_CONFIRMATION,
     PREDICTION_CONTRACT_SHA256,
     CampaignError,
+    _planning_breakdown,
     _provider_plan,
+    _RecordSetHasher,
+    _selection_query,
     cache_plan_status,
     collect_campaign,
     configuration_class,
@@ -37,6 +41,7 @@ from hansard_annotator.web.campaigns.service import (
     estimate_plan,
     import_campaign,
     other_exclusion_reason,
+    plan_campaign,
     production_configuration,
     refresh_campaign,
     same_prediction_configuration,
@@ -193,6 +198,175 @@ def test_deterministic_selection_hash_and_duplicate_protection() -> None:
     assert [row["turn_key"] for row in different] != [row["turn_key"] for row in first]
     with pytest.raises(CampaignError, match="duplicate eligible turn key"):
         deterministic_selection([rows[0], rows[0]], limit=1, seed="fixed")
+
+
+def test_streaming_record_set_hash_matches_historical_canonical_hash() -> None:
+    record_ids = ["turn:one", "turn:quote-\"", "turn:unicode-\N{SNOWMAN}"]
+    hasher = _RecordSetHasher()
+    for record_id in record_ids:
+        hasher.add(record_id)
+    assert hasher.hexdigest() == canonical_hash(record_ids)
+
+
+def test_planning_query_is_database_bounded_and_preserves_seeded_ordering() -> None:
+    source = inspect.getsource(plan_campaign)
+    count_source = inspect.getsource(_planning_breakdown)
+    query = _selection_query()
+    assert ".fetchall()" not in source
+    assert "all_rows" not in source
+    assert "connection.cursor(name=" in source
+    assert "LIMIT %s" in query
+    assert "sha256(convert_to(turn.turn_key || ':' || %s,'UTF8'))" in query
+    assert 'turn.turn_key COLLATE "C"' in query
+    assert "eligible_main_analysis" not in query
+    assert "annotation.status IN ('submitted','revised')" in query
+    assert "annotation.status IN ('submitted','revised')" in count_source
+    for noncanonical_status in ("draft", "skipped", "flagged", "in_progress"):
+        assert f"'{noncanonical_status}'" not in query
+        assert f"'{noncanonical_status}'" not in count_source
+
+
+class _PlanningResult:
+    def __init__(self, row: dict[str, Any]) -> None:
+        self.row = row
+
+    def fetchone(self) -> dict[str, Any]:
+        return self.row
+
+
+class _PlanningSelectionCursor:
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = rows
+        self.selected: list[dict[str, Any]] = []
+        self.itersize = 0
+
+    def __enter__(self) -> _PlanningSelectionCursor:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def execute(self, query: str, parameters: tuple[object, ...]) -> None:
+        assert "LIMIT %s" in query
+        limit = int(parameters[-1])
+        self.selected = self.rows[:limit]
+
+    def __iter__(self) -> object:
+        return iter(self.selected)
+
+
+class _PlanningInsertCursor:
+    def __init__(self) -> None:
+        self.values: list[tuple[object, ...]] = []
+
+    def executemany(self, _query: str, values: list[tuple[object, ...]]) -> None:
+        self.values.extend(values)
+
+
+class _PlanningConnection:
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self.campaign = {
+            **production_configuration(),
+            "id": 1,
+            "public_id": UUID(int=4),
+            "corpus_id": 1,
+            "status": "DRAFT",
+        }
+        self.breakdown = {
+            "corpus_total_count": 160_577,
+            "human_annotated_count": 43,
+            "human_prediction_overlap_count": 11,
+            "excluded_existing_prediction_count": 100,
+            "excluded_human_annotated_count": 32,
+            "excluded_other_count": 10,
+            "eligible_count": 160_435,
+        }
+        self.rows = rows
+        self.selection_cursor = _PlanningSelectionCursor(rows)
+        self.insert_cursor = _PlanningInsertCursor()
+        self.queries: list[str] = []
+
+    def __enter__(self) -> _PlanningConnection:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def execute(self, query: str, parameters: object = None) -> _PlanningResult:
+        self.queries.append(query)
+        if "FOR UPDATE" in query:
+            return _PlanningResult(self.campaign)
+        if "WITH base AS MATERIALIZED" in query:
+            return _PlanningResult(self.breakdown)
+        if "UPDATE ai_annotation_campaigns" in query:
+            assert isinstance(parameters, tuple)
+            selection = parameters[0].obj
+            self.campaign = {
+                **self.campaign,
+                "status": "PLANNED",
+                "selection_definition": selection,
+                "record_set_sha256": parameters[1],
+                "corpus_total_count": parameters[2],
+                "eligible_count": parameters[3],
+                "planned_count": parameters[6],
+            }
+            return _PlanningResult(self.campaign)
+        raise AssertionError(f"unexpected planning query: {query}")
+
+    def cursor(self, name: str | None = None) -> object:
+        return self.selection_cursor if name else self.insert_cursor
+
+
+def test_ten_record_plan_from_large_corpus_materialises_only_selected_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seed = "bounded-seed"
+    candidates = [
+        {
+            "id": number,
+            "turn_key": f"turn-{number:06d}",
+            "date": "2026-01-01",
+            "chamber": "House",
+            "speaker_name_raw": "Speaker",
+            "major_heading_original": "Debate",
+            "minor_heading_original": None,
+            "business_type": None,
+            "text_clean": f"Policy speech {number}",
+            "text_raw": None,
+        }
+        for number in range(30)
+    ]
+    ordered = sorted(
+        candidates,
+        key=lambda row: (
+            hashlib.sha256(f"{row['turn_key']}:{seed}".encode()).hexdigest(),
+            row["turn_key"],
+        ),
+    )
+    connection = _PlanningConnection(ordered)
+    monkeypatch.setattr(
+        "hansard_annotator.web.campaigns.service.psycopg.connect",
+        lambda *_args, **_kwargs: connection,
+    )
+
+    result = plan_campaign(
+        _settings(),
+        _principal(),
+        str(connection.campaign["public_id"]),
+        limit=10,
+        seed=seed,
+        exclude_human_annotated=True,
+    )
+
+    expected_ids = [f"turn:{row['turn_key']}" for row in ordered[:10]]
+    assert result.campaign["corpus_total_count"] == 160_577
+    assert result.campaign["eligible_count"] == 160_435
+    assert result.campaign["planned_count"] == 10
+    assert result.campaign["record_set_sha256"] == canonical_hash(expected_ids)
+    assert [value[2] for value in connection.insert_cursor.values] == expected_ids
+    assert len(result.preview) == 10
+    assert connection.selection_cursor.itersize == 1_000
+    assert all("fetchall" not in query.lower() for query in connection.queries)
 
 
 def test_human_annotation_exclusion_default_and_disjoint_plan_buckets() -> None:
