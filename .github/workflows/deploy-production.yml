@@ -40,7 +40,13 @@ jobs:
           git archive --format=tar.gz --output="$release" "$GITHUB_SHA" -- \
             Dockerfile compose.production.yaml alembic.ini \
             requirements.lock pyproject.toml README.md \
-            deploy src migrations config
+            deploy src migrations config \
+            scripts/conference-codebook-pilot-01-ai-codebook-input-d1d13e895705/CODEBOOK_CONTEXT.json
+          required_codebook="scripts/conference-codebook-pilot-01-ai-codebook-input-d1d13e895705/CODEBOOK_CONTEXT.json"
+          tar -tzf "$release" | grep -Fx "$required_codebook" >/dev/null || {
+            echo "Required frozen V2 CODEBOOK_CONTEXT.json is missing from release artifact." >&2
+            exit 1
+          }
           checksum="$(sha256sum "$release" | cut -d ' ' -f 1)"
           echo "release=$release" >> "$GITHUB_OUTPUT"
           echo "checksum=$checksum" >> "$GITHUB_OUTPUT"

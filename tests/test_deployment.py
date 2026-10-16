@@ -98,6 +98,30 @@ def test_github_production_deployment_is_manual_gated_and_serialized() -> None:
     assert "docker compose down" not in workflow
 
 
+def test_production_release_packages_and_preflights_frozen_codebook_context() -> None:
+    required = (
+        "scripts/conference-codebook-pilot-01-ai-codebook-input-d1d13e895705/"
+        "CODEBOOK_CONTEXT.json"
+    )
+    workflow = (ROOT / ".github/workflows/deploy-production.yml").read_text(
+        encoding="utf-8"
+    )
+    release = (ROOT / "deploy/host/hansard-release").read_text(encoding="utf-8")
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+    assert required in workflow
+    assert f"COPY {required} ./" in dockerfile
+    assert "    scripts/|scripts/conference-codebook-pilot-01-ai-codebook-input" in release
+    assert f"    {required}) ;;" in release
+    assert "scripts/*" not in release
+    assert 'codebook_context=scripts/conference-codebook-pilot-01-ai-codebook-input' in release
+    assert "Required frozen V2 CODEBOOK_CONTEXT.json is missing" in workflow
+    assert "Required frozen V2 CODEBOOK_CONTEXT.json is missing" in release
+    assert release.index("Required frozen V2 CODEBOOK_CONTEXT.json is missing") < release.index(
+        "build web migrate"
+    )
+
+
 def test_restricted_release_command_backs_up_before_migration() -> None:
     release = (ROOT / "deploy/host/hansard-release").read_text(encoding="utf-8")
     bootstrap = (ROOT / "deploy/host/bootstrap-github-deployer.sh").read_text(
