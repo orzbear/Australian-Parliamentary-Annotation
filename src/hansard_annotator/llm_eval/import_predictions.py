@@ -15,6 +15,8 @@ from psycopg.types.json import Jsonb
 
 from hansard_annotator.db.config import DatabaseSettings
 from hansard_annotator.llm_eval.operations import (
+    APPROVED_PRODUCTION_GENERATION,
+    APPROVED_PRODUCTION_MODEL,
     FROZEN_CANONICAL_SCHEMA_SHA256,
     FROZEN_MODEL,
     FROZEN_PROMPT_SHA256,
@@ -24,6 +26,24 @@ from hansard_annotator.llm_eval.validation import validate_prediction
 
 INVALID_ARTIFACT_DIRECTORY = "batch_pilot_500_results"
 DOMAIN_CODES = (*tuple(f"AU{number:02d}" for number in range(1, 15)), "AU_OTHER_REVIEW")
+
+
+def _generation_identity(provenance: dict[str, Any]) -> dict[str, Any]:
+    supported = {
+        FROZEN_MODEL: {"thinking_budget": 0},
+        APPROVED_PRODUCTION_MODEL: APPROVED_PRODUCTION_GENERATION,
+    }
+    model = provenance.get("model")
+    if not isinstance(model, str) or model not in supported:
+        raise ValueError("artifact provenance mismatch: model")
+    generation = {
+        key: provenance[key]
+        for key in ("thinking_budget", "thinking_level")
+        if key in provenance
+    }
+    if generation != supported[model]:
+        raise ValueError("artifact provenance mismatch: thinking configuration")
+    return generation
 
 
 def _artifact_hash(directory: Path) -> str:
@@ -45,16 +65,15 @@ def load_prediction_artifact(directory: Path) -> tuple[dict[str, Any], list[dict
     provenance = summary.get("provenance", {})
     expected = {
         "provider": "gemini",
-        "model": FROZEN_MODEL,
         "prompt_version": FROZEN_PROMPT_VERSION,
         "assembled_prompt_sha256": FROZEN_PROMPT_SHA256,
         "canonical_schema_sha256": FROZEN_CANONICAL_SCHEMA_SHA256,
-        "thinking_budget": 0,
         "execution_mode": "batch",
     }
     for key, value in expected.items():
         if provenance.get(key) != value:
             raise ValueError(f"artifact provenance mismatch: {key}")
+    _generation_identity(provenance)
     coverage = summary.get("coverage", {})
     if (
         not coverage.get("accounting_invariant_ok")
@@ -119,6 +138,7 @@ def import_predictions(
         if dry_run or existing_run:
             return result
         provenance = summary["provenance"]
+        generation = _generation_identity(provenance)
         coverage = summary["coverage"]
         tokens = summary["tokens"]
         cost = summary["cost"]
@@ -148,7 +168,7 @@ def import_predictions(
                 provenance["canonical_schema_sha256"],
                 provenance.get("prediction_contract_sha256"),
                 provenance.get("provider_schema_sha256"),
-                Jsonb({"thinking_budget": 0}),
+                Jsonb(generation),
                 provenance["execution_mode"],
                 provenance["batch_id"],
                 provenance.get("cached_content"),

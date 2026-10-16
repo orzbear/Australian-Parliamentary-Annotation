@@ -24,6 +24,14 @@ class AnnotationValidationError(Exception):
         self.outcome = outcome
 
 
+class AnnotationRevisionError(ValueError):
+    """An expected user-facing revision/state conflict."""
+
+    def __init__(self, message: str, *, status_code: int = 409) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
 def schema_form(
     settings: WebSettings,
     principal: Principal,
@@ -59,30 +67,6 @@ def schema_form(
             """,
             (assignment_id,),
         ).fetchone()
-        ai_prediction = connection.execute(
-            """
-            SELECT mp.id,mp.public_id,mp.is_non_policy,mp.primary_australian_domain,
-                   mp.secondary_australian_domains,mp.reasoning,mp.created_at,
-                   mpr.public_id AS run_public_id,mpr.configured_model,
-                   mpr.prompt_version,mpr.execution_mode
-            FROM assignments a JOIN tasks t ON t.id=a.task_id
-            JOIN model_predictions mp ON mp.speaker_turn_id=t.speaker_turn_id
-            JOIN model_prediction_runs mpr ON mpr.id=mp.run_id
-            WHERE a.id=%s
-            ORDER BY mpr.imported_at DESC,mp.id DESC LIMIT 1
-            """,
-            (assignment_id,),
-        ).fetchone()
-        ai_review = None
-        if ai_prediction:
-            ai_review = connection.execute(
-                """
-                SELECT review_status,note,reviewed_at FROM model_prediction_reviews
-                WHERE model_prediction_id=%s AND reviewer_user_id=%s
-                ORDER BY reviewed_at DESC,id DESC LIMIT 1
-                """,
-                (ai_prediction["id"], principal.user_id),
-            ).fetchone()
         return {
             "fields": fields,
             "labels": labels,
@@ -91,8 +75,6 @@ def schema_form(
             "annotation_status": current["status"] if current else None,
             "schema_name": assignment["schema_name"],
             "schema_version": assignment["schema_version"],
-            "ai_prediction": dict(ai_prediction) if ai_prediction else None,
-            "ai_review": dict(ai_review) if ai_review else None,
         }
 
 
@@ -103,6 +85,7 @@ def save_annotation(
     payload: dict[str, object],
     *,
     event_type: str,
+    expected_revision_number: int | None = None,
 ) -> dict[str, object]:
     if event_type not in {"draft_saved", "submitted", "revised"}:
         raise ValueError("invalid annotation event type")
@@ -122,9 +105,11 @@ def save_annotation(
         if assignment is None:
             raise LookupError("assignment not found")
         if assignment["status"] in {"withdrawn", "flagged"}:
-            raise ValueError("assignment is not editable")
+            raise AnnotationRevisionError("assignment is not editable")
         if assignment["status"] == "submitted" and event_type != "revised":
-            raise ValueError("submitted annotation requires an explicit revision")
+            raise AnnotationRevisionError(
+                "submitted annotation requires an explicit revision"
+            )
         fields, labels = load_schema(
             connection, assignment["annotation_schema_version_id"]
         )
@@ -148,6 +133,21 @@ def save_annotation(
             """,
             (assignment_id,),
         ).fetchone()
+        current_revision = int(annotation["revision_number"] or 0) if annotation else 0
+        if (
+            expected_revision_number is not None
+            and expected_revision_number != current_revision
+        ):
+            raise AnnotationRevisionError(
+                "This annotation changed after the form was loaded. "
+                "Reload it before saving your changes."
+            )
+        if event_type == "revised" and (
+            annotation is None or annotation["status"] not in {"submitted", "revised"}
+        ):
+            raise AnnotationRevisionError(
+                "a revision requires an existing submitted annotation"
+            )
         if (
             annotation
             and annotation["values_sha256"] == outcome.sha256
@@ -266,12 +266,35 @@ def revision_history(
     with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
         rows = connection.execute(
             """
-            SELECT av.revision_number,av.event_type,av.values_sha256,av.created_at
+            SELECT av.revision_number,av.event_type,av.values_sha256,av.values,
+                   av.created_at,u.display_name AS annotator_name
             FROM assignments a JOIN annotations an ON an.assignment_id=a.id
             JOIN annotation_versions av ON av.annotation_id=an.id
+            JOIN users u ON u.id=av.created_by_user_id
             WHERE a.id=%s AND a.user_id=%s
             ORDER BY av.revision_number DESC
             """,
             (assignment_id, principal.user_id),
         ).fetchall()
-        return [dict(row) for row in rows]
+        history: list[dict[str, object]] = []
+        for row in rows:
+            item = dict(row)
+            values = dict(row["values"])
+            if "is_non_policy" in values:
+                item["policy_label"] = (
+                    "Non-Policy" if values.get("is_non_policy") else "Policy"
+                )
+            elif "content_status" in values:
+                item["policy_label"] = (
+                    "Policy"
+                    if values.get("content_status") == "substantive_policy"
+                    else "Non-Policy"
+                )
+            else:
+                item["policy_label"] = "Not applicable"
+            item["primary_domain"] = values.get("primary_australian_domain")
+            item["secondary_domains"] = (
+                values.get("secondary_australian_domains") or []
+            )
+            history.append(item)
+        return history

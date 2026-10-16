@@ -15,11 +15,14 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from hansard_annotator.web.annotations.ai_review import ai_review_summary
 from hansard_annotator.web.auth.models import Principal
 from hansard_annotator.web.auth.routes import router as auth_router
+from hansard_annotator.web.campaigns.routes import router as campaigns_router
+from hansard_annotator.web.codebook.routes import router as codebook_router
 from hansard_annotator.web.config import WebSettings
 from hansard_annotator.web.dependencies import get_settings, require_principal
 from hansard_annotator.web.middleware import security_middleware
 from hansard_annotator.web.projects.routes import router as projects_router
 from hansard_annotator.web.projects.service import list_projects
+from hansard_annotator.web.research_exports.routes import router as research_exports_router
 from hansard_annotator.web.tasks.routes import router as tasks_router
 from hansard_annotator.web.tasks.service import personal_dashboard
 from hansard_annotator.web.users.routes import router as users_router
@@ -30,7 +33,7 @@ PACKAGE_ROOT = Path(__file__).parent
 def create_app(settings: WebSettings | None = None) -> FastAPI:
     resolved = settings or WebSettings.from_environment()
     app = FastAPI(
-        title="Hansard Research Workspace",
+        title="Australian Hansard Policy Annotation",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
@@ -44,6 +47,9 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
     app.include_router(projects_router)
     app.include_router(tasks_router)
     app.include_router(users_router)
+    app.include_router(campaigns_router)
+    app.include_router(codebook_router)
+    app.include_router(research_exports_router)
 
     @app.get("/health/live")
     def liveness() -> dict[str, str]:

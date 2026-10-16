@@ -287,6 +287,54 @@ def analyse_review_rows(
     return summary, edited_cases, flagged_cases
 
 
+def full_review_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Flatten every prediction while preserving prediction/review/human distinctions."""
+    output: list[dict[str, Any]] = []
+    for row in rows:
+        human_raw = row.get("human_values")
+        human = human_raw if isinstance(human_raw, dict) else {}
+        notes = _flag_notes(row)
+        output.append(
+            {
+                "run_id": str(row["run_public_id"]),
+                "prediction_id": str(row["prediction_id"]),
+                "speaker_turn_id": int(row["speaker_turn_id"]),
+                "record_id": str(row["record_id"]),
+                "turn_key": str(row["turn_key"]),
+                "speaker": row.get("speaker"),
+                "sitting_date": row.get("sitting_date"),
+                "chamber": row.get("chamber"),
+                "major_heading": row.get("major_heading"),
+                "minor_heading": row.get("minor_heading"),
+                "business_type": row.get("business_type"),
+                "speech_text": row.get("speech_text"),
+                "ai_is_non_policy": bool(row["ai_is_non_policy"]),
+                "ai_primary_domain": row.get("ai_primary_domain"),
+                "ai_secondary_domains": _normalise_domains(row.get("ai_secondary_domains")),
+                "ai_reasoning": row.get("ai_reasoning"),
+                "terminal_review_action": row.get("review_status"),
+                "review_note": row.get("review_note"),
+                "reviewer_user_id": row.get("terminal_reviewer_user_id"),
+                "reviewer": row.get("terminal_reviewer"),
+                "reviewed_at": row.get("terminal_reviewed_at"),
+                "annotation_version_id": row.get("annotation_version_id"),
+                "human_is_non_policy": human.get("is_non_policy") if human else None,
+                "human_primary_domain": human.get("primary_australian_domain")
+                if human
+                else None,
+                "human_secondary_domains": _normalise_domains(
+                    human.get("secondary_australian_domains")
+                )
+                if human
+                else [],
+                "codebook_flagged": bool(row.get("codebook_flag_count", 0)),
+                "codebook_flag_note": notes[-1] if notes else None,
+                "all_codebook_flag_notes": notes,
+            }
+        )
+    return output
+
+
 def _json_default(value: object) -> str:
     return value.isoformat() if hasattr(value, "isoformat") else str(value)
 
@@ -497,6 +545,9 @@ def _load_rows(connection: psycopg.Connection[Any], run_id: int) -> list[dict[st
                    st.minor_heading_original AS minor_heading,st.business_type,
                    st.text_clean AS speech_text,
                    terminal.review_status,terminal.note AS review_note,
+                   terminal.reviewer_user_id AS terminal_reviewer_user_id,
+                   reviewer.display_name AS terminal_reviewer,
+                   terminal.reviewed_at AS terminal_reviewed_at,
                    terminal.annotation_version_id,av.values AS human_values,
                    human_task.speaker_turn_id AS human_speaker_turn_id,
                    COALESCE(flags.flag_count,0) AS codebook_flag_count,
@@ -505,12 +556,13 @@ def _load_rows(connection: psycopg.Connection[Any], run_id: int) -> list[dict[st
             JOIN model_prediction_runs run ON run.id=mp.run_id
             JOIN speaker_turns st ON st.id=mp.speaker_turn_id
             LEFT JOIN LATERAL (
-              SELECT review_status,note,annotation_version_id,reviewed_at,id
+              SELECT review_status,note,annotation_version_id,reviewer_user_id,reviewed_at,id
               FROM model_prediction_reviews review
               WHERE review.model_prediction_id=mp.id
                 AND review.review_status IN ('accepted','edited','skipped')
               ORDER BY reviewed_at DESC,id DESC LIMIT 1
             ) terminal ON true
+            LEFT JOIN users reviewer ON reviewer.id=terminal.reviewer_user_id
             LEFT JOIN annotation_versions av ON av.id=terminal.annotation_version_id
             LEFT JOIN annotations human_annotation ON human_annotation.id=av.annotation_id
             LEFT JOIN assignments human_assignment
@@ -548,6 +600,7 @@ def create_review_audit(
         run = choose_run(_load_runs(connection), run_id=run_id, latest=latest)
         rows = _load_rows(connection, int(run["id"]))
         summary, edited, flagged = analyse_review_rows(run, rows)
+        all_results = full_review_rows(rows)
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "review_summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True, default=_json_default)
@@ -589,6 +642,40 @@ def create_review_audit(
         output_dir / "codebook_flagged_cases.csv",
         flagged,
         [*base_columns, "ai_label", "human_label", "ai_annotation_changed"],
+    )
+    _write_csv(
+        output_dir / "full_review_results.csv",
+        all_results,
+        [
+            "run_id",
+            "prediction_id",
+            "speaker_turn_id",
+            "record_id",
+            "turn_key",
+            "speaker",
+            "sitting_date",
+            "chamber",
+            "major_heading",
+            "minor_heading",
+            "business_type",
+            "speech_text",
+            "ai_is_non_policy",
+            "ai_primary_domain",
+            "ai_secondary_domains",
+            "ai_reasoning",
+            "terminal_review_action",
+            "review_note",
+            "reviewer_user_id",
+            "reviewer",
+            "reviewed_at",
+            "annotation_version_id",
+            "human_is_non_policy",
+            "human_primary_domain",
+            "human_secondary_domains",
+            "codebook_flagged",
+            "codebook_flag_note",
+            "all_codebook_flag_notes",
+        ],
     )
     return summary
 

@@ -119,7 +119,7 @@ def _batch_name(arguments: argparse.Namespace) -> str:
     return name
 
 
-def _get_batch(name: str) -> dict[str, Any]:
+def _get_gemini_resource(name: str, *, resource_label: str) -> dict[str, Any]:
     key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not key:
         raise ValueError("GEMINI_API_KEY or GOOGLE_API_KEY is not set")
@@ -133,12 +133,26 @@ def _get_batch(name: str) -> dict[str, Any]:
             value = json.loads(response.read().decode("utf-8"))
     except HTTPError as error:
         body = error.read().decode("utf-8", errors="replace")[:2000]
-        raise ValueError(f"Gemini status HTTP {error.code}: {body}") from None
+        raise ValueError(f"Gemini {resource_label} HTTP {error.code}: {body}") from None
     except (URLError, TimeoutError) as error:
-        raise ValueError(f"Gemini status request failed: {type(error).__name__}") from None
+        raise ValueError(
+            f"Gemini {resource_label} request failed: {type(error).__name__}"
+        ) from None
     if not isinstance(value, dict):
-        raise ValueError("Gemini status response is not an object")
+        raise ValueError(f"Gemini {resource_label} response is not an object")
     return value
+
+
+def _get_batch(name: str) -> dict[str, Any]:
+    if not name.startswith("batches/"):
+        raise ValueError("Gemini batch name must begin with batches/")
+    return _get_gemini_resource(name, resource_label="status")
+
+
+def _get_cache(name: str) -> dict[str, Any]:
+    if not name.startswith("cachedContents/"):
+        raise ValueError("Gemini cache name must begin with cachedContents/")
+    return _get_gemini_resource(name, resource_label="cache lookup")
 
 
 def _write_jsonl(path: Path, values: list[dict[str, Any]]) -> None:
@@ -178,7 +192,10 @@ def _collection_summary(
     valid = sum(result.get("status") == "success" for result in results)
     invalid = sum(result.get("status") == "invalid" for result in results)
     provider_failures = sum(result.get("status") == "provider_failure" for result in results)
-    entry = pricing["models"]["gemini:gemini-2.5-flash"]
+    model = plan.get("provenance", {}).get("model")
+    entry = pricing["models"].get(f"gemini:{model}")
+    if not isinstance(entry, dict):
+        raise ValueError(f"pricing is not configured for Gemini model {model}")
     rates = entry["modes"]["batch"]
     uncached = max(0, tokens["input_tokens"] - tokens["cached_input_tokens"])
     input_cost = uncached * float(rates["input_per_million_usd"]) / 1_000_000
@@ -527,7 +544,9 @@ def main(argv: list[str] | None = None) -> int:
                 result["prompt_version"] = provenance["prompt_version"]
                 result["prompt_sha256"] = provenance["assembled_prompt_sha256"]
                 result["schema_sha256"] = provenance["canonical_schema_sha256"]
-                result["thinking_budget"] = provenance["thinking_budget"]
+                for field in ("thinking_budget", "thinking_level"):
+                    if field in provenance:
+                        result[field] = provenance[field]
                 result["execution_mode"] = provenance["execution_mode"]
                 result["cache_identifier"] = provenance["cached_content"]
                 result["batch_id"] = batch_name

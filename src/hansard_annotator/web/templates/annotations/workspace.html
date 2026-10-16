@@ -4,10 +4,13 @@
 {% block main_class %}workspace-shell{% endblock %}
 {% block content %}
 <header class="workspace-header">
-  <div><a class="text-sm font-medium text-brand" href="/projects/{{ assignment.project_id }}">← {{ assignment.project_name }}</a><h1 class="mt-1 text-xl font-semibold">Annotation workspace</h1></div>
-  <div class="flex items-center gap-3">{{ badge(assignment.assignment_status) }}<span class="text-sm text-muted">{{ assignment.calculated_word_count }} words</span></div>
+  <div><a class="text-sm font-medium text-brand" href="/projects/{{ assignment.project_id }}">← Back to Human Annotation</a><h1 class="mt-1 text-xl font-semibold">{{ assignment.project_name }}</h1></div>
+  <div class="flex flex-wrap items-center gap-3">{{ badge(assignment.assignment_status) }}<span class="text-sm text-muted">{{ progress.completed }} completed / {{ progress.total }} assigned</span><span class="text-sm text-muted">{{ assignment.calculated_word_count }} words</span><form method="post" action="/projects/{{ assignment.project_id }}/next-assignment">{{ csrf(principal) }}<input type="hidden" name="exclude_assignment_id" value="{{ assignment.id }}"><button class="btn btn-quiet" type="submit">Next eligible task</button></form></div>
 </header>
 {% if request.query_params.get('submitted') %}<div class="alert alert-success mb-4" role="status">Annotation submitted. The next available task is ready.</div>{% endif %}
+{% if request.query_params.get('skipped') %}<div class="alert alert-success mb-4" role="status">Previous task skipped. The next available task is ready.</div>{% endif %}
+{% if request.query_params.get('saved') %}<div class="alert alert-success mb-4" role="status">Draft saved. You remain on this annotation.</div>{% endif %}
+{% if request.query_params.get('reopened') %}<div class="alert alert-success mb-4" role="status">Skipped annotation reopened.</div>{% endif %}
 {{ error_summary(errors) }}
 <div class="workspace-grid">
   <article class="speech-panel" aria-labelledby="speech-heading">
@@ -37,36 +40,10 @@
     </details>
   </article>
   <aside class="annotation-panel" aria-labelledby="form-heading">
-    {% if ai_prediction %}
-    <section class="card mb-4" aria-labelledby="ai-suggestion-heading">
-      <p class="eyebrow">AI suggestion · not yet human-approved</p>
-      <h2 id="ai-suggestion-heading" class="mt-1 text-xl font-semibold">{{ ai_prediction.configured_model }}</h2>
-      <dl class="metadata mt-3">
-        <div><dt>Policy status</dt><dd>{{ 'Non-Policy' if ai_prediction.is_non_policy else 'Policy' }}</dd></div>
-        <div><dt>Primary domain</dt><dd>{{ ai_prediction.primary_australian_domain or 'None' }}</dd></div>
-        <div><dt>Secondary domains</dt><dd>{{ ai_prediction.secondary_australian_domains|join(', ') or 'None' }}</dd></div>
-      </dl>
-      <p class="mt-3 text-sm"><strong>Model reasoning:</strong> {{ ai_prediction.reasoning }}</p>
-      {% if ai_review %}<p class="mt-3">{{ badge(ai_review.review_status) }} Reviewed {{ ai_review.reviewed_at }}</p>{% endif %}
-      <form class="mt-3" method="post" action="/assignments/{{ assignment.id }}/accept-ai">
-        {{ csrf(principal) }}
-        <button class="btn btn-primary" type="submit">Accept AI &amp; next</button>
-      </form>
-      <details class="provenance mt-3">
-        <summary>Machine provenance</summary>
-        <dl class="metadata mt-3">
-          <div><dt>Model</dt><dd>{{ ai_prediction.configured_model }}</dd></div>
-          <div><dt>Prompt</dt><dd>{{ ai_prediction.prompt_version }}</dd></div>
-          <div><dt>Execution</dt><dd>{{ ai_prediction.execution_mode }}</dd></div>
-          <div><dt>Run ID</dt><dd class="hash">{{ ai_prediction.run_public_id }}</dd></div>
-          <div><dt>Prediction time</dt><dd>{{ ai_prediction.created_at }}</dd></div>
-        </dl>
-      </details>
-    </section>
-    {% endif %}
     <div class="annotation-title"><p class="eyebrow">Human annotation · {{ schema_version }}</p><h2 id="form-heading" class="mt-1 text-2xl font-semibold">{{ schema_name }}</h2><p class="mt-2 text-sm text-muted">Preprocessing hints are context only. This form follows the project's pinned annotation pass.</p></div>
     <form id="annotation-form" method="post" action="/assignments/{{ assignment.id }}/submit" data-dirty-form>
       {{ csrf(principal) }}
+      <input id="expected-revision-number" type="hidden" name="expected_revision_number" value="{{ revision_number or 0 }}">
       <div class="annotation-fields">
       {% for field in fields %}
         {% set current = values.get(field.field_key) %}
@@ -107,14 +84,13 @@
       <div class="annotation-actions">
         <div id="save-status" class="save-status" aria-live="polite">{% if revision_number %}Loaded revision {{ revision_number }}{% else %}No draft saved yet{% endif %}</div>
         <div class="grid grid-cols-2 gap-3">
-          <button class="btn btn-secondary" type="submit" formaction="/assignments/{{ assignment.id }}/draft" hx-post="/assignments/{{ assignment.id }}/draft" hx-target="#save-status" hx-swap="innerHTML" data-save-draft>Save draft</button>
-          <button class="btn btn-primary" type="submit" data-submit-next>{% if ai_prediction %}Save edited annotation &amp; next{% else %}Submit &amp; next{% endif %}</button>
+          {% if annotation_status not in ['submitted', 'revised'] %}<button class="btn btn-secondary" type="submit" formaction="/assignments/{{ assignment.id }}/draft" hx-post="/assignments/{{ assignment.id }}/draft" hx-target="#save-status" hx-swap="innerHTML" data-save-draft>Save draft</button>{% endif %}
+          <button class="btn btn-primary" type="submit" data-submit-next>{% if annotation_status in ['submitted', 'revised'] %}Submit revision &amp; next{% else %}Submit &amp; next{% endif %}</button>
         </div>
       </div>
     </form>
     <div class="secondary-actions">
-      <form method="post" action="/assignments/{{ assignment.id }}/skip">{{ csrf(principal) }}<button class="btn btn-quiet" type="submit">Skip for now</button></form>
-      <form method="post" action="/assignments/{{ assignment.id }}/flag" class="flex gap-2">{{ csrf(principal) }}<label class="sr-only" for="flag-reason">Codebook issue</label><input id="flag-reason" name="reason" placeholder="Possible taxonomy/codebook ambiguity" required><button class="btn btn-danger" type="submit">Flag codebook issue</button></form>
+      <form method="post" action="/assignments/{{ assignment.id }}/skip">{{ csrf(principal) }}<button class="btn btn-quiet" type="submit">Skip &amp; next</button></form>
       <a class="btn btn-quiet" href="/assignments/{{ assignment.id }}/history">Revision history</a>
     </div>
   </aside>

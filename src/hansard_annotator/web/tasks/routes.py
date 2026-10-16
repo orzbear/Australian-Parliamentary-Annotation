@@ -10,14 +10,16 @@ from fastapi.templating import Jinja2Templates
 
 from hansard_annotator.web.annotations.ai_review import (
     REVIEW_FILTERS,
+    RUN_FILTERS,
     ai_review_queue,
+    ai_review_runs,
     ensure_prediction_assignment,
     next_unreviewed_prediction,
     prediction_review_workspace,
-    record_ai_review,
     record_prediction_review,
 )
 from hansard_annotator.web.annotations.service import (
+    AnnotationRevisionError,
     AnnotationValidationError,
     revision_history,
     save_annotation,
@@ -26,9 +28,14 @@ from hansard_annotator.web.annotations.service import (
 from hansard_annotator.web.auth.models import Principal
 from hansard_annotator.web.config import WebSettings
 from hansard_annotator.web.dependencies import enforce_csrf, get_settings, require_principal
+from hansard_annotator.web.projects.permissions import PermissionDenied
 from hansard_annotator.web.tasks.service import (
+    assignment_progress,
     claim_next,
     get_assignment,
+    human_annotation_detail,
+    next_human_assignment,
+    reopen_skipped_assignment,
     set_assignment_outcome,
 )
 
@@ -54,6 +61,29 @@ async def claim(
     return RedirectResponse(destination, status_code=303)
 
 
+@router.post("/projects/{project_id}/next-assignment")
+async def next_assignment_route(
+    request: Request,
+    project_id: int,
+    settings: Annotated[WebSettings, Depends(get_settings)],
+    principal: Annotated[Principal, Depends(require_principal)],
+    exclude_assignment_id: Annotated[int | None, Form()] = None,
+) -> RedirectResponse:
+    await enforce_csrf(request, principal, settings)
+    assignment = next_human_assignment(
+        settings,
+        principal,
+        project_id,
+        exclude_assignment_id=exclude_assignment_id,
+    )
+    destination = (
+        f"/assignments/{assignment['id']}"
+        if assignment
+        else f"/projects/{project_id}?queue_complete=1"
+    )
+    return RedirectResponse(destination, status_code=303)
+
+
 @router.get("/assignments/{assignment_id}")
 def assignment_workspace(
     request: Request,
@@ -66,8 +96,53 @@ def assignment_workspace(
     return _templates(request).TemplateResponse(
         request,
         "annotations/workspace.html",
-        {"principal": principal, "assignment": assignment, **form, "errors": {}},
+        {
+            "principal": principal,
+            "assignment": assignment,
+            **form,
+            "progress": assignment_progress(
+                settings, principal, cast(int, assignment["project_id"])
+            ),
+            "errors": {},
+        },
     )
+
+
+@router.get("/assignments/{assignment_id}/detail")
+def completed_annotation_detail(
+    request: Request,
+    assignment_id: int,
+    settings: Annotated[WebSettings, Depends(get_settings)],
+    principal: Annotated[Principal, Depends(require_principal)],
+) -> object:
+    try:
+        annotation = human_annotation_detail(settings, principal, assignment_id)
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except (PermissionError, PermissionDenied) as error:
+        raise HTTPException(status_code=403, detail=str(error)) from error
+    return _templates(request).TemplateResponse(
+        request,
+        "annotations/detail.html",
+        {"principal": principal, "annotation": annotation},
+    )
+
+
+@router.post("/assignments/{assignment_id}/reopen")
+async def reopen_assignment(
+    request: Request,
+    assignment_id: int,
+    settings: Annotated[WebSettings, Depends(get_settings)],
+    principal: Annotated[Principal, Depends(require_principal)],
+) -> RedirectResponse:
+    await enforce_csrf(request, principal, settings)
+    try:
+        reopen_skipped_assignment(settings, principal, assignment_id)
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return RedirectResponse(f"/assignments/{assignment_id}?reopened=1", status_code=303)
 
 
 async def _annotation_payload(
@@ -75,7 +150,7 @@ async def _annotation_payload(
     settings: WebSettings,
     principal: Principal,
     assignment_id: int,
-) -> dict[str, object]:
+) -> tuple[dict[str, object], dict[str, object], int]:
     metadata = schema_form(settings, principal, assignment_id)
     form = await request.form()
     payload: dict[str, object] = {}
@@ -91,7 +166,20 @@ async def _annotation_payload(
         else:
             raw = form.get(key)
             payload[key] = str(raw) if raw is not None else None
-    return payload
+    raw_revision = form.get("expected_revision_number")
+    try:
+        expected_revision = int(str(raw_revision))
+    except (TypeError, ValueError) as error:
+        raise AnnotationRevisionError(
+            "The annotation revision is missing or malformed. Reload the form and try again.",
+            status_code=422,
+        ) from error
+    if expected_revision < 0:
+        raise AnnotationRevisionError(
+            "The annotation revision is invalid. Reload the form and try again.",
+            status_code=422,
+        )
+    return payload, metadata, expected_revision
 
 
 async def _payload_for_fields(request: Request, fields: list[dict[str, Any]]) -> dict[str, object]:
@@ -119,20 +207,55 @@ async def _save(
     event_type: str,
 ) -> object:
     await enforce_csrf(request, principal, settings)
-    payload = await _annotation_payload(request, settings, principal, assignment_id)
     try:
-        result = save_annotation(settings, principal, assignment_id, payload, event_type=event_type)
-    except AnnotationValidationError as error:
+        payload, metadata, expected_revision = await _annotation_payload(
+            request, settings, principal, assignment_id
+        )
+        effective_event_type = (
+            "revised"
+            if event_type == "submitted"
+            and metadata["annotation_status"] in {"submitted", "revised"}
+            else event_type
+        )
+        result = save_annotation(
+            settings,
+            principal,
+            assignment_id,
+            payload,
+            event_type=effective_event_type,
+            expected_revision_number=expected_revision,
+        )
+    except AnnotationRevisionError as error:
         assignment = get_assignment(settings, principal, assignment_id)
-        metadata: dict[str, Any] = schema_form(settings, principal, assignment_id)
-        metadata["values"] = error.outcome.values
+        current_metadata = schema_form(settings, principal, assignment_id)
         return _templates(request).TemplateResponse(
             request,
             "annotations/workspace.html",
             {
                 "principal": principal,
                 "assignment": assignment,
-                **metadata,
+                **current_metadata,
+                "progress": assignment_progress(
+                    settings, principal, cast(int, assignment["project_id"])
+                ),
+                "errors": {"_form": [str(error)]},
+            },
+            status_code=error.status_code,
+        )
+    except AnnotationValidationError as error:
+        assignment = get_assignment(settings, principal, assignment_id)
+        invalid_metadata: dict[str, Any] = schema_form(settings, principal, assignment_id)
+        invalid_metadata["values"] = error.outcome.values
+        return _templates(request).TemplateResponse(
+            request,
+            "annotations/workspace.html",
+            {
+                "principal": principal,
+                "assignment": assignment,
+                **invalid_metadata,
+                "progress": assignment_progress(
+                    settings, principal, cast(int, assignment["project_id"])
+                ),
                 "errors": error.outcome.errors,
             },
             status_code=422,
@@ -143,22 +266,21 @@ async def _save(
             "annotations/_save_status.html",
             {"result": result},
         )
-    if event_type in {"submitted", "revised"}:
-        record_ai_review(
+    if effective_event_type in {"submitted", "revised"}:
+        project_id = int(get_assignment_project(settings, assignment_id))
+        next_assignment = next_human_assignment(
             settings,
             principal,
-            assignment_id,
-            "edited",
-            annotation_version_id=cast(int, result["annotation_version_id"]),
-        )
-        next_assignment = claim_next(
-            settings, principal, int(get_assignment_project(settings, assignment_id))
+            project_id,
+            exclude_assignment_id=assignment_id,
         )
         if next_assignment:
             return RedirectResponse(
                 f"/assignments/{next_assignment['id']}?submitted=1", status_code=303
             )
-        return RedirectResponse("/?submitted=1", status_code=303)
+        return RedirectResponse(
+            f"/projects/{project_id}?queue_complete=1", status_code=303
+        )
     return RedirectResponse(f"/assignments/{assignment_id}?saved=1", status_code=303)
 
 
@@ -217,41 +339,6 @@ async def submit(
     return await _save(request, assignment_id, settings, principal, "submitted")
 
 
-@router.post("/assignments/{assignment_id}/accept-ai")
-async def accept_ai(
-    request: Request,
-    assignment_id: int,
-    settings: Annotated[WebSettings, Depends(get_settings)],
-    principal: Annotated[Principal, Depends(require_principal)],
-) -> RedirectResponse:
-    await enforce_csrf(request, principal, settings)
-    metadata = schema_form(settings, principal, assignment_id)
-    event_type = (
-        "revised" if metadata["annotation_status"] in {"submitted", "revised"} else "submitted"
-    )
-    result = save_annotation(
-        settings,
-        principal,
-        assignment_id,
-        _accepted_ai_payload(metadata),
-        event_type=event_type,
-    )
-    record_ai_review(
-        settings,
-        principal,
-        assignment_id,
-        "accepted",
-        annotation_version_id=cast(int, result["annotation_version_id"]),
-    )
-    next_assignment = claim_next(
-        settings, principal, int(get_assignment_project(settings, assignment_id))
-    )
-    destination = (
-        f"/assignments/{next_assignment['id']}?submitted=1" if next_assignment else "/?submitted=1"
-    )
-    return RedirectResponse(destination, status_code=303)
-
-
 @router.post("/assignments/{assignment_id}/skip")
 async def skip(
     request: Request,
@@ -260,9 +347,20 @@ async def skip(
     principal: Annotated[Principal, Depends(require_principal)],
 ) -> RedirectResponse:
     await enforce_csrf(request, principal, settings)
-    record_ai_review(settings, principal, assignment_id, "skipped")
+    project_id = int(get_assignment_project(settings, assignment_id))
     set_assignment_outcome(settings, principal, assignment_id, "skipped")
-    return RedirectResponse("/", status_code=303)
+    next_assignment = next_human_assignment(
+        settings,
+        principal,
+        project_id,
+        exclude_assignment_id=assignment_id,
+    )
+    destination = (
+        f"/assignments/{next_assignment['id']}?skipped=1"
+        if next_assignment
+        else f"/projects/{project_id}?queue_complete=1&status=skipped"
+    )
+    return RedirectResponse(destination, status_code=303)
 
 
 @router.post("/assignments/{assignment_id}/flag")
@@ -274,7 +372,6 @@ async def flag(
     reason: Annotated[str, Form()],
 ) -> RedirectResponse:
     await enforce_csrf(request, principal, settings)
-    record_ai_review(settings, principal, assignment_id, "flagged_codebook", note=reason)
     set_assignment_outcome(settings, principal, assignment_id, "flagged", reason=reason)
     return RedirectResponse("/", status_code=303)
 
@@ -288,9 +385,12 @@ def review_queue(
     run_id: str | None = None,
     primary_domain: str | None = None,
     is_non_policy: bool | None = None,
+    runs: str = "all",
 ) -> object:
     if status not in REVIEW_FILTERS:
         status = "unreviewed"
+    if runs not in RUN_FILTERS:
+        runs = "all"
     rows = ai_review_queue(
         settings,
         principal,
@@ -302,7 +402,14 @@ def review_queue(
     return _templates(request).TemplateResponse(
         request,
         "annotations/ai_queue.html",
-        {"principal": principal, "rows": rows, "active_filter": status},
+        {
+            "principal": principal,
+            "rows": rows,
+            "active_filter": status,
+            "runs": ai_review_runs(settings, run_filter=runs),
+            "active_run_filter": runs,
+            "active_run_id": run_id,
+        },
     )
 
 

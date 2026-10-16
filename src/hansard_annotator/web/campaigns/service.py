@@ -1,0 +1,1339 @@
+"""Persistent, recoverable orchestration around Phase 4B and Phase 4C services."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from collections import Counter
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any, Protocol, cast
+
+import psycopg
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
+
+from hansard_annotator.llm_eval.costs import load_pricing
+from hansard_annotator.llm_eval.import_predictions import (
+    import_predictions,
+    load_prediction_artifact,
+)
+from hansard_annotator.llm_eval.operations import (
+    APPROVED_PRODUCTION_GENERATION,
+    APPROVED_PRODUCTION_MODEL,
+    FROZEN_CANONICAL_SCHEMA_SHA256,
+    FROZEN_PROMPT_SHA256,
+    FROZEN_PROMPT_VERSION,
+    build_batch_create_request,
+    build_cache_create_request,
+    canonical_hash,
+    collect_inline_batch,
+    gemini_batch_schema,
+    parse_batch_status,
+    production_record_from_turn,
+    simulate_costs,
+    submission_batch_name,
+    validate_production_plan,
+)
+from hansard_annotator.llm_eval.ops_cli import (
+    _collection_summary,
+    _get_batch,
+    _get_cache,
+)
+from hansard_annotator.llm_eval.prompt import (
+    build_system_prompt,
+    prediction_json_schema,
+    prompt_hash,
+)
+from hansard_annotator.llm_eval.providers import _http_json
+from hansard_annotator.web.auth.models import Principal
+from hansard_annotator.web.codebook.service import ROOT, production_codebook
+from hansard_annotator.web.config import WebSettings
+
+PREDICTION_CONTRACT_SHA256 = "99cafa6c473293dc076793ee6baeca44b6961d7cb11de8f9174517defc4a0879"
+GEMINI_BATCH_SCHEMA_SHA256 = "980b0ed6d6002a8eadd326f84942ba60dcdf8f2abd9e70ea6aaecf7d78de3c22"
+PAID_CONFIRMATION = "START AI CAMPAIGN"
+PRODUCTION_GENERATION_CONFIG = APPROVED_PRODUCTION_GENERATION
+PRODUCTION_EXECUTION_MODE = "batch"
+DEFAULT_EXCLUDE_HUMAN_ANNOTATED = True
+AI_ELIGIBILITY_RULE = "prompt_text_present_v1"
+OTHER_EXCLUSION_LABELS = {
+    "missing_prompt_text": "No cleaned or raw speech text",
+    "unmapped_business_heading": (
+        "Legacy main-analysis rule: business heading has no reviewed mapping"
+    ),
+    "committees_procedural_status_unknown": (
+        "Legacy main-analysis rule: Committees procedural status is indeterminate"
+    ),
+    "motions_procedural_status_unknown": (
+        "Legacy main-analysis rule: Motions procedural status is indeterminate"
+    ),
+    "parliamentary_representation_ceremonial_status_unknown": (
+        "Legacy main-analysis rule: Parliamentary Representation ceremonial status "
+        "is indeterminate"
+    ),
+    "legacy_business_mapping_indeterminate": (
+        "Legacy main-analysis rule: business mapping eligibility is indeterminate"
+    ),
+    "under_50_words": "Legacy main-analysis rule: fewer than 50 words",
+    "unknown_speaker": "Legacy main-analysis rule: speaker identity is unknown",
+    "collective_speaker": "Legacy main-analysis rule: collective speaker",
+    "procedural_business": "Legacy main-analysis rule: procedural business",
+    "ceremonial_business": "Legacy main-analysis rule: ceremonial business",
+    "orphan_continuation": "Legacy main-analysis rule: orphan continuation",
+}
+
+# Calibrated from the successful 100-record Phase 4B schema-fix validation run.
+# Calibrated from the frozen 120-record Gemini 3.1 Flash-Lite benchmark.  The
+# cached prefix token count is the benchmark's locally recorded planning value;
+# a live campaign retains the provider-reported cache metadata separately.
+INPUT_TOKENS_PER_RECORD = 581870 / 120
+OUTPUT_TOKENS_PER_RECORD = 13687 / 120
+EXPLICIT_CACHE_TOKENS = 4131
+CACHED_INPUT_SHARE = EXPLICIT_CACHE_TOKENS / INPUT_TOKENS_PER_RECORD
+EXPLICIT_CACHE_TTL_HOURS = 24.0
+EXPLICIT_CACHE_TTL_SECONDS = int(EXPLICIT_CACHE_TTL_HOURS * 3600)
+CACHE_REUSE_MINIMUM = timedelta(hours=1)
+
+STATES = {
+    "DRAFT",
+    "PLANNED",
+    "READY",
+    "SUBMITTED",
+    "RUNNING",
+    "PROVIDER_COMPLETED",
+    "COLLECTED",
+    "VALIDATED",
+    "IMPORTED",
+    "FAILED",
+    "CANCELLED",
+}
+TRANSITIONS = {
+    "DRAFT": {"PLANNED", "CANCELLED"},
+    "PLANNED": {"READY", "CANCELLED"},
+    "READY": {"SUBMITTED", "CANCELLED"},
+    "SUBMITTED": {"RUNNING", "PROVIDER_COMPLETED", "FAILED"},
+    "RUNNING": {"RUNNING", "PROVIDER_COMPLETED", "FAILED"},
+    "PROVIDER_COMPLETED": {"COLLECTED", "FAILED"},
+    "COLLECTED": {"VALIDATED", "FAILED"},
+    "VALIDATED": {"IMPORTED", "FAILED"},
+    "FAILED": {"RUNNING", "PROVIDER_COMPLETED", "COLLECTED", "VALIDATED"},
+    "CANCELLED": set(),
+    "IMPORTED": set(),
+}
+
+
+class CampaignError(ValueError):
+    """Campaign state, identity, or lifecycle invariant failed."""
+
+
+def validate_transition(current: str, target: str) -> None:
+    if current not in STATES or target not in STATES:
+        raise CampaignError("unknown campaign state")
+    if target not in TRANSITIONS[current]:
+        raise CampaignError(f"invalid campaign transition: {current} -> {target}")
+
+
+def production_configuration() -> dict[str, Any]:
+    return {
+        "provider": "gemini",
+        "configured_model": APPROVED_PRODUCTION_MODEL,
+        "prompt_version": FROZEN_PROMPT_VERSION,
+        "prompt_sha256": FROZEN_PROMPT_SHA256,
+        "canonical_schema_sha256": FROZEN_CANONICAL_SCHEMA_SHA256,
+        "prediction_contract_sha256": PREDICTION_CONTRACT_SHA256,
+        "provider_schema_sha256": GEMINI_BATCH_SCHEMA_SHA256,
+        "generation_config": dict(PRODUCTION_GENERATION_CONFIG),
+        "execution_mode": PRODUCTION_EXECUTION_MODE,
+    }
+
+
+def configuration_class(configuration: dict[str, Any]) -> str:
+    return (
+        "APPROVED_PRODUCTION"
+        if same_prediction_configuration(configuration, production_configuration())
+        else "RESEARCH"
+    )
+
+
+def same_prediction_configuration(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    """Match the identity used by SQL eligibility; run/campaign IDs are irrelevant."""
+    keys = (
+        "provider",
+        "configured_model",
+        "prompt_version",
+        "prompt_sha256",
+        "canonical_schema_sha256",
+        "prediction_contract_sha256",
+        "provider_schema_sha256",
+        "generation_config",
+        "execution_mode",
+    )
+    return all(left.get(key) == right.get(key) for key in keys)
+
+
+def _cache_display_name(content_sha256: str) -> str:
+    return f"phase4d-{FROZEN_PROMPT_VERSION}-{content_sha256[:16]}"
+
+
+def _canonical_cache_plan(campaign: dict[str, Any]) -> dict[str, Any]:
+    codebook = production_codebook()
+    context = cast(dict[str, Any], codebook["context"])
+    system_prompt = build_system_prompt(context, str(campaign["prompt_version"]))
+    content_sha256 = prompt_hash(system_prompt)
+    if content_sha256 != FROZEN_PROMPT_SHA256 or content_sha256 != campaign["prompt_sha256"]:
+        raise CampaignError("canonical cache content does not match frozen prompt provenance")
+    display_name = _cache_display_name(content_sha256)
+    return {
+        "content_sha256": content_sha256,
+        "display_name": display_name,
+        "model": f"models/{campaign['configured_model']}",
+        "system_prompt": system_prompt,
+        "request": build_cache_create_request(
+            model=str(campaign["configured_model"]),
+            system_prompt=system_prompt,
+            ttl_seconds=EXPLICIT_CACHE_TTL_SECONDS,
+            display_name=display_name,
+        ),
+    }
+
+
+def _provider_time(value: object, field: str) -> datetime:
+    if not isinstance(value, str):
+        raise CampaignError(f"Gemini cache response has no {field}")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise CampaignError(f"Gemini cache response has invalid {field}") from None
+    if parsed.tzinfo is None:
+        raise CampaignError(f"Gemini cache response has timezone-free {field}")
+    return parsed.astimezone(UTC)
+
+
+def _cache_resource_fields(
+    resource: dict[str, Any], plan: dict[str, Any], *, now: datetime
+) -> dict[str, Any]:
+    name = resource.get("name")
+    if not isinstance(name, str) or not name.startswith("cachedContents/"):
+        raise CampaignError("Gemini cache response has an invalid resource name")
+    if resource.get("model") != plan["model"]:
+        raise CampaignError("Gemini cache model does not match the campaign model")
+    if resource.get("displayName") != plan["display_name"]:
+        raise CampaignError("Gemini cache display identity does not match canonical content")
+    created_at = _provider_time(resource.get("createTime"), "createTime")
+    expires_at = _provider_time(resource.get("expireTime"), "expireTime")
+    if expires_at <= now + CACHE_REUSE_MINIMUM:
+        raise CampaignError("Gemini cache is expired or has insufficient remaining lifetime")
+    instruction = resource.get("systemInstruction")
+    if instruction is not None:
+        parts = instruction.get("parts") if isinstance(instruction, dict) else None
+        text = parts[0].get("text") if isinstance(parts, list) and len(parts) == 1 else None
+        if text != plan["system_prompt"]:
+            raise CampaignError("Gemini cache returned incompatible system instruction content")
+    safe_metadata = {
+        key: resource[key]
+        for key in ("updateTime", "usageMetadata")
+        if key in resource
+    }
+    return {
+        "cache_status": "REUSABLE",
+        "cache_identifier": name,
+        "cache_content_sha256": plan["content_sha256"],
+        "cache_model": plan["model"],
+        "cache_display_name": plan["display_name"],
+        "cache_created_at": created_at,
+        "cache_expires_at": expires_at,
+        "cache_verified_at": now,
+        "cache_metadata": safe_metadata,
+    }
+
+
+def cache_plan_status(campaign: dict[str, Any], *, now: datetime | None = None) -> str:
+    current = now or datetime.now(UTC)
+    if not campaign.get("cache_identifier"):
+        return "REQUIRED"
+    expires = campaign.get("cache_expires_at")
+    compatible = (
+        campaign.get("cache_content_sha256") == FROZEN_PROMPT_SHA256
+        and campaign.get("cache_model") == f"models/{campaign.get('configured_model')}"
+        and campaign.get("cache_display_name") == _cache_display_name(FROZEN_PROMPT_SHA256)
+        and campaign.get("cache_verified_at") is not None
+        and isinstance(expires, datetime)
+        and expires.astimezone(UTC) > current + CACHE_REUSE_MINIMUM
+    )
+    return "REUSABLE" if compatible else "UNAVAILABLE"
+
+
+def deterministic_selection(
+    rows: list[dict[str, Any]], *, limit: int, seed: str
+) -> tuple[list[dict[str, Any]], str]:
+    if limit < 1:
+        raise CampaignError("planned count must be positive")
+    unique: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        turn_key = str(row["turn_key"])
+        if turn_key in unique:
+            raise CampaignError(f"duplicate eligible turn key: {turn_key}")
+        unique[turn_key] = row
+    ordered = sorted(
+        unique.values(),
+        key=lambda row: (
+            hashlib.sha256(f"{row['turn_key']}:{seed}".encode()).hexdigest(),
+            str(row["turn_key"]),
+        ),
+    )[:limit]
+    record_ids = [f"turn:{row['turn_key']}" for row in ordered]
+    return ordered, canonical_hash(record_ids)
+
+
+def other_exclusion_reason(row: dict[str, Any]) -> str | None:
+    """Return a content-neutral reason that prevents a usable model prompt."""
+    text = row.get("text_clean") or row.get("text_raw")
+    if not isinstance(text, str) or not text.strip():
+        return "missing_prompt_text"
+    return None
+
+
+def selection_breakdown(
+    rows: list[dict[str, Any]], *, exclude_human_annotated: bool
+) -> dict[str, Any]:
+    """Return disjoint plan buckets plus factual overlap diagnostics."""
+    same_configuration = 0
+    human_annotated = 0
+    human_annotated_excluded = 0
+    other_excluded = 0
+    eligible = 0
+    human_prediction_overlap = 0
+    other_reasons: Counter[str] = Counter()
+    for row in rows:
+        predicted = bool(row["already_predicted"])
+        human = bool(row["human_annotated"])
+        human_annotated += int(human)
+        human_prediction_overlap += int(human and predicted)
+        if predicted:
+            same_configuration += 1
+        elif exclude_human_annotated and human:
+            human_annotated_excluded += 1
+        elif reason := other_exclusion_reason(row):
+            other_excluded += 1
+            other_reasons[reason] += 1
+        else:
+            eligible += 1
+    return {
+        "corpus_total_count": len(rows),
+        "human_annotated_count": human_annotated,
+        "excluded_existing_prediction_count": same_configuration,
+        "excluded_human_annotated_count": human_annotated_excluded,
+        "excluded_other_count": other_excluded,
+        "eligible_count": eligible,
+        "human_prediction_overlap_count": human_prediction_overlap,
+        "other_exclusion_reasons": dict(sorted(other_reasons.items())),
+    }
+
+
+def estimate_plan(records: int) -> dict[str, float | int]:
+    pricing = load_pricing(ROOT / "config/llm_eval/pricing.yaml")
+    entry = pricing["models"][f"gemini:{APPROVED_PRODUCTION_MODEL}"]
+    rates = entry["modes"]["batch"]
+    estimate = simulate_costs(
+        records=records,
+        input_tokens_per_record=INPUT_TOKENS_PER_RECORD,
+        output_tokens_per_record=OUTPUT_TOKENS_PER_RECORD,
+        cached_share=CACHED_INPUT_SHARE,
+        input_rate=float(rates["input_per_million_usd"]),
+        cached_rate=float(rates["cached_input_per_million_usd"]),
+        output_rate=float(rates["output_per_million_usd"]),
+        explicit_cache_tokens=EXPLICIT_CACHE_TOKENS,
+        ttl_hours=EXPLICIT_CACHE_TTL_HOURS,
+        storage_rate=float(entry["cache_storage_per_million_token_hours_usd"]),
+    )
+    estimate["input_tokens"] = round(INPUT_TOKENS_PER_RECORD * records)
+    return estimate
+
+
+class GeminiGateway(Protocol):
+    def create_cache(self, request: dict[str, Any]) -> dict[str, Any]: ...
+
+    def get_cache(self, cache_identifier: str) -> dict[str, Any]: ...
+
+    def submit(self, plan: dict[str, Any], model: str) -> str: ...
+
+    def status(self, provider_job_id: str) -> dict[str, Any]: ...
+
+
+class LiveGeminiGateway:
+    """Thin web adapter over the already validated Phase 4B provider operations."""
+
+    @staticmethod
+    def _key() -> str:
+        key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        if not key:
+            raise CampaignError("Gemini credentials are not configured")
+        return key
+
+    def create_cache(self, request: dict[str, Any]) -> dict[str, Any]:
+        return _http_json(
+            "https://generativelanguage.googleapis.com/v1beta/cachedContents",
+            {"x-goog-api-key": self._key(), "Content-Type": "application/json"},
+            request,
+            120.0,
+        )
+
+    def get_cache(self, cache_identifier: str) -> dict[str, Any]:
+        self._key()
+        return _get_cache(cache_identifier)
+
+    def submit(self, plan: dict[str, Any], model: str) -> str:
+        validate_production_plan(plan)
+        response = _http_json(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:batchGenerateContent",
+            {"x-goog-api-key": self._key(), "Content-Type": "application/json"},
+            plan["request"],
+            120.0,
+        )
+        return submission_batch_name({"response": response})
+
+    def status(self, provider_job_id: str) -> dict[str, Any]:
+        return _get_batch(provider_job_id)
+
+
+@dataclass(frozen=True)
+class PlanResult:
+    campaign: dict[str, Any]
+    preview: list[dict[str, Any]]
+
+
+def _require_admin(principal: Principal) -> None:
+    if not principal.is_admin:
+        raise PermissionError("administrator or research access required")
+
+
+def list_corpora(settings: WebSettings) -> list[dict[str, Any]]:
+    with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
+        return [
+            dict(row)
+            for row in connection.execute(
+                "SELECT id,public_id,slug,name FROM corpora WHERE is_active ORDER BY name"
+            ).fetchall()
+        ]
+
+
+def create_campaign(
+    settings: WebSettings,
+    principal: Principal,
+    *,
+    name: str,
+    corpus_id: int,
+) -> dict[str, Any]:
+    _require_admin(principal)
+    if not name.strip():
+        raise CampaignError("campaign name is required")
+    configuration = production_configuration()
+    with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
+        reusable = connection.execute(
+            """
+            SELECT cache_identifier,cache_content_sha256,cache_model,cache_display_name,
+                   cache_created_at,cache_expires_at,cache_verified_at,cache_metadata
+            FROM ai_annotation_campaigns
+            WHERE provider=%s AND configured_model=%s AND prompt_version=%s
+              AND prompt_sha256=%s AND canonical_schema_sha256=%s
+              AND prediction_contract_sha256=%s AND provider_schema_sha256=%s
+              AND generation_config=%s AND execution_mode=%s
+              AND cache_status='REUSABLE' AND cache_identifier IS NOT NULL
+              AND cache_content_sha256=%s AND cache_model=%s
+              AND cache_display_name=%s AND cache_verified_at IS NOT NULL
+              AND cache_expires_at>now()+(%s * interval '1 second')
+            ORDER BY cache_expires_at DESC,id DESC LIMIT 1
+            """,
+            (
+                configuration["provider"],
+                configuration["configured_model"],
+                configuration["prompt_version"],
+                configuration["prompt_sha256"],
+                configuration["canonical_schema_sha256"],
+                configuration["prediction_contract_sha256"],
+                configuration["provider_schema_sha256"],
+                Jsonb(configuration["generation_config"]),
+                configuration["execution_mode"],
+                FROZEN_PROMPT_SHA256,
+                f"models/{APPROVED_PRODUCTION_MODEL}",
+                _cache_display_name(FROZEN_PROMPT_SHA256),
+                int(CACHE_REUSE_MINIMUM.total_seconds()),
+            ),
+        ).fetchone()
+        cache = dict(reusable) if reusable is not None else {}
+        row = connection.execute(
+            """
+            INSERT INTO ai_annotation_campaigns
+              (name,corpus_id,created_by_user_id,provider,configured_model,prompt_version,
+               prompt_sha256,canonical_schema_sha256,prediction_contract_sha256,
+               provider_schema_sha256,generation_config,execution_mode,configuration_class,
+               cache_status,cache_identifier,cache_content_sha256,cache_model,
+               cache_display_name,cache_created_at,cache_expires_at,cache_verified_at,
+               cache_metadata)
+            SELECT %s,c.id,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+            FROM corpora c WHERE c.id=%s AND c.is_active
+            RETURNING *
+            """,
+            (
+                name.strip(),
+                principal.user_id,
+                configuration["provider"],
+                configuration["configured_model"],
+                configuration["prompt_version"],
+                configuration["prompt_sha256"],
+                configuration["canonical_schema_sha256"],
+                configuration["prediction_contract_sha256"],
+                configuration["provider_schema_sha256"],
+                Jsonb(configuration["generation_config"]),
+                configuration["execution_mode"],
+                configuration_class(configuration),
+                "REUSABLE" if cache else "REQUIRED",
+                cache.get("cache_identifier"),
+                cache.get("cache_content_sha256"),
+                cache.get("cache_model"),
+                cache.get("cache_display_name"),
+                cache.get("cache_created_at"),
+                cache.get("cache_expires_at"),
+                cache.get("cache_verified_at"),
+                Jsonb(cache.get("cache_metadata", {})),
+                corpus_id,
+            ),
+        ).fetchone()
+        if row is None:
+            raise LookupError("active corpus not found")
+        return dict(row)
+
+
+def list_campaigns(settings: WebSettings, principal: Principal) -> list[dict[str, Any]]:
+    _require_admin(principal)
+    with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
+        return [
+            dict(row)
+            for row in connection.execute(
+                """
+                SELECT campaign.*,corpus.name AS corpus_name,run.public_id AS run_public_id
+                FROM ai_annotation_campaigns campaign
+                JOIN corpora corpus ON corpus.id=campaign.corpus_id
+                LEFT JOIN model_prediction_runs run
+                  ON run.id=campaign.model_prediction_run_id
+                ORDER BY campaign.created_at DESC,campaign.id DESC
+                """
+            ).fetchall()
+        ]
+
+
+def _legacy_other_exclusion_breakdown(
+    connection: psycopg.Connection[dict[str, Any]],
+    campaign: dict[str, Any],
+) -> dict[str, int]:
+    """Explain a stored pre-fix plan without mutating its frozen record selection."""
+    exclude_human = bool(
+        (campaign.get("selection_definition") or {}).get("exclude_human_annotated")
+    )
+    rows = connection.execute(
+        """
+        WITH base AS (
+          SELECT turn.*,
+            EXISTS (
+              SELECT 1 FROM model_predictions prediction
+              JOIN model_prediction_runs run ON run.id=prediction.run_id
+              WHERE prediction.speaker_turn_id=turn.id
+                AND run.provider=%s AND run.configured_model=%s
+                AND run.prompt_version=%s AND run.prompt_sha256=%s
+                AND run.canonical_schema_sha256=%s
+                AND run.prediction_contract_sha256=%s
+                AND run.provider_schema_sha256=%s
+                AND run.generation_config @> %s AND run.execution_mode=%s
+            ) AS already_predicted,
+            EXISTS (
+              SELECT 1 FROM tasks task
+              JOIN assignments assignment ON assignment.task_id=task.id
+              JOIN annotations annotation ON annotation.assignment_id=assignment.id
+              WHERE task.speaker_turn_id=turn.id
+                AND annotation.status IN ('submitted','revised')
+            ) AS human_annotated
+          FROM speaker_turns turn
+          JOIN reconstruction_runs reconstruction
+            ON reconstruction.id=turn.reconstruction_run_id
+          JOIN corpora corpus ON corpus.current_preprocessing_run_id=
+            reconstruction.preprocessing_run_id
+          WHERE corpus.id=%s
+        ), reasons AS (
+          SELECT CASE
+            WHEN business_type IS NULL THEN 'unmapped_business_heading'
+            WHEN business_type='committees' AND is_procedural IS NULL
+              THEN 'committees_procedural_status_unknown'
+            WHEN business_type='motions' AND is_procedural IS NULL
+              THEN 'motions_procedural_status_unknown'
+            WHEN business_type='parliamentary_representation'
+              AND is_ceremonial IS NULL
+              THEN 'parliamentary_representation_ceremonial_status_unknown'
+            WHEN is_procedural IS NULL OR is_ceremonial IS NULL
+              THEN 'legacy_business_mapping_indeterminate'
+            WHEN NOT eligible_50_words THEN 'under_50_words'
+            WHEN NOT has_known_speaker THEN 'unknown_speaker'
+            WHEN is_collective_speaker IS TRUE THEN 'collective_speaker'
+            WHEN is_procedural IS TRUE THEN 'procedural_business'
+            WHEN is_ceremonial IS TRUE THEN 'ceremonial_business'
+            WHEN is_orphan_continuation THEN 'orphan_continuation'
+            ELSE NULL
+          END AS reason
+          FROM base
+          WHERE NOT already_predicted
+            AND (NOT %s OR NOT human_annotated)
+            AND eligible_main_analysis IS NOT TRUE
+        )
+        SELECT reason,count(*) AS count FROM reasons
+        GROUP BY reason ORDER BY reason
+        """,
+        (
+            campaign["provider"],
+            campaign["configured_model"],
+            campaign["prompt_version"],
+            campaign["prompt_sha256"],
+            campaign["canonical_schema_sha256"],
+            campaign["prediction_contract_sha256"],
+            campaign["provider_schema_sha256"],
+            Jsonb(campaign["generation_config"]),
+            campaign["execution_mode"],
+            campaign["corpus_id"],
+            exclude_human,
+        ),
+    ).fetchall()
+    result: dict[str, int] = {}
+    for row in rows:
+        reason = row["reason"]
+        if not isinstance(reason, str) or reason not in OTHER_EXCLUSION_LABELS:
+            raise CampaignError("stored campaign has an unexplained legacy exclusion")
+        result[reason] = int(row["count"])
+    if sum(result.values()) != int(campaign["excluded_other_count"]):
+        raise CampaignError("stored campaign exclusion breakdown no longer reconciles")
+    return result
+
+
+def get_campaign(
+    settings: WebSettings, principal: Principal, public_id: str
+) -> dict[str, Any]:
+    _require_admin(principal)
+    with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
+        row = connection.execute(
+            """
+            SELECT campaign.*,corpus.name AS corpus_name,run.public_id AS run_public_id
+            FROM ai_annotation_campaigns campaign
+            JOIN corpora corpus ON corpus.id=campaign.corpus_id
+            LEFT JOIN model_prediction_runs run ON run.id=campaign.model_prediction_run_id
+            WHERE campaign.public_id::text=%s
+            """,
+            (public_id,),
+        ).fetchone()
+        if row is None:
+            raise LookupError("AI annotation campaign not found")
+        result = dict(row)
+        result["cache_plan_status"] = cache_plan_status(result)
+        selection = cast(dict[str, Any], result.get("selection_definition") or {})
+        other_reasons = selection.get("other_exclusion_reasons")
+        if not isinstance(other_reasons, dict) and selection.get(
+            "eligible_main_analysis"
+        ) is True:
+            other_reasons = _legacy_other_exclusion_breakdown(connection, result)
+        if not isinstance(other_reasons, dict):
+            other_reasons = {}
+        result["other_exclusion_details"] = [
+            {
+                "code": code,
+                "label": label,
+                "count": int(other_reasons[code]),
+            }
+            for code, label in OTHER_EXCLUSION_LABELS.items()
+            if code in other_reasons
+        ]
+        result["selection_current"] = (
+            selection.get("eligibility_rule") == AI_ELIGIBILITY_RULE
+        )
+        result["preview"] = [
+            dict(value)
+            for value in connection.execute(
+                """
+                SELECT record.record_id,record.selection_order,turn.speaker_name_raw,
+                       turn.speech_date,turn.major_heading_original,turn.text_clean
+                FROM ai_annotation_campaign_records record
+                JOIN speaker_turns turn ON turn.id=record.speaker_turn_id
+                WHERE record.campaign_id=%s ORDER BY record.selection_order LIMIT 10
+                """,
+                (row["id"],),
+            ).fetchall()
+        ]
+        return result
+
+
+def plan_campaign(
+    settings: WebSettings,
+    principal: Principal,
+    public_id: str,
+    *,
+    limit: int,
+    seed: str,
+    exclude_human_annotated: bool,
+) -> PlanResult:
+    _require_admin(principal)
+    if limit > 200_000:
+        raise CampaignError("planned count exceeds the 200,000-record safety limit")
+    with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
+        campaign = connection.execute(
+            "SELECT * FROM ai_annotation_campaigns WHERE public_id::text=%s FOR UPDATE",
+            (public_id,),
+        ).fetchone()
+        if campaign is None:
+            raise LookupError("AI annotation campaign not found")
+        if campaign["status"] != "DRAFT":
+            raise CampaignError("only a DRAFT campaign can be planned")
+        all_rows = [
+            dict(row)
+            for row in connection.execute(
+                """
+                SELECT turn.id,turn.turn_key,turn.speech_date AS date,turn.chamber,
+                       turn.speaker_name_raw,turn.major_heading_original,
+                       turn.minor_heading_original,turn.business_type,
+                       turn.text_clean,turn.text_raw,turn.eligible_main_analysis,
+                       EXISTS (
+                         SELECT 1 FROM model_predictions prediction
+                         JOIN model_prediction_runs run ON run.id=prediction.run_id
+                         WHERE prediction.speaker_turn_id=turn.id
+                           AND run.provider=%s AND run.configured_model=%s
+                           AND run.prompt_version=%s AND run.prompt_sha256=%s
+                           AND run.canonical_schema_sha256=%s
+                           AND run.prediction_contract_sha256=%s
+                           AND run.provider_schema_sha256=%s
+                           AND run.generation_config @> %s
+                           AND run.execution_mode=%s
+                       ) AS already_predicted,
+                       EXISTS (
+                         SELECT 1 FROM tasks task JOIN annotations annotation
+                           ON annotation.assignment_id IN (
+                             SELECT assignment.id FROM assignments assignment
+                             WHERE assignment.task_id=task.id
+                           )
+                         WHERE task.speaker_turn_id=turn.id
+                           AND annotation.status IN ('submitted','revised')
+                       ) AS human_annotated
+                FROM speaker_turns turn
+                JOIN reconstruction_runs reconstruction
+                  ON reconstruction.id=turn.reconstruction_run_id
+                JOIN corpora corpus ON corpus.current_preprocessing_run_id=
+                  reconstruction.preprocessing_run_id
+                WHERE corpus.id=%s
+                ORDER BY turn.turn_key,turn.id
+                """,
+                (
+                    campaign["provider"],
+                    campaign["configured_model"],
+                    campaign["prompt_version"],
+                    campaign["prompt_sha256"],
+                    campaign["canonical_schema_sha256"],
+                    campaign["prediction_contract_sha256"],
+                    campaign["provider_schema_sha256"],
+                    Jsonb(campaign["generation_config"]),
+                    campaign["execution_mode"],
+                    campaign["corpus_id"],
+                ),
+            ).fetchall()
+        ]
+        breakdown = selection_breakdown(
+            all_rows, exclude_human_annotated=exclude_human_annotated
+        )
+        eligible = [
+            row
+            for row in all_rows
+            if not row["already_predicted"]
+            and not (exclude_human_annotated and row["human_annotated"])
+            and other_exclusion_reason(row) is None
+        ]
+        selected, record_set_sha256 = deterministic_selection(eligible, limit=limit, seed=seed)
+        if not selected:
+            raise CampaignError("selection contains no eligible records")
+        estimate = estimate_plan(len(selected))
+        record_values: list[tuple[object, ...]] = []
+        for order, row in enumerate(selected):
+            record = production_record_from_turn(row)
+            record_values.append(
+                (
+                    campaign["id"],
+                    row["id"],
+                    record["record_id"],
+                    order,
+                    canonical_hash(record),
+                )
+            )
+        connection.cursor().executemany(
+            """
+            INSERT INTO ai_annotation_campaign_records
+              (campaign_id,speaker_turn_id,record_id,selection_order,record_sha256)
+            VALUES (%s,%s,%s,%s,%s)
+            """,
+            record_values,
+        )
+        selection = {
+            "eligibility_rule": AI_ELIGIBILITY_RULE,
+            "exclude_human_annotated": exclude_human_annotated,
+            "human_annotated_count": breakdown["human_annotated_count"],
+            "excluded_human_annotated_count": breakdown[
+                "excluded_human_annotated_count"
+            ],
+            "human_prediction_overlap_count": breakdown[
+                "human_prediction_overlap_count"
+            ],
+            "other_exclusion_reasons": breakdown["other_exclusion_reasons"],
+            "seed": seed,
+            "limit": limit,
+            "ordering": "sha256(turn_key + ':' + seed), turn_key",
+        }
+        updated = connection.execute(
+            """
+            UPDATE ai_annotation_campaigns SET
+              status='PLANNED',selection_definition=%s,record_set_sha256=%s,
+              corpus_total_count=%s,eligible_count=%s,
+              excluded_existing_prediction_count=%s,excluded_other_count=%s,
+              planned_count=%s,estimated_input_tokens=%s,
+              estimated_cached_input_tokens=%s,estimated_uncached_input_tokens=%s,
+              estimated_output_tokens=%s,estimated_processing_cost_usd=%s,
+              estimated_cache_storage_cost_usd=%s,estimated_total_cost_usd=%s,
+              planned_at=now()
+            WHERE id=%s RETURNING *
+            """,
+            (
+                Jsonb(selection),
+                record_set_sha256,
+                breakdown["corpus_total_count"],
+                breakdown["eligible_count"],
+                breakdown["excluded_existing_prediction_count"],
+                breakdown["excluded_other_count"],
+                len(selected),
+                estimate["input_tokens"],
+                estimate["cached_input_tokens"],
+                estimate["uncached_input_tokens"],
+                estimate["output_tokens"],
+                estimate["token_processing_cost_usd"],
+                estimate["explicit_cache_storage_cost_usd"],
+                estimate["estimated_total_cost_usd"],
+                campaign["id"],
+            ),
+        ).fetchone()
+        assert updated is not None
+        return PlanResult(dict(updated), selected[:10])
+
+
+def transition_campaign(
+    settings: WebSettings,
+    principal: Principal,
+    public_id: str,
+    target: str,
+) -> dict[str, Any]:
+    _require_admin(principal)
+    with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
+        row = connection.execute(
+            "SELECT * FROM ai_annotation_campaigns WHERE public_id::text=%s FOR UPDATE",
+            (public_id,),
+        ).fetchone()
+        if row is None:
+            raise LookupError("AI annotation campaign not found")
+        validate_transition(str(row["status"]), target)
+        updated = connection.execute(
+            "UPDATE ai_annotation_campaigns SET status=%s WHERE id=%s RETURNING *",
+            (target, row["id"]),
+        ).fetchone()
+        assert updated is not None
+        return dict(updated)
+
+
+def _records_for_campaign(
+    connection: psycopg.Connection[dict[str, Any]], campaign_id: int
+) -> tuple[dict[str, Any], ...]:
+    rows = connection.execute(
+        """
+        SELECT turn.turn_key,turn.speech_date AS date,turn.chamber,turn.speaker_name_raw,
+               turn.major_heading_original,turn.minor_heading_original,turn.business_type,
+               turn.text_clean,turn.text_raw
+        FROM ai_annotation_campaign_records record
+        JOIN speaker_turns turn ON turn.id=record.speaker_turn_id
+        WHERE record.campaign_id=%s ORDER BY record.selection_order
+        """,
+        (campaign_id,),
+    ).fetchall()
+    return tuple(production_record_from_turn(dict(row)) for row in rows)
+
+
+def _provider_plan(campaign: dict[str, Any], records: tuple[dict[str, Any], ...]) -> dict[str, Any]:
+    codebook = production_codebook()
+    context = cast(dict[str, Any], codebook["context"])
+    system_prompt = build_system_prompt(context, str(campaign["prompt_version"]))
+    if prompt_hash(system_prompt) != campaign["prompt_sha256"]:
+        raise CampaignError("assembled prompt no longer matches frozen campaign provenance")
+    domain_codes = tuple(label.code for label in codebook["taxonomy"].labels)
+    schema = prediction_json_schema(domain_codes)
+    pricing = load_pricing(ROOT / "config/llm_eval/pricing.yaml")
+    pricing_entry = pricing["models"][f"gemini:{campaign['configured_model']}"]
+    request = build_batch_create_request(
+        model=str(campaign["configured_model"]),
+        system_prompt=system_prompt,
+        records=records,
+        schema=schema,
+        display_name=f"phase4d-{campaign['public_id']}",
+        cached_content=campaign["cache_identifier"],
+        generation=campaign["generation_config"],
+    )
+    provenance = {
+        "provider": campaign["provider"],
+        "model": campaign["configured_model"],
+        "prompt_version": campaign["prompt_version"],
+        "assembled_prompt_sha256": campaign["prompt_sha256"],
+        "canonical_schema_sha256": campaign["canonical_schema_sha256"],
+        "prediction_contract_sha256": campaign["prediction_contract_sha256"],
+        "provider_schema_sha256": campaign["provider_schema_sha256"],
+        **campaign["generation_config"],
+        "execution_mode": campaign["execution_mode"],
+        "cached_content": campaign["cache_identifier"],
+        "record_count": len(records),
+        "record_ids_sha256": canonical_hash([record["record_id"] for record in records]),
+        "pricing_format_version": 1,
+        "pricing_effective_date": pricing_entry.get(
+            "effective_date", pricing.get("effective_date")
+        ),
+    }
+    plan = {"provenance": provenance, "request": request}
+    validate_production_plan(plan)
+    if provenance["record_ids_sha256"] != campaign["record_set_sha256"]:
+        raise CampaignError("stored record set no longer matches campaign plan")
+    if canonical_hash(schema) != campaign["prediction_contract_sha256"]:
+        raise CampaignError("prediction contract no longer matches campaign")
+    if canonical_hash(gemini_batch_schema(schema)) != campaign["provider_schema_sha256"]:
+        raise CampaignError("provider schema no longer matches campaign")
+    return plan
+
+
+def _persist_cache_fields(
+    connection: psycopg.Connection[dict[str, Any]],
+    campaign_id: int,
+    fields: dict[str, Any],
+) -> dict[str, Any]:
+    updated = connection.execute(
+        """
+        UPDATE ai_annotation_campaigns SET
+          cache_status=%s,cache_identifier=%s,cache_content_sha256=%s,
+          cache_model=%s,cache_display_name=%s,cache_created_at=%s,
+          cache_expires_at=%s,cache_verified_at=%s,cache_metadata=%s
+        WHERE id=%s AND status='READY' AND provider_job_id IS NULL RETURNING *
+        """,
+        (
+            fields["cache_status"],
+            fields["cache_identifier"],
+            fields["cache_content_sha256"],
+            fields["cache_model"],
+            fields["cache_display_name"],
+            fields["cache_created_at"],
+            fields["cache_expires_at"],
+            fields["cache_verified_at"],
+            Jsonb(fields["cache_metadata"]),
+            campaign_id,
+        ),
+    ).fetchone()
+    if updated is None:
+        raise CampaignError("campaign changed while cache provenance was being persisted")
+    return dict(updated)
+
+
+def _mark_cache_unavailable(
+    settings: WebSettings, campaign_id: int, reason: str
+) -> None:
+    with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
+        connection.execute(
+            """
+            UPDATE ai_annotation_campaigns SET cache_status='UNAVAILABLE',
+              failure_metadata=failure_metadata || %s
+            WHERE id=%s AND status='READY' AND provider_job_id IS NULL
+            """,
+            (Jsonb({"cache_error": reason[:1000]}), campaign_id),
+        )
+
+
+def require_current_ai_selection(campaign: dict[str, Any]) -> None:
+    selection = campaign.get("selection_definition")
+    rule = selection.get("eligibility_rule") if isinstance(selection, dict) else None
+    if rule != AI_ELIGIBILITY_RULE:
+        raise CampaignError(
+            "campaign uses the legacy main-analysis eligibility rule; create and plan "
+            "a new campaign before paid submission"
+        )
+
+
+def ensure_campaign_cache(
+    settings: WebSettings,
+    principal: Principal,
+    public_id: str,
+    *,
+    gateway: GeminiGateway | None = None,
+) -> dict[str, Any]:
+    """Verify a locally-bound cache or create it only inside the paid submission path."""
+    _require_admin(principal)
+    provider = gateway or LiveGeminiGateway()
+    with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
+        row = connection.execute(
+            "SELECT * FROM ai_annotation_campaigns WHERE public_id::text=%s FOR UPDATE",
+            (public_id,),
+        ).fetchone()
+        if row is None:
+            raise LookupError("AI annotation campaign not found")
+        campaign = dict(row)
+        if campaign["status"] != "READY" or campaign["provider_job_id"] is not None:
+            raise CampaignError("campaign is not ready for cache preparation")
+        if configuration_class(campaign) != "APPROVED_PRODUCTION":
+            raise CampaignError("cache preparation requires the approved production configuration")
+        require_current_ai_selection(campaign)
+        cache_plan = _canonical_cache_plan(campaign)
+        if campaign.get("cache_status") == "CREATING":
+            raise CampaignError("cache preparation is already in progress")
+        if cache_plan_status(campaign) == "REUSABLE":
+            identifier = str(campaign["cache_identifier"])
+            try:
+                resource = provider.get_cache(identifier)
+            except ValueError as error:
+                if "HTTP 404" not in str(error):
+                    raise CampaignError(f"Gemini cache verification failed: {error}") from error
+            else:
+                try:
+                    fields = _cache_resource_fields(
+                        resource, cache_plan, now=datetime.now(UTC)
+                    )
+                    if fields["cache_identifier"] != identifier:
+                        raise CampaignError("Gemini returned a different cache identifier")
+                except CampaignError:
+                    pass
+                else:
+                    return _persist_cache_fields(connection, int(campaign["id"]), fields)
+        reserved = connection.execute(
+            """
+            UPDATE ai_annotation_campaigns SET cache_status='CREATING'
+            WHERE id=%s AND status='READY' AND provider_job_id IS NULL
+              AND cache_status<>'CREATING' RETURNING *
+            """,
+            (campaign["id"],),
+        ).fetchone()
+        if reserved is None:
+            raise CampaignError("cache preparation could not be reserved")
+
+    try:
+        resource = provider.create_cache(cast(dict[str, Any], cache_plan["request"]))
+        fields = _cache_resource_fields(resource, cache_plan, now=datetime.now(UTC))
+    except Exception as error:
+        _mark_cache_unavailable(settings, int(campaign["id"]), str(error))
+        if isinstance(error, CampaignError):
+            raise
+        raise CampaignError(f"Gemini cache creation failed: {error}") from error
+
+    with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
+        row = connection.execute(
+            "SELECT * FROM ai_annotation_campaigns WHERE id=%s FOR UPDATE",
+            (campaign["id"],),
+        ).fetchone()
+        if row is None or row["cache_status"] != "CREATING":
+            raise CampaignError("campaign cache reservation was lost")
+        return _persist_cache_fields(connection, int(campaign["id"]), fields)
+
+
+def submit_campaign(
+    settings: WebSettings,
+    principal: Principal,
+    public_id: str,
+    confirmation: str,
+    *,
+    gateway: GeminiGateway | None = None,
+) -> dict[str, Any]:
+    _require_admin(principal)
+    if confirmation != PAID_CONFIRMATION:
+        raise CampaignError(f"paid submission requires typing {PAID_CONFIRMATION}")
+    provider = gateway or LiveGeminiGateway()
+    ensure_campaign_cache(settings, principal, public_id, gateway=provider)
+    with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
+        campaign_row = connection.execute(
+            "SELECT * FROM ai_annotation_campaigns WHERE public_id::text=%s FOR UPDATE",
+            (public_id,),
+        ).fetchone()
+        if campaign_row is None:
+            raise LookupError("AI annotation campaign not found")
+        campaign = dict(campaign_row)
+        if campaign["status"] != "READY" or campaign["provider_job_id"] is not None:
+            raise CampaignError("campaign is not ready for a first submission")
+        if configuration_class(campaign) != "APPROVED_PRODUCTION":
+            raise CampaignError("paid submission is restricted to the approved production configuration")
+        if cache_plan_status(campaign) != "REUSABLE" or campaign.get("cache_status") != "REUSABLE":
+            raise CampaignError("approved production submission requires a verified live cache")
+        records = _records_for_campaign(connection, int(campaign["id"]))
+        if len(records) != int(campaign["planned_count"]):
+            raise CampaignError("stored campaign record count differs from the approved plan")
+        plan = _provider_plan(campaign, records)
+        provider_job_id = provider.submit(plan, str(campaign["configured_model"]))
+        updated = connection.execute(
+            """
+            UPDATE ai_annotation_campaigns SET status='SUBMITTED',provider_job_id=%s,
+                   provider_state='BATCH_STATE_PENDING',submitted_at=now()
+            WHERE id=%s AND provider_job_id IS NULL AND status='READY' RETURNING *
+            """,
+            (provider_job_id, campaign["id"]),
+        ).fetchone()
+        if updated is None:
+            raise CampaignError("campaign submission identity could not be persisted")
+        return dict(updated)
+
+
+def refresh_campaign(
+    settings: WebSettings,
+    principal: Principal,
+    public_id: str,
+    *,
+    gateway: GeminiGateway | None = None,
+) -> dict[str, Any]:
+    _require_admin(principal)
+    provider = gateway or LiveGeminiGateway()
+    with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
+        campaign = connection.execute(
+            "SELECT * FROM ai_annotation_campaigns WHERE public_id::text=%s FOR UPDATE",
+            (public_id,),
+        ).fetchone()
+        if campaign is None:
+            raise LookupError("AI annotation campaign not found")
+        job = campaign["provider_job_id"]
+        if not isinstance(job, str):
+            raise CampaignError("campaign has no provider job to refresh")
+        status = parse_batch_status(provider.status(job))
+        provider_state = str(status["state"])
+        if status["successful_terminal"]:
+            target = "PROVIDER_COMPLETED"
+        elif status["terminal"]:
+            target = "FAILED"
+        else:
+            target = "RUNNING"
+        current = str(campaign["status"])
+        if current != target:
+            validate_transition(current, target)
+        updated = connection.execute(
+            """
+            UPDATE ai_annotation_campaigns SET status=%s,provider_state=%s,
+              provider_success_count=%s,provider_failure_count=%s,
+              provider_completed_at=CASE WHEN %s THEN COALESCE(provider_completed_at,now())
+                                         ELSE provider_completed_at END,
+              failure_metadata=CASE WHEN %s THEN %s ELSE failure_metadata END
+            WHERE id=%s RETURNING *
+            """,
+            (
+                target,
+                provider_state,
+                status["successful_count"],
+                status["failed_count"],
+                bool(status["terminal"]),
+                target == "FAILED",
+                Jsonb({"provider_error": status["error"]}),
+                campaign["id"],
+            ),
+        ).fetchone()
+        assert updated is not None
+        return dict(updated)
+
+
+def _artifact_directory(public_id: str) -> Path:
+    root = Path(os.getenv("HANSARD_CAMPAIGN_ARTIFACT_ROOT", ROOT / "data/review/phase4d"))
+    root = root.resolve()
+    target = (root / f"campaign-{public_id}").resolve()
+    if target.parent != root:
+        raise CampaignError("unsafe campaign artifact path")
+    return target
+
+
+def collect_campaign(
+    settings: WebSettings,
+    principal: Principal,
+    public_id: str,
+    *,
+    gateway: GeminiGateway | None = None,
+) -> dict[str, Any]:
+    _require_admin(principal)
+    provider = gateway or LiveGeminiGateway()
+    with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
+        campaign_row = connection.execute(
+            "SELECT * FROM ai_annotation_campaigns WHERE public_id::text=%s FOR UPDATE",
+            (public_id,),
+        ).fetchone()
+        if campaign_row is None:
+            raise LookupError("AI annotation campaign not found")
+        campaign = dict(campaign_row)
+        if campaign["status"] == "COLLECTED" and campaign["artifact_reference"]:
+            return campaign
+        if campaign["status"] != "PROVIDER_COMPLETED":
+            raise CampaignError("campaign provider job is not ready for collection")
+        records = _records_for_campaign(connection, int(campaign["id"]))
+        plan = _provider_plan(campaign, records)
+        batch_value = provider.status(str(campaign["provider_job_id"]))
+        domain_codes = tuple(label.code for label in production_codebook()["taxonomy"].labels)
+        results, coverage = collect_inline_batch(
+            batch_value=batch_value,
+            plan=plan,
+            domain_codes=domain_codes,
+        )
+        for result in results:
+            result.update(
+                provider=campaign["provider"],
+                configured_model=campaign["configured_model"],
+                prompt_version=campaign["prompt_version"],
+                prompt_sha256=campaign["prompt_sha256"],
+                schema_sha256=campaign["canonical_schema_sha256"],
+                execution_mode=campaign["execution_mode"],
+                cache_identifier=campaign["cache_identifier"],
+                batch_id=campaign["provider_job_id"],
+                pricing_effective_date=plan["provenance"]["pricing_effective_date"],
+            )
+            result.update(campaign["generation_config"])
+        pricing = load_pricing(ROOT / "config/llm_eval/pricing.yaml")
+        summary = _collection_summary(batch_value, plan, results, coverage, pricing, None)
+        directory = _artifact_directory(public_id)
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "plan.json").write_text(
+            json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        (directory / "predictions.jsonl").write_text(
+            "".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in results),
+            encoding="utf-8",
+        )
+        failures = [row for row in results if row.get("status") != "success"]
+        if failures:
+            (directory / "failures.jsonl").write_text(
+                "".join(
+                    json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
+                    for row in failures
+                ),
+                encoding="utf-8",
+            )
+        (directory / "operational_summary.json").write_text(
+            json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        artifact_sha256 = hashlib.sha256(
+            (directory / "operational_summary.json").read_bytes()
+            + (directory / "predictions.jsonl").read_bytes()
+        ).hexdigest()
+        updated = connection.execute(
+            """
+            UPDATE ai_annotation_campaigns SET status='COLLECTED',artifact_reference=%s,
+              artifact_sha256=%s,collected_at=now(),provider_success_count=%s,
+              provider_failure_count=%s,valid_count=%s,invalid_count=%s,
+              operational_metadata=%s
+            WHERE id=%s RETURNING *
+            """,
+            (
+                str(directory),
+                artifact_sha256,
+                summary["coverage"]["successful_provider_responses"],
+                summary["coverage"]["failed_provider_responses"],
+                summary["coverage"]["valid_structured_predictions"],
+                summary["coverage"]["invalid_structured_predictions"],
+                Jsonb(
+                    {
+                        "provider_status": summary["batch_status"],
+                        "coverage": summary["coverage"],
+                        "tokens": summary["tokens"],
+                        "cost": summary["cost"],
+                    }
+                ),
+                campaign["id"],
+            ),
+        ).fetchone()
+        assert updated is not None
+        return dict(updated)
+
+
+def validate_campaign(
+    settings: WebSettings, principal: Principal, public_id: str
+) -> dict[str, Any]:
+    _require_admin(principal)
+    with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
+        campaign = connection.execute(
+            "SELECT * FROM ai_annotation_campaigns WHERE public_id::text=%s FOR UPDATE",
+            (public_id,),
+        ).fetchone()
+        if campaign is None:
+            raise LookupError("AI annotation campaign not found")
+        if campaign["status"] == "VALIDATED":
+            return dict(campaign)
+        if campaign["status"] != "COLLECTED":
+            raise CampaignError("campaign results have not been collected")
+        directory = Path(str(campaign["artifact_reference"]))
+        summary, rows, artifact_hash = load_prediction_artifact(directory)
+        coverage = summary["coverage"]
+        if len(rows) != int(campaign["planned_count"]):
+            raise CampaignError("validated result coverage does not equal planned records")
+        if coverage.get("missing_responses") or coverage.get("duplicate_mappings"):
+            raise CampaignError("missing or duplicate provider mappings block import")
+        updated = connection.execute(
+            """
+            UPDATE ai_annotation_campaigns SET status='VALIDATED',validated_at=now(),
+              artifact_sha256=%s,valid_count=%s,invalid_count=%s
+            WHERE id=%s RETURNING *
+            """,
+            (artifact_hash, len(rows), coverage["invalid_structured_predictions"], campaign["id"]),
+        ).fetchone()
+        assert updated is not None
+        return dict(updated)
+
+
+def import_campaign(
+    settings: WebSettings, principal: Principal, public_id: str
+) -> dict[str, Any]:
+    _require_admin(principal)
+    with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
+        campaign = connection.execute(
+            "SELECT * FROM ai_annotation_campaigns WHERE public_id::text=%s FOR UPDATE",
+            (public_id,),
+        ).fetchone()
+        if campaign is None:
+            raise LookupError("AI annotation campaign not found")
+        if campaign["status"] == "IMPORTED":
+            return dict(campaign)
+        if campaign["status"] != "VALIDATED" or campaign["model_prediction_run_id"] is not None:
+            raise CampaignError("campaign is not ready for a first prediction import")
+        artifact = Path(str(campaign["artifact_reference"]))
+        result = import_predictions(artifact, settings.database, dry_run=False)
+        run = connection.execute(
+            "SELECT id FROM model_prediction_runs WHERE artifact_sha256=%s",
+            (result["artifact_sha256"],),
+        ).fetchone()
+        if run is None:
+            raise CampaignError("prediction importer did not produce a linked run")
+        updated = connection.execute(
+            """
+            UPDATE ai_annotation_campaigns SET status='IMPORTED',imported_at=now(),
+                   model_prediction_run_id=%s
+            WHERE id=%s AND model_prediction_run_id IS NULL RETURNING *
+            """,
+            (run["id"], campaign["id"]),
+        ).fetchone()
+        if updated is None:
+            raise CampaignError("campaign was already linked during import")
+        return dict(updated)
+
+
+def credential_status() -> dict[str, dict[str, object]]:
+    return {
+        "gemini": {
+            "name": "Gemini",
+            "configured": bool(
+                os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+            ),
+            "environment_variables": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+            "purpose": "Required for approved production campaigns, cache creation, and paid Gemini Batch execution.",
+        },
+        "openai": {
+            "name": "OpenAI",
+            "configured": bool(os.environ.get("OPENAI_API_KEY")),
+            "environment_variables": ("OPENAI_API_KEY",),
+            "purpose": "Required for research configurations only; not used by this campaign configuration.",
+        },
+    }

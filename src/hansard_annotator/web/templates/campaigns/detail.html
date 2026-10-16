@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+{% from "components/macros.html" import badge, csrf %}
+{% block title %}{{ campaign.name }} · AI Annotation{% endblock %}
+{% block content %}
+<nav class="breadcrumbs"><a href="/ai-annotation">AI Annotation</a><span>/</span><span>{{ campaign.name }}</span></nav>
+<div class="mt-5 flex flex-wrap items-start justify-between gap-4">
+  <div>{{ badge(campaign.status) }}<h1 class="mt-3 text-4xl font-semibold">{{ campaign.name }}</h1><p class="mt-2 text-muted">{{ campaign.corpus_name }}</p></div>
+  {% if campaign.run_public_id %}<a class="btn btn-primary" href="/ai-reviews?status=unreviewed&run_id={{ campaign.run_public_id }}">Start reviewing</a>{% endif %}
+</div>
+{% if notice_message %}<div class="alert alert-success mt-5" role="status">{{ notice_message }}</div>{% endif %}
+
+<section class="surface mt-7 p-6">
+  <div class="flex flex-wrap items-start justify-between gap-4"><div><p class="eyebrow">Configuration</p><h2 class="mt-1 text-2xl font-semibold">{% if campaign.configured_model == 'gemini-3.1-flash-lite' %}Gemini 3.1 Flash-Lite{% elif campaign.configured_model == 'gemini-2.5-flash' %}Gemini 2.5 Flash{% else %}{{ campaign.configured_model }}{% endif %} · frozen V2</h2></div><span class="badge badge-active">{{ campaign.configuration_class|replace('_',' ') }}</span></div>
+  <dl class="metadata mt-5">
+    <div><dt>Provider / model</dt><dd>Gemini / {{ campaign.configured_model }}</dd></div>
+    <div><dt>Prompt</dt><dd>{{ campaign.prompt_version }} (frozen)</dd></div>
+    {% if campaign.generation_config.get('thinking_level') %}<div><dt>Thinking</dt><dd>{{ campaign.generation_config.get('thinking_level') }}</dd></div>{% else %}<div><dt>Thinking budget</dt><dd>{{ campaign.generation_config.get('thinking_budget', 'Provider default') }}</dd></div>{% endif %}
+    <div><dt>Execution</dt><dd>Batch API with explicit Gemini cache</dd></div>
+    <div><dt>Credential</dt><dd>{{ 'Configured' if credentials.gemini.configured else 'Not configured' }} via <code>GEMINI_API_KEY</code> or <code>GOOGLE_API_KEY</code></dd></div>
+  </dl>
+  <p class="mt-3 text-sm text-muted">Credential values stay in the server environment and are never rendered or stored with the campaign. Displaying this status makes no provider request.</p>
+  <details class="provenance mt-5"><summary>Technical provenance and hashes</summary><dl class="metadata mt-3"><div><dt>Prompt SHA256</dt><dd class="hash">{{ campaign.prompt_sha256 }}</dd></div><div><dt>Canonical schema SHA256</dt><dd class="hash">{{ campaign.canonical_schema_sha256 }}</dd></div><div><dt>Prediction contract SHA256</dt><dd class="hash">{{ campaign.prediction_contract_sha256 }}</dd></div><div><dt>Provider schema SHA256</dt><dd class="hash">{{ campaign.provider_schema_sha256 }}</dd></div><div><dt>Record-set SHA256</dt><dd class="hash">{{ campaign.record_set_sha256 or 'Available after planning' }}</dd></div></dl></details>
+</section>
+
+<section class="surface mt-7 p-6">
+  <p class="eyebrow">Selection</p>
+  {% if campaign.status == 'DRAFT' %}
+  <h2 class="mt-1 text-2xl font-semibold">Choose records</h2>
+  <p class="mt-2 text-muted">Planning queries the local database, applies exclusions once, and creates a deterministic record set. It does not contact Gemini.</p>
+  <form method="post" action="/ai-annotation/{{ campaign.public_id }}/plan" class="mt-5 grid gap-4 sm:grid-cols-2" data-progress-form>
+    {{ csrf(principal) }}
+    <div><label for="planned">Planned records</label><input id="planned" type="number" name="planned_count" min="1" max="200000" value="10" required></div>
+    <div><label for="seed">Deterministic seed</label><input id="seed" name="seed" value="phase4d-production-v2" required></div>
+    <input type="hidden" name="exclude_human_annotated" value="false">
+    <label class="compact-check sm:col-span-2" for="exclude-human-annotated">
+      <input id="exclude-human-annotated" type="checkbox" name="exclude_human_annotated" value="true" checked>
+      <span>Exclude already human-annotated turns <small class="mt-1 block font-normal text-muted">Recommended default. Clear this only when you intentionally want AI predictions for records that already have submitted or revised human annotations.</small></span>
+    </label>
+    <button class="btn btn-primary sm:col-span-2" type="submit" data-progress-text="Planning...">Plan campaign — no provider call</button>
+  </form>
+  {% else %}
+  <h2 class="mt-1 text-2xl font-semibold">Deterministic record plan</h2>
+  {% set selection = campaign.selection_definition or {} %}
+  <div class="stats-grid mt-5">
+    <article class="stat"><span>Corpus total</span><strong>{{ campaign.corpus_total_count }}</strong></article>
+    <article class="stat"><span>Already human annotated (exclusive)</span><strong>{{ selection.get('excluded_human_annotated_count', 0) }}</strong></article>
+    <article class="stat"><span>Same-config excluded</span><strong>{{ campaign.excluded_existing_prediction_count }}</strong></article>
+    <article class="stat"><span>Other exclusions</span><strong>{{ campaign.excluded_other_count }}</strong></article>
+    <article class="stat"><span>Eligible</span><strong>{{ campaign.eligible_count }}</strong></article>
+    <article class="stat"><span>Planned</span><strong>{{ campaign.planned_count }}</strong></article>
+  </div>
+  <p class="mt-4 text-sm text-muted">Exclusion buckets are mutually exclusive: same-configuration predictions take precedence, then human annotations, then other eligibility rules. The corpus contains {{ selection.get('human_annotated_count', 0) }} human-annotated turns; {{ selection.get('human_prediction_overlap_count', 0) }} also had same-configuration predictions and are counted only in that bucket.</p>
+  {% if campaign.other_exclusion_details %}<div class="mt-4 rounded-xl border bg-slate-50 p-4"><h3 class="font-semibold">Other exclusions breakdown</h3><dl class="metadata mt-2">{% for reason in campaign.other_exclusion_details %}<div><dt>{{ reason.label }}</dt><dd>{{ reason.count }}</dd></div>{% endfor %}</dl>{% if not campaign.selection_current %}<p class="mt-2 text-sm text-muted">Legacy reasons are mutually exclusive in this order: indeterminate business mapping, fewer than 50 words, unknown speaker, collective speaker, procedural business, ceremonial business, then orphan continuation. Each turn is assigned to its first applicable reason.</p>{% endif %}</div>{% endif %}
+  {% if not campaign.selection_current %}<div class="alert alert-error mt-4"><strong>Legacy selection rule.</strong> This stored plan used the narrower main-analysis eligibility flag and cannot be submitted. Create and plan a new campaign to use corpus-wide, content-neutral AI eligibility.</div>{% endif %}
+  <dl class="metadata mt-4"><div><dt>Human exclusion</dt><dd>{{ 'Enabled' if selection.get('exclude_human_annotated') else 'Disabled' }}</dd></div><div><dt>Seed</dt><dd>{{ selection.get('seed', 'Not available') }}</dd></div><div><dt>Ordering</dt><dd>{{ selection.get('ordering', 'Not available') }}</dd></div></dl>
+  <h3 class="mt-6 font-semibold">Record preview</h3>
+  <div class="mt-3 divide-y">{% for row in campaign.preview %}<article class="py-3"><strong>{{ row.record_id }}</strong><p class="text-sm text-muted">{{ row.speaker_name_raw or 'Unknown speaker' }} · {{ row.speech_date }} · {{ row.major_heading_original }}</p><p class="mt-1 line-clamp-2">{{ row.text_clean }}</p></article>{% endfor %}</div>
+  {% endif %}
+</section>
+
+{% if campaign.status != 'DRAFT' %}
+<section class="surface mt-7 p-6">
+  <p class="eyebrow">Cost estimate</p><h2 class="mt-1 text-2xl font-semibold">Batch processing estimate</h2>
+  <dl class="metadata mt-5"><div><dt>Input / cached / uncached tokens</dt><dd>{{ campaign.estimated_input_tokens }} / {{ campaign.estimated_cached_input_tokens }} / {{ campaign.estimated_uncached_input_tokens }}</dd></div><div><dt>Estimated output tokens</dt><dd>{{ campaign.estimated_output_tokens }}</dd></div><div><dt>Processing estimate</dt><dd>USD {{ campaign.estimated_processing_cost_usd }}</dd></div><div><dt>Cache storage estimate</dt><dd>USD {{ campaign.estimated_cache_storage_cost_usd }}</dd></div><div><dt>Combined estimate</dt><dd><strong>USD {{ campaign.estimated_total_cost_usd }}</strong></dd></div></dl>
+</section>
+{% endif %}
+
+<section class="surface mt-7 p-6">
+  <p class="eyebrow">Cache</p><h2 class="mt-1 text-2xl font-semibold">Explicit Gemini cache</h2>
+  <dl class="metadata mt-5"><div><dt>Planning status</dt><dd>{{ campaign.cache_plan_status }}</dd></div><div><dt>Identifier</dt><dd>{{ campaign.cache_identifier or 'Created or verified only during confirmed submission' }}</dd></div><div><dt>Model</dt><dd>{{ campaign.cache_model or ('models/' ~ campaign.configured_model) }}</dd></div><div><dt>Created / expires</dt><dd>{{ campaign.cache_created_at or 'Not created' }} / {{ campaign.cache_expires_at or 'Not available' }}</dd></div></dl>
+  <p class="mt-3 text-sm text-muted">Planning never contacts Gemini. Confirmed submission verifies a compatible reusable cache or creates the canonical frozen V2 cache before the paid Batch job.</p>
+  <details class="provenance mt-4"><summary>Cache provenance</summary><dl class="metadata mt-3"><div><dt>Content SHA256</dt><dd class="hash">{{ campaign.cache_content_sha256 or campaign.prompt_sha256 }}</dd></div><div><dt>Verified</dt><dd>{{ campaign.cache_verified_at or 'Not yet verified' }}</dd></div></dl></details>
+</section>
+
+{% include "campaigns/_provider_status.html" %}
+
+<section class="surface mt-7 p-6">
+  <p class="eyebrow">Validation and import</p><h2 class="mt-1 text-2xl font-semibold">Local integrity checks</h2>
+  <div class="mt-5 flex flex-wrap gap-3">{% if campaign.status == 'COLLECTED' %}<form method="post" action="/ai-annotation/{{ campaign.public_id }}/validate" data-progress-form>{{ csrf(principal) }}<button class="btn btn-primary" data-progress-text="Validating...">Validate results locally</button></form>{% elif campaign.status == 'VALIDATED' %}<form method="post" action="/ai-annotation/{{ campaign.public_id }}/import" data-progress-form>{{ csrf(principal) }}<button class="btn btn-primary" data-progress-text="Importing...">Import immutable predictions</button></form>{% endif %}</div>
+  <dl class="metadata mt-5"><div><dt>Collected / validated / imported</dt><dd>{{ campaign.collected_at or 'Not yet' }} / {{ campaign.validated_at or 'Not yet' }} / {{ campaign.imported_at or 'Not yet' }}</dd></div><div><dt>Valid / invalid</dt><dd>{{ campaign.valid_count }} / {{ campaign.invalid_count }}</dd></div><div><dt>Imported run</dt><dd>{{ campaign.run_public_id or 'Not imported' }}</dd></div></dl>
+  {% set coverage = campaign.operational_metadata.get('coverage', {}) %}{% set tokens = campaign.operational_metadata.get('tokens', {}) %}{% set cost = campaign.operational_metadata.get('cost', {}) %}
+  {% if coverage %}<h3 class="mt-6 font-semibold">Collected operational results</h3><dl class="metadata mt-3"><div><dt>Planned / returned</dt><dd>{{ coverage.get('planned_requests', 0) }} / {{ coverage.get('collected_responses', 0) }}</dd></div><div><dt>Missing / duplicate</dt><dd>{{ coverage.get('missing_responses', 0) }} / {{ coverage.get('duplicate_mappings', 0) }}</dd></div><div><dt>Actual input / cached / output / reasoning tokens</dt><dd>{{ tokens.get('input_tokens', 0) }} / {{ tokens.get('cached_input_tokens', 0) }} / {{ tokens.get('output_tokens', 0) }} / {{ tokens.get('reasoning_tokens', 0) }}</dd></div><div><dt>Actual processing / cache / total cost</dt><dd>USD {{ cost.get('token_processing_cost_usd', 0) }} / {{ cost.get('explicit_cache_storage_cost_usd', 0) }} / {{ cost.get('total_pilot_cost_usd', 0) }}</dd></div></dl>{% endif %}
+</section>
+{% endblock %}

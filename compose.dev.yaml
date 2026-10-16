@@ -28,6 +28,9 @@ services:
     environment:
       HANSARD_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       HANSARD_PROCESSED_DATA_ROOT: /app/data/processed
+      HANSARD_CAMPAIGN_ARTIFACT_ROOT: /var/lib/hansard-campaign-artifacts
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
       HANSARD_APP_ENV: development
       HANSARD_SESSION_SECRET: ${HANSARD_SESSION_SECRET:-}
       HANSARD_COOKIE_SECURE: "false"
@@ -50,6 +53,8 @@ services:
         condition: service_healthy
     volumes:
       - ./src:/app/src:ro
+      - hansard-campaign-artifacts:/var/lib/hansard-campaign-artifacts
 
 volumes:
   hansard-postgres-data:
+  hansard-campaign-artifacts:

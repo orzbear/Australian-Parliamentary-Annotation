@@ -315,6 +315,7 @@ def test_model_specific_pricing_metadata_is_reported() -> None:
     ("provider", "model", "expected"),
     (
         ("gemini", "gemini-2.5-flash-lite", 0.10),
+        ("gemini", "gemini-3.1-flash-lite", 0.25),
         ("gemini", "gemini-3.5-flash-lite", 0.30),
         ("openai", "gpt-5.4-mini", 0.75),
     ),

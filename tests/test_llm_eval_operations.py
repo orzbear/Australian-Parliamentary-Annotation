@@ -5,6 +5,8 @@ from typing import Any
 import pytest
 
 from hansard_annotator.llm_eval.operations import (
+    APPROVED_PRODUCTION_GENERATION,
+    APPROVED_PRODUCTION_MODEL,
     FROZEN_CANONICAL_SCHEMA_SHA256,
     FROZEN_MODEL,
     FROZEN_PROMPT_SHA256,
@@ -125,6 +127,44 @@ def test_batch_preserves_schema_thinking_prompt_and_record_mapping() -> None:
     cached_request = cached["batch"]["input_config"]["requests"]["requests"][0]["request"]
     assert cached_request["cachedContent"] == "cachedContents/fixture"
     assert "systemInstruction" not in cached_request
+
+
+def test_gemini_31_batch_uses_minimal_level_without_thinking_budget() -> None:
+    schema = prediction_json_schema(("AU01", "AU_OTHER_REVIEW"))
+    payload = build_batch_create_request(
+        model=APPROVED_PRODUCTION_MODEL,
+        system_prompt="frozen-system",
+        records=(_record(1),),
+        schema=schema,
+        display_name="production",
+        cached_content="cachedContents/gemini31",
+        generation=APPROVED_PRODUCTION_GENERATION,
+    )
+    request = payload["batch"]["input_config"]["requests"]["requests"][0]["request"]
+    assert request["generationConfig"]["thinkingConfig"] == {
+        "thinkingLevel": "minimal"
+    }
+    assert "thinkingBudget" not in request["generationConfig"]["thinkingConfig"]
+
+    plan = {
+        "provenance": {
+            "model": APPROVED_PRODUCTION_MODEL,
+            "prompt_version": FROZEN_PROMPT_VERSION,
+            "assembled_prompt_sha256": FROZEN_PROMPT_SHA256,
+            "canonical_schema_sha256": FROZEN_CANONICAL_SCHEMA_SHA256,
+            "thinking_level": "minimal",
+            "cached_content": "cachedContents/gemini31",
+            "provider_schema_sha256": canonical_hash(
+                request["generationConfig"]["responseSchema"]
+            ),
+        },
+        "request": payload,
+    }
+    validate_production_plan(plan)
+
+    plan["provenance"]["thinking_budget"] = 0
+    with pytest.raises(ValueError, match="thinking configuration"):
+        validate_production_plan(plan)
 
 
 def test_cache_request_and_batch_mapping_recovery_guards() -> None:

@@ -39,11 +39,11 @@
     {% endif %}
   </section>
   <section class="surface p-6">
-    <p class="eyebrow">Projects</p><h2 class="mt-1 text-2xl font-semibold">Your studies</h2>
+    <p class="eyebrow">Human Annotation</p><h2 class="mt-1 text-2xl font-semibold">Your annotation workspaces</h2>
     <div class="mt-5 space-y-3">
       {% for project in projects %}
       <a class="project-mini" href="/projects/{{ project.id }}"><div><strong>{{ project.name }}</strong><p>Schema {{ project.schema_version }} · {{ project.submitted_count }} / {{ project.task_count }} submitted · {{ project.run_name }}</p></div>{{ badge(project.status) }}</a>
-      {% else %}<div class="empty-state"><p>No projects are assigned.</p></div>{% endfor %}
+      {% else %}<div class="empty-state"><p>No human annotation workspaces are assigned.</p></div>{% endfor %}
     </div>
   </section>
 </div>

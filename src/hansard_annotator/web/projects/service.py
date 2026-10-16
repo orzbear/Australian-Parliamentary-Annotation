@@ -29,7 +29,10 @@ def list_projects(
                    source.name AS source_project_name,
                    (SELECT count(*) FROM tasks t WHERE t.project_id=p.id) AS task_count,
                    (SELECT count(*) FROM tasks t
-                    WHERE t.project_id=p.id AND t.status='submitted') AS submitted_count
+                    WHERE t.project_id=p.id AND t.status='submitted') AS submitted_count,
+                   work.total AS human_total,work.to_annotate AS human_to_annotate,
+                   work.in_progress AS human_in_progress,
+                   work.completed AS human_completed,work.skipped AS human_skipped
             FROM projects p
             LEFT JOIN projects source ON source.id=p.source_project_id
             JOIN corpora c ON c.id=p.corpus_id
@@ -38,12 +41,35 @@ def list_projects(
               ON asv.id=p.annotation_schema_version_id
             LEFT JOIN project_memberships pm
               ON pm.project_id=p.id AND pm.user_id=%s AND pm.status='active'
+            LEFT JOIN LATERAL (
+              SELECT count(*) AS total,
+                     count(*) FILTER (
+                       WHERE a.status IN ('assigned','claimed') AND an.id IS NULL
+                     ) AS to_annotate,
+                     count(*) FILTER (
+                       WHERE a.status<>'skipped'
+                         AND (an.status='draft' OR a.status='in_progress')
+                     ) AS in_progress,
+                     count(*) FILTER (
+                       WHERE an.status IN ('submitted','revised') OR a.status='submitted'
+                     ) AS completed,
+                     count(*) FILTER (WHERE a.status='skipped') AS skipped
+              FROM assignments a JOIN tasks t ON t.id=a.task_id
+              LEFT JOIN annotations an ON an.assignment_id=a.id
+              WHERE t.project_id=p.id AND a.status NOT IN ('withdrawn','flagged')
+                AND (%s OR pm.project_role<>'annotator' OR a.user_id=%s)
+            ) work ON true
             WHERE %s OR pm.id IS NOT NULL
             ORDER BY CASE p.status WHEN 'active' THEN 0 WHEN 'paused' THEN 1
                           WHEN 'draft' THEN 2 ELSE 3 END,
                      (p.source_project_id IS NOT NULL),p.updated_at DESC,p.id DESC
             """,
-            (principal.user_id, principal.is_admin),
+            (
+                principal.user_id,
+                principal.is_admin,
+                principal.user_id,
+                principal.is_admin,
+            ),
         ).fetchall()
         return [dict(row) for row in rows]
 
