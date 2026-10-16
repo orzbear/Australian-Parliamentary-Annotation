@@ -55,7 +55,12 @@ from hansard_annotator.web.auth.service import (
     revoke_session,
     set_user_enabled,
 )
-from hansard_annotator.web.campaigns.service import create_campaign
+from hansard_annotator.web.campaigns.service import (
+    create_campaign,
+    deterministic_selection,
+    other_exclusion_reason,
+    plan_campaign,
+)
 from hansard_annotator.web.config import WebSettings
 from hansard_annotator.web.exports.service import (
     build_ai_codebook_export,
@@ -1120,6 +1125,135 @@ def test_phase4d_migration_constraints_immutability_linkage_and_downgrade_guard(
     monkeypatch.setenv("HANSARD_DATABASE_URL", database_url)
     with pytest.raises(RuntimeError, match="downgrade refused"):
         command.downgrade(config, "20261009_06")
+
+
+def test_phase4d_planning_matches_historical_selection_and_rolls_back_atomically(
+    database_url: str, tmp_path: Path
+) -> None:
+    settings = _web_settings(database_url)
+    import_validated_run(
+        settings.database,
+        _fixture_run(tmp_path, run_id="phase4d-planning-fixture"),
+    )
+    password = "phase4d planning test password"
+    create_user(
+        settings,
+        "phase4d-planner",
+        "Phase 4D Planner",
+        password,
+        admin=True,
+        must_change_password=False,
+    )
+    admin, _ = authenticate(settings, "phase4d-planner", password)
+    url = database_url.replace("postgresql+psycopg://", "postgresql://")
+    with psycopg.connect(url, row_factory=dict_row) as connection:
+        corpus = connection.execute("SELECT id FROM corpora LIMIT 1").fetchone()
+        assert corpus is not None
+        source_rows = [
+            dict(row)
+            for row in connection.execute(
+                """
+                SELECT turn.id,turn.turn_key,turn.speech_date AS date,turn.chamber,
+                       turn.speaker_name_raw,turn.major_heading_original,
+                       turn.minor_heading_original,turn.business_type,
+                       turn.text_clean,turn.text_raw
+                FROM speaker_turns turn
+                JOIN reconstruction_runs reconstruction
+                  ON reconstruction.id=turn.reconstruction_run_id
+                JOIN corpora corpus ON corpus.current_preprocessing_run_id=
+                  reconstruction.preprocessing_run_id
+                WHERE corpus.id=%s
+                """,
+                (corpus["id"],),
+            ).fetchall()
+        ]
+    eligible = [row for row in source_rows if other_exclusion_reason(row) is None]
+    expected, expected_hash = deterministic_selection(
+        eligible, limit=10, seed="database-bounded"
+    )
+    assert len(expected) == 10
+
+    first = create_campaign(
+        settings, admin, name="Bounded planning one", corpus_id=corpus["id"]
+    )
+    second = create_campaign(
+        settings, admin, name="Bounded planning two", corpus_id=corpus["id"]
+    )
+    first_plan = plan_campaign(
+        settings,
+        admin,
+        str(first["public_id"]),
+        limit=10,
+        seed="database-bounded",
+        exclude_human_annotated=True,
+    )
+    second_plan = plan_campaign(
+        settings,
+        admin,
+        str(second["public_id"]),
+        limit=10,
+        seed="database-bounded",
+        exclude_human_annotated=True,
+    )
+    assert first_plan.campaign["planned_count"] == 10
+    assert first_plan.campaign["record_set_sha256"] == expected_hash
+    assert second_plan.campaign["record_set_sha256"] == expected_hash
+    with psycopg.connect(url, row_factory=dict_row) as connection:
+        first_records = connection.execute(
+            """
+            SELECT speaker_turn_id,record_id,selection_order
+            FROM ai_annotation_campaign_records
+            WHERE campaign_id=%s ORDER BY selection_order
+            """,
+            (first["id"],),
+        ).fetchall()
+        second_ids = [
+            row["record_id"]
+            for row in connection.execute(
+                """
+                SELECT record_id FROM ai_annotation_campaign_records
+                WHERE campaign_id=%s ORDER BY selection_order
+                """,
+                (second["id"],),
+            ).fetchall()
+        ]
+    expected_ids = [f"turn:{row['turn_key']}" for row in expected]
+    assert [row["record_id"] for row in first_records] == expected_ids
+    assert second_ids == expected_ids
+
+    interrupted = create_campaign(
+        settings, admin, name="Interrupted planning", corpus_id=corpus["id"]
+    )
+    with psycopg.connect(url) as connection:
+        connection.execute(
+            """
+            INSERT INTO ai_annotation_campaign_records
+              (campaign_id,speaker_turn_id,record_id,selection_order,record_sha256)
+            VALUES (%s,%s,'turn:preexisting',0,%s)
+            """,
+            (interrupted["id"], first_records[0]["speaker_turn_id"], "1" * 64),
+        )
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        plan_campaign(
+            settings,
+            admin,
+            str(interrupted["public_id"]),
+            limit=10,
+            seed="database-bounded",
+            exclude_human_annotated=True,
+        )
+    with psycopg.connect(url) as connection:
+        state = connection.execute(
+            """
+            SELECT campaign.status,count(record.id)
+            FROM ai_annotation_campaigns campaign
+            LEFT JOIN ai_annotation_campaign_records record
+              ON record.campaign_id=campaign.id
+            WHERE campaign.id=%s GROUP BY campaign.id
+            """,
+            (interrupted["id"],),
+        ).fetchone()
+    assert state == ("DRAFT", 1)
 
 
 def test_phase4c_prediction_runs_allow_same_turn_across_immutable_runs(

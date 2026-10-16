@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from collections import Counter
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -96,6 +97,7 @@ CACHED_INPUT_SHARE = EXPLICIT_CACHE_TOKENS / INPUT_TOKENS_PER_RECORD
 EXPLICIT_CACHE_TTL_HOURS = 24.0
 EXPLICIT_CACHE_TTL_SECONDS = int(EXPLICIT_CACHE_TTL_HOURS * 3600)
 CACHE_REUSE_MINIMUM = timedelta(hours=1)
+PLANNING_CHUNK_SIZE = 1_000
 
 STATES = {
     "DRAFT",
@@ -351,6 +353,187 @@ def estimate_plan(records: int) -> dict[str, float | int]:
     )
     estimate["input_tokens"] = round(INPUT_TOKENS_PER_RECORD * records)
     return estimate
+
+
+class _RecordSetHasher:
+    """Incrementally reproduce canonical_hash(list[str]) without retaining the list."""
+
+    def __init__(self) -> None:
+        self._digest = hashlib.sha256()
+        self._digest.update(b"[")
+        self._count = 0
+
+    def add(self, record_id: str) -> None:
+        if self._count:
+            self._digest.update(b",")
+        rendered = json.dumps(record_id, ensure_ascii=False, separators=(",", ":"))
+        self._digest.update(rendered.encode("utf-8"))
+        self._count += 1
+
+    def hexdigest(self) -> str:
+        digest = self._digest.copy()
+        digest.update(b"]")
+        return digest.hexdigest()
+
+
+def _configuration_query_parameters(campaign: dict[str, Any]) -> tuple[object, ...]:
+    return (
+        campaign["provider"],
+        campaign["configured_model"],
+        campaign["prompt_version"],
+        campaign["prompt_sha256"],
+        campaign["canonical_schema_sha256"],
+        campaign["prediction_contract_sha256"],
+        campaign["provider_schema_sha256"],
+        Jsonb(campaign["generation_config"]),
+        campaign["execution_mode"],
+    )
+
+
+def _planning_breakdown(
+    connection: psycopg.Connection[dict[str, Any]],
+    campaign: dict[str, Any],
+    *,
+    exclude_human_annotated: bool,
+) -> dict[str, Any]:
+    row = connection.execute(
+        """
+        WITH base AS MATERIALIZED (
+          SELECT
+            EXISTS (
+              SELECT 1 FROM model_predictions prediction
+              JOIN model_prediction_runs run ON run.id=prediction.run_id
+              WHERE prediction.speaker_turn_id=turn.id
+                AND run.provider=%s AND run.configured_model=%s
+                AND run.prompt_version=%s AND run.prompt_sha256=%s
+                AND run.canonical_schema_sha256=%s
+                AND run.prediction_contract_sha256=%s
+                AND run.provider_schema_sha256=%s
+                AND run.generation_config @> %s
+                AND run.execution_mode=%s
+            ) AS already_predicted,
+            EXISTS (
+              SELECT 1 FROM tasks task
+              JOIN assignments assignment ON assignment.task_id=task.id
+              JOIN annotations annotation ON annotation.assignment_id=assignment.id
+              WHERE task.speaker_turn_id=turn.id
+                AND annotation.status IN ('submitted','revised')
+            ) AS human_annotated,
+            CASE
+              WHEN turn.text_clean IS NOT NULL AND turn.text_clean<>''
+                THEN btrim(turn.text_clean)<>''
+              WHEN turn.text_raw IS NOT NULL AND turn.text_raw<>''
+                THEN btrim(turn.text_raw)<>''
+              ELSE false
+            END AS prompt_text_present
+          FROM speaker_turns turn
+          JOIN reconstruction_runs reconstruction
+            ON reconstruction.id=turn.reconstruction_run_id
+          JOIN corpora corpus ON corpus.current_preprocessing_run_id=
+            reconstruction.preprocessing_run_id
+          WHERE corpus.id=%s
+        )
+        SELECT
+          count(*)::integer AS corpus_total_count,
+          count(*) FILTER (WHERE human_annotated)::integer AS human_annotated_count,
+          count(*) FILTER (
+            WHERE human_annotated AND already_predicted
+          )::integer AS human_prediction_overlap_count,
+          count(*) FILTER (
+            WHERE already_predicted
+          )::integer AS excluded_existing_prediction_count,
+          count(*) FILTER (
+            WHERE NOT already_predicted AND %s AND human_annotated
+          )::integer AS excluded_human_annotated_count,
+          count(*) FILTER (
+            WHERE NOT already_predicted
+              AND (NOT %s OR NOT human_annotated)
+              AND NOT prompt_text_present
+          )::integer AS excluded_other_count,
+          count(*) FILTER (
+            WHERE NOT already_predicted
+              AND (NOT %s OR NOT human_annotated)
+              AND prompt_text_present
+          )::integer AS eligible_count
+        FROM base
+        """,
+        (
+            *_configuration_query_parameters(campaign),
+            campaign["corpus_id"],
+            exclude_human_annotated,
+            exclude_human_annotated,
+            exclude_human_annotated,
+        ),
+    ).fetchone()
+    assert row is not None
+    result = dict(row)
+    result["other_exclusion_reasons"] = (
+        {"missing_prompt_text": result["excluded_other_count"]}
+        if result["excluded_other_count"]
+        else {}
+    )
+    return result
+
+
+def _selection_query() -> str:
+    return """
+        SELECT turn.id,turn.turn_key,turn.speech_date AS date,turn.chamber,
+               turn.speaker_name_raw,turn.major_heading_original,
+               turn.minor_heading_original,turn.business_type,
+               turn.text_clean,turn.text_raw
+        FROM speaker_turns turn
+        JOIN reconstruction_runs reconstruction
+          ON reconstruction.id=turn.reconstruction_run_id
+        JOIN corpora corpus ON corpus.current_preprocessing_run_id=
+          reconstruction.preprocessing_run_id
+        WHERE corpus.id=%s
+          AND NOT EXISTS (
+            SELECT 1 FROM model_predictions prediction
+            JOIN model_prediction_runs run ON run.id=prediction.run_id
+            WHERE prediction.speaker_turn_id=turn.id
+              AND run.provider=%s AND run.configured_model=%s
+              AND run.prompt_version=%s AND run.prompt_sha256=%s
+              AND run.canonical_schema_sha256=%s
+              AND run.prediction_contract_sha256=%s
+              AND run.provider_schema_sha256=%s
+              AND run.generation_config @> %s
+              AND run.execution_mode=%s
+          )
+          AND (NOT %s OR NOT EXISTS (
+            SELECT 1 FROM tasks task
+            JOIN assignments assignment ON assignment.task_id=task.id
+            JOIN annotations annotation ON annotation.assignment_id=assignment.id
+            WHERE task.speaker_turn_id=turn.id
+              AND annotation.status IN ('submitted','revised')
+          ))
+          AND CASE
+            WHEN turn.text_clean IS NOT NULL AND turn.text_clean<>''
+              THEN btrim(turn.text_clean)<>''
+            WHEN turn.text_raw IS NOT NULL AND turn.text_raw<>''
+              THEN btrim(turn.text_raw)<>''
+            ELSE false
+          END
+        ORDER BY
+          sha256(convert_to(turn.turn_key || ':' || %s,'UTF8')),
+          turn.turn_key COLLATE "C"
+        LIMIT %s
+    """
+
+
+def _selection_query_parameters(
+    campaign: dict[str, Any],
+    *,
+    exclude_human_annotated: bool,
+    seed: str,
+    limit: int,
+) -> tuple[object, ...]:
+    return (
+        campaign["corpus_id"],
+        *_configuration_query_parameters(campaign),
+        exclude_human_annotated,
+        seed,
+        limit,
+    )
 
 
 class GeminiGateway(Protocol):
@@ -677,11 +860,19 @@ def plan_campaign(
     limit: int,
     seed: str,
     exclude_human_annotated: bool,
+    _connection: psycopg.Connection[dict[str, Any]] | None = None,
 ) -> PlanResult:
     _require_admin(principal)
+    if limit < 1:
+        raise CampaignError("planned count must be positive")
     if limit > 200_000:
         raise CampaignError("planned count exceeds the 200,000-record safety limit")
-    with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
+    connection_context = (
+        psycopg.connect(settings.database.psycopg_url, row_factory=dict_row)
+        if _connection is None
+        else nullcontext(_connection)
+    )
+    with connection_context as connection:
         campaign = connection.execute(
             "SELECT * FROM ai_annotation_campaigns WHERE public_id::text=%s FOR UPDATE",
             (public_id,),
@@ -690,91 +881,67 @@ def plan_campaign(
             raise LookupError("AI annotation campaign not found")
         if campaign["status"] != "DRAFT":
             raise CampaignError("only a DRAFT campaign can be planned")
-        all_rows = [
-            dict(row)
-            for row in connection.execute(
-                """
-                SELECT turn.id,turn.turn_key,turn.speech_date AS date,turn.chamber,
-                       turn.speaker_name_raw,turn.major_heading_original,
-                       turn.minor_heading_original,turn.business_type,
-                       turn.text_clean,turn.text_raw,turn.eligible_main_analysis,
-                       EXISTS (
-                         SELECT 1 FROM model_predictions prediction
-                         JOIN model_prediction_runs run ON run.id=prediction.run_id
-                         WHERE prediction.speaker_turn_id=turn.id
-                           AND run.provider=%s AND run.configured_model=%s
-                           AND run.prompt_version=%s AND run.prompt_sha256=%s
-                           AND run.canonical_schema_sha256=%s
-                           AND run.prediction_contract_sha256=%s
-                           AND run.provider_schema_sha256=%s
-                           AND run.generation_config @> %s
-                           AND run.execution_mode=%s
-                       ) AS already_predicted,
-                       EXISTS (
-                         SELECT 1 FROM tasks task JOIN annotations annotation
-                           ON annotation.assignment_id IN (
-                             SELECT assignment.id FROM assignments assignment
-                             WHERE assignment.task_id=task.id
-                           )
-                         WHERE task.speaker_turn_id=turn.id
-                           AND annotation.status IN ('submitted','revised')
-                       ) AS human_annotated
-                FROM speaker_turns turn
-                JOIN reconstruction_runs reconstruction
-                  ON reconstruction.id=turn.reconstruction_run_id
-                JOIN corpora corpus ON corpus.current_preprocessing_run_id=
-                  reconstruction.preprocessing_run_id
-                WHERE corpus.id=%s
-                ORDER BY turn.turn_key,turn.id
-                """,
-                (
-                    campaign["provider"],
-                    campaign["configured_model"],
-                    campaign["prompt_version"],
-                    campaign["prompt_sha256"],
-                    campaign["canonical_schema_sha256"],
-                    campaign["prediction_contract_sha256"],
-                    campaign["provider_schema_sha256"],
-                    Jsonb(campaign["generation_config"]),
-                    campaign["execution_mode"],
-                    campaign["corpus_id"],
-                ),
-            ).fetchall()
-        ]
-        breakdown = selection_breakdown(
-            all_rows, exclude_human_annotated=exclude_human_annotated
+        breakdown = _planning_breakdown(
+            connection,
+            dict(campaign),
+            exclude_human_annotated=exclude_human_annotated,
         )
-        eligible = [
-            row
-            for row in all_rows
-            if not row["already_predicted"]
-            and not (exclude_human_annotated and row["human_annotated"])
-            and other_exclusion_reason(row) is None
-        ]
-        selected, record_set_sha256 = deterministic_selection(eligible, limit=limit, seed=seed)
-        if not selected:
-            raise CampaignError("selection contains no eligible records")
-        estimate = estimate_plan(len(selected))
-        record_values: list[tuple[object, ...]] = []
-        for order, row in enumerate(selected):
-            record = production_record_from_turn(row)
-            record_values.append(
-                (
-                    campaign["id"],
-                    row["id"],
-                    record["record_id"],
-                    order,
-                    canonical_hash(record),
-                )
+        record_set_hasher = _RecordSetHasher()
+        selected_count = 0
+        preview: list[dict[str, Any]] = []
+        insert_values: list[tuple[object, ...]] = []
+        insert_cursor = connection.cursor()
+        with connection.cursor(name=f"campaign_plan_{campaign['id']}") as selected_rows:
+            selected_rows.itersize = PLANNING_CHUNK_SIZE
+            selected_rows.execute(
+                _selection_query(),
+                _selection_query_parameters(
+                    dict(campaign),
+                    exclude_human_annotated=exclude_human_annotated,
+                    seed=seed,
+                    limit=limit,
+                ),
             )
-        connection.cursor().executemany(
-            """
+            for selected_row in selected_rows:
+                row = dict(selected_row)
+                record = production_record_from_turn(row)
+                record_id = str(record["record_id"])
+                record_set_hasher.add(record_id)
+                insert_values.append(
+                    (
+                        campaign["id"],
+                        row["id"],
+                        record_id,
+                        selected_count,
+                        canonical_hash(record),
+                    )
+                )
+                if len(preview) < 10:
+                    preview.append(row)
+                selected_count += 1
+                if len(insert_values) == PLANNING_CHUNK_SIZE:
+                    insert_cursor.executemany(
+                        """
+                        INSERT INTO ai_annotation_campaign_records
+                          (campaign_id,speaker_turn_id,record_id,selection_order,record_sha256)
+                        VALUES (%s,%s,%s,%s,%s)
+                        """,
+                        insert_values,
+                    )
+                    insert_values.clear()
+        if not selected_count:
+            raise CampaignError("selection contains no eligible records")
+        if insert_values:
+            insert_cursor.executemany(
+                """
             INSERT INTO ai_annotation_campaign_records
               (campaign_id,speaker_turn_id,record_id,selection_order,record_sha256)
             VALUES (%s,%s,%s,%s,%s)
-            """,
-            record_values,
-        )
+                """,
+                insert_values,
+            )
+        record_set_sha256 = record_set_hasher.hexdigest()
+        estimate = estimate_plan(selected_count)
         selection = {
             "eligibility_rule": AI_ELIGIBILITY_RULE,
             "exclude_human_annotated": exclude_human_annotated,
@@ -810,7 +977,7 @@ def plan_campaign(
                 breakdown["eligible_count"],
                 breakdown["excluded_existing_prediction_count"],
                 breakdown["excluded_other_count"],
-                len(selected),
+                selected_count,
                 estimate["input_tokens"],
                 estimate["cached_input_tokens"],
                 estimate["uncached_input_tokens"],
@@ -822,7 +989,7 @@ def plan_campaign(
             ),
         ).fetchone()
         assert updated is not None
-        return PlanResult(dict(updated), selected[:10])
+        return PlanResult(dict(updated), preview)
 
 
 def transition_campaign(
