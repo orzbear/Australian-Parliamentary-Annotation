@@ -1,4 +1,17 @@
 (() => {
+  function resetProgressForms() {
+    document.querySelectorAll("form[data-progress-form]").forEach((progressForm) => {
+      delete progressForm.dataset.submitting;
+      progressForm.removeAttribute("aria-busy");
+      progressForm.querySelectorAll('button[type="submit"], button:not([type])').forEach((button) => {
+        button.disabled = false;
+        if (button.dataset.originalText) button.textContent = button.dataset.originalText;
+        button.classList.remove("is-loading");
+      });
+    });
+  }
+  window.addEventListener("pageshow", resetProgressForms);
+
   document.addEventListener("submit", (event) => {
     const progressForm = event.target.closest?.("form[data-progress-form]");
     if (!progressForm) return;
@@ -13,6 +26,7 @@
     });
     const submitter = event.submitter;
     if (submitter) {
+      submitter.dataset.originalText ||= submitter.textContent;
       submitter.textContent = submitter.dataset.progressText || "Working...";
       submitter.classList.add("is-loading");
     }

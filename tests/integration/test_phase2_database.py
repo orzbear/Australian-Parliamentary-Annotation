@@ -130,6 +130,10 @@ PHASE4D_TABLES = {
     "ai_annotation_campaigns",
     "ai_annotation_campaign_records",
 }
+PHASE4D_RECOVERY_TABLES = {
+    "ai_annotation_campaign_recoveries",
+    "ai_annotation_campaign_recovery_records",
+}
 
 
 @pytest.fixture
@@ -143,7 +147,9 @@ def database_url(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     cleanup_url = TEST_URL.replace("postgresql+psycopg://", "postgresql://")
     with psycopg.connect(cleanup_url, autocommit=True) as connection:
         connection.execute(
-            "TRUNCATE ai_annotation_campaign_records,ai_annotation_campaigns,"
+            "TRUNCATE ai_annotation_campaign_recovery_records,"
+            "ai_annotation_campaign_recoveries,ai_annotation_campaign_records,"
+            "ai_annotation_campaigns,"
             "model_prediction_reviews,model_predictions,model_prediction_runs"
         )
         connection.execute("TRUNCATE users,projects CASCADE")
@@ -953,7 +959,9 @@ def test_annotation_ready_views_are_explicitly_current_run_aware(
 def test_phase3_relations_roles_and_empty_round_trip(database_url: str) -> None:
     settings = DatabaseSettings(url=database_url, processed_data_root=Path("data/processed"))
     inspector = inspect(create_database_engine(settings))
-    assert set(inspector.get_table_names()) >= PHASE3_TABLES | PHASE4C_TABLES | PHASE4D_TABLES
+    assert set(inspector.get_table_names()) >= (
+        PHASE3_TABLES | PHASE4C_TABLES | PHASE4D_TABLES | PHASE4D_RECOVERY_TABLES
+    )
     url = database_url.replace("postgresql+psycopg://", "postgresql://")
     with psycopg.connect(url) as connection:
         assert (
@@ -1006,6 +1014,13 @@ def test_phase4d_migration_constraints_immutability_linkage_and_downgrade_guard(
         ("campaign_id", "record_id"),
         ("campaign_id", "selection_order"),
     } <= record_uniques
+    command.upgrade(config, "20261017_08")
+    inspector = inspect(create_database_engine(settings))
+    assert set(inspector.get_table_names()) >= PHASE4D_RECOVERY_TABLES
+    recovery_fks = inspector.get_foreign_keys("ai_annotation_campaign_recoveries")
+    assert {fk["referred_table"] for fk in recovery_fks} == {
+        "ai_annotation_campaigns"
+    }
 
     import_validated_run(settings, _fixture_run(tmp_path, run_id="phase4d-db-fixture"))
     password = "phase4d database test password"
@@ -1047,6 +1062,56 @@ def test_phase4d_migration_constraints_immutability_linkage_and_downgrade_guard(
             ("2" * 64, campaign_id),
         )
         connection.commit()
+
+        recovery_id = connection.execute(
+            """
+            INSERT INTO ai_annotation_campaign_recoveries
+              (campaign_id,attempt_number,unresolved_set_sha256,request_count,status,
+               submission_display_name)
+            VALUES (%s,1,%s,1,'PREPARING','phase4d-recovery-db-001') RETURNING id
+            """,
+            (campaign_id, "6" * 64),
+        ).fetchone()[0]
+        campaign_record_id = connection.execute(
+            "SELECT id FROM ai_annotation_campaign_records WHERE campaign_id=%s",
+            (campaign_id,),
+        ).fetchone()[0]
+        connection.execute(
+            """
+            INSERT INTO ai_annotation_campaign_recovery_records
+              (recovery_id,campaign_record_id,record_id,original_request_index,
+               original_validation_error)
+            VALUES (%s,%s,'turn:db-acceptance',0,
+                    'primary domain cannot also be secondary')
+            """,
+            (recovery_id, campaign_record_id),
+        )
+        connection.commit()
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            connection.execute(
+                """
+                INSERT INTO ai_annotation_campaign_recoveries
+                  (campaign_id,attempt_number,unresolved_set_sha256,request_count,status,
+                   submission_display_name)
+                VALUES (%s,2,%s,1,'PREPARING','phase4d-recovery-db-002')
+                """,
+                (campaign_id, "6" * 64),
+            )
+        connection.rollback()
+        with pytest.raises(psycopg.errors.RaiseException, match="recovery provenance"):
+            connection.execute(
+                """
+                UPDATE ai_annotation_campaign_recoveries SET request_count=2 WHERE id=%s
+                """,
+                (recovery_id,),
+            )
+        connection.rollback()
+        with pytest.raises(psycopg.errors.ObjectNotInPrerequisiteState):
+            connection.execute(
+                "DELETE FROM ai_annotation_campaign_recovery_records WHERE recovery_id=%s",
+                (recovery_id,),
+            )
+        connection.rollback()
 
         with pytest.raises(psycopg.errors.UniqueViolation):
             connection.execute(
@@ -1123,7 +1188,7 @@ def test_phase4d_migration_constraints_immutability_linkage_and_downgrade_guard(
         assert linked == ("IMPORTED", run_id)
 
     monkeypatch.setenv("HANSARD_DATABASE_URL", database_url)
-    with pytest.raises(RuntimeError, match="downgrade refused"):
+    with pytest.raises(RuntimeError, match="recovery downgrade refused"):
         command.downgrade(config, "20261009_06")
 
 

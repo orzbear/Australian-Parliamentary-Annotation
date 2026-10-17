@@ -13,6 +13,7 @@ from hansard_annotator.web.campaigns.service import (
     DEFAULT_EXCLUDE_HUMAN_ANNOTATED,
     CampaignError,
     collect_campaign,
+    collect_recovery,
     create_campaign,
     credential_status,
     get_campaign,
@@ -21,8 +22,11 @@ from hansard_annotator.web.campaigns.service import (
     list_corpora,
     plan_campaign,
     production_configuration,
+    recover_recovery_submission,
     refresh_campaign,
+    refresh_recovery,
     submit_campaign,
+    submit_recovery,
     transition_campaign,
     validate_campaign,
 )
@@ -51,6 +55,9 @@ def _notice_message(code: str | None, campaign: dict[str, object]) -> str | None
         "batch-submitted": "Batch submitted.",
         "status-refreshed": "Provider status refreshed.",
         "results-collected": "Results collected.",
+        "recovery-submitted": "Paid targeted recovery submitted.",
+        "recovery-status-refreshed": "Recovery provider status refreshed.",
+        "recovery-collected": "Recovery results collected and effective validation refreshed.",
         "campaign-cancelled": "Campaign cancelled.",
     }
     if code == "validation-passed":
@@ -150,7 +157,14 @@ async def campaign_provider_status(
     await enforce_csrf(request, principal, settings)
     try:
         campaign = get_campaign(settings, principal, campaign_id)
-        if campaign["status"] in {"SUBMITTED", "RUNNING"}:
+        active_recovery = campaign.get("active_recovery")
+        if isinstance(active_recovery, dict) and active_recovery.get("status") in {
+            "SUBMITTED",
+            "RUNNING",
+        }:
+            refresh_recovery(settings, principal, campaign_id)
+            campaign = get_campaign(settings, principal, campaign_id)
+        elif campaign["status"] in {"SUBMITTED", "RUNNING"}:
             refresh_campaign(settings, principal, campaign_id)
             campaign = get_campaign(settings, principal, campaign_id)
     except (CampaignError, LookupError, PermissionError, ValueError) as error:
@@ -243,6 +257,14 @@ async def _action(
             validate_campaign(settings, principal, campaign_id)
         elif operation == "import":
             import_campaign(settings, principal, campaign_id)
+        elif operation == "retry-invalid":
+            submit_recovery(settings, principal, campaign_id, confirmation or "")
+        elif operation == "recovery-refresh":
+            refresh_recovery(settings, principal, campaign_id)
+        elif operation == "recovery-resume":
+            recover_recovery_submission(settings, principal, campaign_id)
+        elif operation == "recovery-collect":
+            collect_recovery(settings, principal, campaign_id)
         else:
             raise CampaignError("unknown campaign action")
     except (CampaignError, LookupError, PermissionError, ValueError) as error:
@@ -253,6 +275,10 @@ async def _action(
         "collect": "results-collected",
         "validate": "validation-passed",
         "import": "predictions-imported",
+        "retry-invalid": "recovery-submitted",
+        "recovery-refresh": "recovery-status-refreshed",
+        "recovery-resume": "recovery-submitted",
+        "recovery-collect": "recovery-collected",
     }[operation]
     return RedirectResponse(
         f"/ai-annotation/{campaign_id}?notice={notice}", status_code=303
@@ -308,3 +334,50 @@ async def campaign_import(
     principal: Annotated[Principal, Depends(require_admin)],
 ) -> RedirectResponse:
     return await _action(request, settings, principal, campaign_id, "import")
+
+
+@router.post("/{campaign_id}/retry-invalid")
+async def campaign_retry_invalid(
+    request: Request,
+    campaign_id: str,
+    settings: Annotated[WebSettings, Depends(get_settings)],
+    principal: Annotated[Principal, Depends(require_admin)],
+    confirmation: Annotated[str, Form()],
+) -> RedirectResponse:
+    return await _action(
+        request, settings, principal, campaign_id, "retry-invalid", confirmation
+    )
+
+
+@router.post("/{campaign_id}/recovery-refresh")
+async def campaign_recovery_refresh(
+    request: Request,
+    campaign_id: str,
+    settings: Annotated[WebSettings, Depends(get_settings)],
+    principal: Annotated[Principal, Depends(require_admin)],
+) -> RedirectResponse:
+    return await _action(
+        request, settings, principal, campaign_id, "recovery-refresh"
+    )
+
+
+@router.post("/{campaign_id}/recovery-resume")
+async def campaign_recovery_resume(
+    request: Request,
+    campaign_id: str,
+    settings: Annotated[WebSettings, Depends(get_settings)],
+    principal: Annotated[Principal, Depends(require_admin)],
+) -> RedirectResponse:
+    return await _action(request, settings, principal, campaign_id, "recovery-resume")
+
+
+@router.post("/{campaign_id}/recovery-collect")
+async def campaign_recovery_collect(
+    request: Request,
+    campaign_id: str,
+    settings: Annotated[WebSettings, Depends(get_settings)],
+    principal: Annotated[Principal, Depends(require_admin)],
+) -> RedirectResponse:
+    return await _action(
+        request, settings, principal, campaign_id, "recovery-collect"
+    )

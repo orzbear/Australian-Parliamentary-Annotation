@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol, cast
+from urllib.parse import quote
 
 import psycopg
 from psycopg.rows import dict_row
@@ -27,6 +28,7 @@ from hansard_annotator.llm_eval.operations import (
     FROZEN_CANONICAL_SCHEMA_SHA256,
     FROZEN_PROMPT_SHA256,
     FROZEN_PROMPT_VERSION,
+    batch_resource,
     build_batch_create_request,
     build_cache_create_request,
     canonical_hash,
@@ -42,6 +44,7 @@ from hansard_annotator.llm_eval.ops_cli import (
     _collection_summary,
     _get_batch,
     _get_cache,
+    _get_gemini_resource,
 )
 from hansard_annotator.llm_eval.prompt import (
     build_system_prompt,
@@ -50,12 +53,19 @@ from hansard_annotator.llm_eval.prompt import (
 )
 from hansard_annotator.llm_eval.providers import _http_json
 from hansard_annotator.web.auth.models import Principal
+from hansard_annotator.web.campaigns.recovery import (
+    RecoveryArtifactError,
+    build_effective_artifact,
+    read_jsonl,
+    unresolved_results,
+)
 from hansard_annotator.web.codebook.service import ROOT, production_codebook
 from hansard_annotator.web.config import WebSettings
 
 PREDICTION_CONTRACT_SHA256 = "99cafa6c473293dc076793ee6baeca44b6961d7cb11de8f9174517defc4a0879"
 GEMINI_BATCH_SCHEMA_SHA256 = "980b0ed6d6002a8eadd326f84942ba60dcdf8f2abd9e70ea6aaecf7d78de3c22"
 PAID_CONFIRMATION = "START AI CAMPAIGN"
+RECOVERY_CONFIRMATION = "RETRY INVALID RECORDS"
 PRODUCTION_GENERATION_CONFIG = APPROVED_PRODUCTION_GENERATION
 PRODUCTION_EXECUTION_MODE = "batch"
 DEFAULT_EXCLUDE_HUMAN_ANNOTATED = True
@@ -545,6 +555,8 @@ class GeminiGateway(Protocol):
 
     def status(self, provider_job_id: str) -> dict[str, Any]: ...
 
+    def find_batch(self, display_name: str, model: str) -> str | None: ...
+
 
 class LiveGeminiGateway:
     """Thin web adapter over the already validated Phase 4B provider operations."""
@@ -580,6 +592,36 @@ class LiveGeminiGateway:
 
     def status(self, provider_job_id: str) -> dict[str, Any]:
         return _get_batch(provider_job_id)
+
+    def find_batch(self, display_name: str, model: str) -> str | None:
+        """Recover a submitted operation by its deterministic display identity."""
+        self._key()
+        matches: list[str] = []
+        page_token: str | None = None
+        while True:
+            query = "batches?pageSize=100"
+            if page_token:
+                query += f"&pageToken={quote(page_token, safe='')}"
+            value = _get_gemini_resource(query, resource_label="batch list")
+            operations = value.get("operations")
+            if isinstance(operations, list):
+                for operation in operations:
+                    if not isinstance(operation, dict):
+                        continue
+                    batch = batch_resource(operation)
+                    if (
+                        batch.get("displayName") == display_name
+                        and batch.get("model") == f"models/{model}"
+                        and isinstance(operation.get("name"), str)
+                    ):
+                        matches.append(str(operation["name"]))
+            token = value.get("nextPageToken")
+            if not isinstance(token, str) or not token:
+                break
+            page_token = token
+        if len(set(matches)) > 1:
+            raise CampaignError("multiple Gemini batches share the recovery identity")
+        return matches[0] if matches else None
 
 
 @dataclass(frozen=True)
@@ -849,6 +891,42 @@ def get_campaign(
                 (row["id"],),
             ).fetchall()
         ]
+        recoveries = [
+            dict(value)
+            for value in connection.execute(
+                """
+                SELECT * FROM ai_annotation_campaign_recoveries
+                WHERE campaign_id=%s ORDER BY attempt_number
+                """,
+                (row["id"],),
+            ).fetchall()
+        ]
+        result["recoveries"] = recoveries
+        result["latest_recovery"] = recoveries[-1] if recoveries else None
+        result["active_recovery"] = next(
+            (
+                recovery
+                for recovery in reversed(recoveries)
+                if recovery["status"]
+                in {"PREPARING", "SUBMITTED", "RUNNING", "PROVIDER_COMPLETED"}
+            ),
+            None,
+        )
+        original_metadata = cast(
+            dict[str, Any], result.get("operational_metadata") or {}
+        )
+        original_cost = cast(dict[str, Any], original_metadata.get("cost") or {})
+        recovery_cost = sum(
+            float(metadata.get("cost", {}).get("total_pilot_cost_usd") or 0)
+            for recovery in recoveries
+            if recovery["status"] == "COLLECTED"
+            and isinstance((metadata := recovery.get("operational_metadata")), dict)
+            and isinstance(metadata.get("cost"), dict)
+        )
+        result["recovery_cost_usd"] = recovery_cost
+        result["campaign_total_cost_usd"] = (
+            float(original_cost.get("total_pilot_cost_usd") or 0) + recovery_cost
+        )
         return result
 
 
@@ -1032,7 +1110,14 @@ def _records_for_campaign(
     return tuple(production_record_from_turn(dict(row)) for row in rows)
 
 
-def _provider_plan(campaign: dict[str, Any], records: tuple[dict[str, Any], ...]) -> dict[str, Any]:
+def _provider_plan(
+    campaign: dict[str, Any],
+    records: tuple[dict[str, Any], ...],
+    *,
+    expected_record_set_sha256: str | None = None,
+    cache_identifier: str | None = None,
+    display_name: str | None = None,
+) -> dict[str, Any]:
     codebook = production_codebook()
     context = cast(dict[str, Any], codebook["context"])
     system_prompt = build_system_prompt(context, str(campaign["prompt_version"]))
@@ -1047,8 +1132,8 @@ def _provider_plan(campaign: dict[str, Any], records: tuple[dict[str, Any], ...]
         system_prompt=system_prompt,
         records=records,
         schema=schema,
-        display_name=f"phase4d-{campaign['public_id']}",
-        cached_content=campaign["cache_identifier"],
+        display_name=display_name or f"phase4d-{campaign['public_id']}",
+        cached_content=cache_identifier or campaign["cache_identifier"],
         generation=campaign["generation_config"],
     )
     provenance = {
@@ -1061,7 +1146,7 @@ def _provider_plan(campaign: dict[str, Any], records: tuple[dict[str, Any], ...]
         "provider_schema_sha256": campaign["provider_schema_sha256"],
         **campaign["generation_config"],
         "execution_mode": campaign["execution_mode"],
-        "cached_content": campaign["cache_identifier"],
+        "cached_content": cache_identifier or campaign["cache_identifier"],
         "record_count": len(records),
         "record_ids_sha256": canonical_hash([record["record_id"] for record in records]),
         "pricing_format_version": 1,
@@ -1071,7 +1156,8 @@ def _provider_plan(campaign: dict[str, Any], records: tuple[dict[str, Any], ...]
     }
     plan = {"provenance": provenance, "request": request}
     validate_production_plan(plan)
-    if provenance["record_ids_sha256"] != campaign["record_set_sha256"]:
+    expected_hash = expected_record_set_sha256 or campaign["record_set_sha256"]
+    if provenance["record_ids_sha256"] != expected_hash:
         raise CampaignError("stored record set no longer matches campaign plan")
     if canonical_hash(schema) != campaign["prediction_contract_sha256"]:
         raise CampaignError("prediction contract no longer matches campaign")
@@ -1417,6 +1503,583 @@ def collect_campaign(
         return dict(updated)
 
 
+def _collected_recoveries(
+    connection: psycopg.Connection[dict[str, Any]], campaign_id: int
+) -> list[dict[str, Any]]:
+    return [
+        dict(row)
+        for row in connection.execute(
+            """
+            SELECT * FROM ai_annotation_campaign_recoveries
+            WHERE campaign_id=%s AND status='COLLECTED' ORDER BY attempt_number
+            """,
+            (campaign_id,),
+        ).fetchall()
+    ]
+
+
+def _original_coverage_complete(campaign: dict[str, Any]) -> None:
+    metadata = campaign.get("operational_metadata")
+    coverage = metadata.get("coverage") if isinstance(metadata, dict) else None
+    if not isinstance(coverage, dict):
+        raise CampaignError("campaign has no collected coverage metadata")
+    planned = int(campaign["planned_count"])
+    if (
+        int(coverage.get("planned_requests") or -1) != planned
+        or int(coverage.get("collected_responses") or -1) != planned
+        or int(coverage.get("missing_responses") or 0) != 0
+        or int(coverage.get("duplicate_mappings") or 0) != 0
+    ):
+        raise CampaignError("targeted retry requires complete, duplicate-free provider coverage")
+
+
+def _recovery_directory(public_id: str, attempt_number: int) -> Path:
+    campaign_directory = _artifact_directory(public_id)
+    recovery_root = (campaign_directory / "recovery").resolve()
+    target = (recovery_root / f"attempt-{attempt_number:03d}").resolve()
+    if target.parent != recovery_root:
+        raise CampaignError("unsafe campaign recovery artifact path")
+    return target
+
+
+def _records_for_recovery(
+    connection: psycopg.Connection[dict[str, Any]], recovery_id: int
+) -> tuple[dict[str, Any], ...]:
+    rows = connection.execute(
+        """
+        SELECT turn.turn_key,turn.speech_date AS date,turn.chamber,
+               turn.speaker_name_raw,turn.major_heading_original,
+               turn.minor_heading_original,turn.business_type,
+               turn.text_clean,turn.text_raw
+        FROM ai_annotation_campaign_recovery_records recovery_record
+        JOIN ai_annotation_campaign_records campaign_record
+          ON campaign_record.id=recovery_record.campaign_record_id
+        JOIN speaker_turns turn ON turn.id=campaign_record.speaker_turn_id
+        WHERE recovery_record.recovery_id=%s
+        ORDER BY recovery_record.original_request_index
+        """,
+        (recovery_id,),
+    ).fetchall()
+    return tuple(production_record_from_turn(dict(row)) for row in rows)
+
+
+def _recovery_cache(
+    campaign: dict[str, Any], provider: GeminiGateway
+) -> tuple[dict[str, Any], bool]:
+    cache_plan = _canonical_cache_plan(campaign)
+    if cache_plan_status(campaign) == "REUSABLE":
+        identifier = str(campaign["cache_identifier"])
+        try:
+            resource = provider.get_cache(identifier)
+            fields = _cache_resource_fields(resource, cache_plan, now=datetime.now(UTC))
+            if fields["cache_identifier"] == identifier:
+                return fields, False
+        except (CampaignError, ValueError):
+            pass
+    resource = provider.create_cache(cast(dict[str, Any], cache_plan["request"]))
+    return _cache_resource_fields(resource, cache_plan, now=datetime.now(UTC)), True
+
+
+def _mark_recovery_failed(
+    settings: WebSettings, recovery_id: int, error: Exception
+) -> None:
+    with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
+        connection.execute(
+            """
+            UPDATE ai_annotation_campaign_recoveries SET status='FAILED',
+              failure_metadata=%s WHERE id=%s AND status='PREPARING'
+            """,
+            (Jsonb({"submission_error": str(error)[:1000]}), recovery_id),
+        )
+
+
+def submit_recovery(
+    settings: WebSettings,
+    principal: Principal,
+    public_id: str,
+    confirmation: str,
+    *,
+    gateway: GeminiGateway | None = None,
+) -> dict[str, Any]:
+    """Submit only unresolved invalid/provider-failed records under frozen provenance."""
+    _require_admin(principal)
+    if confirmation != RECOVERY_CONFIRMATION:
+        raise CampaignError(f"paid recovery requires typing {RECOVERY_CONFIRMATION}")
+    provider = gateway or LiveGeminiGateway()
+    with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
+        row = connection.execute(
+            "SELECT * FROM ai_annotation_campaigns WHERE public_id::text=%s FOR UPDATE",
+            (public_id,),
+        ).fetchone()
+        if row is None:
+            raise LookupError("AI annotation campaign not found")
+        campaign = dict(row)
+        if campaign["status"] != "COLLECTED" or campaign.get("model_prediction_run_id"):
+            raise CampaignError("campaign is not eligible for targeted recovery")
+        if configuration_class(campaign) != "APPROVED_PRODUCTION":
+            raise CampaignError("recovery requires the approved production configuration")
+        _original_coverage_complete(campaign)
+        active = connection.execute(
+            """
+            SELECT * FROM ai_annotation_campaign_recoveries
+            WHERE campaign_id=%s AND status IN
+              ('PREPARING','SUBMITTED','RUNNING','PROVIDER_COMPLETED')
+            ORDER BY attempt_number DESC LIMIT 1
+            """,
+            (campaign["id"],),
+        ).fetchone()
+        if active is not None:
+            raise CampaignError("an unresolved-record recovery job is already active")
+        collected = _collected_recoveries(connection, int(campaign["id"]))
+        original_directory = Path(str(campaign["artifact_reference"]))
+        unresolved = unresolved_results(original_directory, collected)
+        if not unresolved:
+            raise CampaignError("campaign has no unresolved retry-eligible records")
+        unresolved_ids = [str(result["record_id"]) for result in unresolved]
+        unresolved_hash = canonical_hash(unresolved_ids)
+        attempt_row = connection.execute(
+            """
+            SELECT COALESCE(max(attempt_number),0)+1 AS attempt_number
+            FROM ai_annotation_campaign_recoveries WHERE campaign_id=%s
+            """,
+            (campaign["id"],),
+        ).fetchone()
+        assert attempt_row is not None
+        attempt_number = int(attempt_row["attempt_number"])
+        display_name = f"phase4d-recovery-{public_id}-{attempt_number:03d}"
+        recovery = connection.execute(
+            """
+            INSERT INTO ai_annotation_campaign_recoveries
+              (campaign_id,attempt_number,unresolved_set_sha256,request_count,status,
+               submission_display_name)
+            VALUES (%s,%s,%s,%s,'PREPARING',%s) RETURNING *
+            """,
+            (
+                campaign["id"],
+                attempt_number,
+                unresolved_hash,
+                len(unresolved_ids),
+                display_name,
+            ),
+        ).fetchone()
+        assert recovery is not None
+        original = {
+            str(value["record_id"]): value
+            for value in read_jsonl(original_directory / "predictions.jsonl")
+        }
+        for result in unresolved:
+            record_id = str(result["record_id"])
+            source = original[record_id]
+            error = source.get("validation_error") or source.get("provider_error")
+            rendered_error = (
+                str(error)
+                if isinstance(error, str)
+                else json.dumps(error, sort_keys=True, ensure_ascii=False)
+            )
+            campaign_record = connection.execute(
+                """
+                SELECT id FROM ai_annotation_campaign_records
+                WHERE campaign_id=%s AND record_id=%s
+                """,
+                (campaign["id"], record_id),
+            ).fetchone()
+            if campaign_record is None:
+                raise CampaignError("retry record is not present in the campaign")
+            connection.execute(
+                """
+                INSERT INTO ai_annotation_campaign_recovery_records
+                  (recovery_id,campaign_record_id,record_id,original_request_index,
+                   original_validation_error)
+                VALUES (%s,%s,%s,%s,%s)
+                """,
+                (
+                    recovery["id"],
+                    campaign_record["id"],
+                    record_id,
+                    int(source["request_index"]),
+                    rendered_error,
+                ),
+            )
+
+    submission_may_exist = False
+    try:
+        cache, cache_created = _recovery_cache(campaign, provider)
+        with psycopg.connect(
+            settings.database.psycopg_url, row_factory=dict_row
+        ) as connection:
+            records = _records_for_recovery(connection, int(recovery["id"]))
+            plan = _provider_plan(
+                {**campaign, "cache_identifier": cache["cache_identifier"]},
+                records,
+                expected_record_set_sha256=unresolved_hash,
+                cache_identifier=str(cache["cache_identifier"]),
+                display_name=display_name,
+            )
+            directory = _recovery_directory(public_id, attempt_number)
+            directory.mkdir(parents=True, exist_ok=False)
+            (directory / "plan.json").write_text(
+                json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            lineage_rows = connection.execute(
+                """
+                SELECT record_id,original_request_index,original_validation_error
+                FROM ai_annotation_campaign_recovery_records
+                WHERE recovery_id=%s ORDER BY original_request_index
+                """,
+                (recovery["id"],),
+            ).fetchall()
+            requests = plan["request"]["batch"]["input_config"]["requests"]["requests"]
+            (directory / "requests.jsonl").write_text(
+                "".join(
+                    json.dumps(
+                        {
+                            "campaign_id": public_id,
+                            "recovery_attempt_number": attempt_number,
+                            **dict(lineage),
+                            "provider_request": request,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                    for lineage, request in zip(lineage_rows, requests, strict=True)
+                ),
+                encoding="utf-8",
+            )
+            cache_metadata = {
+                **cast(dict[str, Any], cache["cache_metadata"]),
+                "created_for_recovery": cache_created,
+            }
+            prepared = connection.execute(
+                """
+                UPDATE ai_annotation_campaign_recoveries SET
+                  cache_identifier=%s,cache_content_sha256=%s,cache_model=%s,
+                  cache_display_name=%s,cache_created_at=%s,cache_expires_at=%s,
+                  cache_verified_at=%s,cache_metadata=%s
+                WHERE id=%s AND status='PREPARING' RETURNING id
+                """,
+                (
+                    cache["cache_identifier"],
+                    cache["cache_content_sha256"],
+                    cache["cache_model"],
+                    cache["cache_display_name"],
+                    cache["cache_created_at"],
+                    cache["cache_expires_at"],
+                    cache["cache_verified_at"],
+                    Jsonb(cache_metadata),
+                    recovery["id"],
+                ),
+            ).fetchone()
+            if prepared is None:
+                raise CampaignError("recovery cache provenance could not be persisted")
+            connection.commit()
+            submission_may_exist = True
+            finder = getattr(provider, "find_batch", None)
+            provider_job_id = (
+                finder(display_name, str(campaign["configured_model"]))
+                if callable(finder)
+                else None
+            )
+            if provider_job_id is None:
+                provider_job_id = provider.submit(
+                    plan, str(campaign["configured_model"])
+                )
+            updated = connection.execute(
+                """
+                UPDATE ai_annotation_campaign_recoveries SET status='SUBMITTED',
+                  provider_job_id=%s,provider_state='BATCH_STATE_PENDING',
+                  submitted_at=now()
+                WHERE id=%s AND status='PREPARING' AND provider_job_id IS NULL
+                RETURNING *
+                """,
+                (
+                    provider_job_id,
+                    recovery["id"],
+                ),
+            ).fetchone()
+            if updated is None:
+                raise CampaignError("recovery submission identity could not be persisted")
+            return dict(updated)
+    except Exception as error:
+        if not submission_may_exist:
+            _mark_recovery_failed(settings, int(recovery["id"]), error)
+        if isinstance(error, (CampaignError, RecoveryArtifactError)):
+            raise
+        raise CampaignError(f"Gemini recovery submission failed: {error}") from error
+
+
+def refresh_recovery(
+    settings: WebSettings,
+    principal: Principal,
+    public_id: str,
+    *,
+    gateway: GeminiGateway | None = None,
+) -> dict[str, Any]:
+    _require_admin(principal)
+    provider = gateway or LiveGeminiGateway()
+    with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
+        recovery = connection.execute(
+            """
+            SELECT recovery.* FROM ai_annotation_campaign_recoveries recovery
+            JOIN ai_annotation_campaigns campaign ON campaign.id=recovery.campaign_id
+            WHERE campaign.public_id::text=%s AND recovery.status IN
+              ('SUBMITTED','RUNNING','PROVIDER_COMPLETED')
+            ORDER BY recovery.attempt_number DESC LIMIT 1 FOR UPDATE OF recovery
+            """,
+            (public_id,),
+        ).fetchone()
+        if recovery is None or not isinstance(recovery["provider_job_id"], str):
+            raise CampaignError("campaign has no active recovery job")
+        status = parse_batch_status(provider.status(str(recovery["provider_job_id"])))
+        target = (
+            "PROVIDER_COMPLETED"
+            if status["successful_terminal"]
+            else "FAILED"
+            if status["terminal"]
+            else "RUNNING"
+        )
+        updated = connection.execute(
+            """
+            UPDATE ai_annotation_campaign_recoveries SET status=%s,provider_state=%s,
+              provider_completed_at=CASE WHEN %s THEN COALESCE(provider_completed_at,now())
+                                         ELSE provider_completed_at END,
+              failure_metadata=CASE WHEN %s THEN %s ELSE failure_metadata END
+            WHERE id=%s RETURNING *
+            """,
+            (
+                target,
+                status["state"],
+                bool(status["terminal"]),
+                target == "FAILED",
+                Jsonb({"provider_error": status["error"]}),
+                recovery["id"],
+            ),
+        ).fetchone()
+        assert updated is not None
+        return dict(updated)
+
+
+def recover_recovery_submission(
+    settings: WebSettings,
+    principal: Principal,
+    public_id: str,
+    *,
+    gateway: GeminiGateway | None = None,
+) -> dict[str, Any]:
+    """Recover a provider job when submission succeeded but its receipt was lost."""
+    _require_admin(principal)
+    provider = gateway or LiveGeminiGateway()
+    finder = getattr(provider, "find_batch", None)
+    if not callable(finder):
+        raise CampaignError("the Gemini gateway cannot recover submitted Batch jobs")
+    with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
+        recovery = connection.execute(
+            """
+            SELECT recovery.*,campaign.configured_model
+            FROM ai_annotation_campaign_recoveries recovery
+            JOIN ai_annotation_campaigns campaign ON campaign.id=recovery.campaign_id
+            WHERE campaign.public_id::text=%s AND recovery.status='PREPARING'
+            ORDER BY recovery.attempt_number DESC LIMIT 1 FOR UPDATE OF recovery
+            """,
+            (public_id,),
+        ).fetchone()
+        if recovery is None:
+            raise CampaignError("campaign has no pending recovery submission to recover")
+        provider_job_id = finder(
+            str(recovery["submission_display_name"]),
+            str(recovery["configured_model"]),
+        )
+        if provider_job_id is None:
+            raise CampaignError("no matching Gemini recovery Batch is visible yet")
+        updated = connection.execute(
+            """
+            UPDATE ai_annotation_campaign_recoveries SET status='SUBMITTED',
+              provider_job_id=%s,provider_state='BATCH_STATE_PENDING',submitted_at=now()
+            WHERE id=%s AND status='PREPARING' AND provider_job_id IS NULL RETURNING *
+            """,
+            (provider_job_id, recovery["id"]),
+        ).fetchone()
+        if updated is None:
+            raise CampaignError("recovery submission was already recovered")
+        return dict(updated)
+
+
+def collect_recovery(
+    settings: WebSettings,
+    principal: Principal,
+    public_id: str,
+    *,
+    gateway: GeminiGateway | None = None,
+) -> dict[str, Any]:
+    _require_admin(principal)
+    provider = gateway or LiveGeminiGateway()
+    with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
+        row = connection.execute(
+            """
+            SELECT campaign.*,recovery.id AS recovery_id,
+                   recovery.attempt_number,recovery.status AS recovery_status,
+                   recovery.provider_job_id AS recovery_provider_job_id,
+                   recovery.cache_identifier AS recovery_cache_identifier,
+                   recovery.cache_created_at AS recovery_cache_created_at,
+                   recovery.cache_expires_at AS recovery_cache_expires_at,
+                   recovery.cache_metadata AS recovery_cache_metadata,
+                   recovery.unresolved_set_sha256
+            FROM ai_annotation_campaigns campaign
+            JOIN ai_annotation_campaign_recoveries recovery
+              ON recovery.campaign_id=campaign.id
+            WHERE campaign.public_id::text=%s
+            ORDER BY recovery.attempt_number DESC LIMIT 1 FOR UPDATE OF recovery
+            """,
+            (public_id,),
+        ).fetchone()
+        if row is None:
+            raise CampaignError("campaign has no recovery attempt")
+        combined = dict(row)
+        if combined["recovery_status"] == "COLLECTED":
+            return combined
+        if combined["recovery_status"] != "PROVIDER_COMPLETED":
+            raise CampaignError("recovery provider job is not ready for collection")
+        records = _records_for_recovery(connection, int(combined["recovery_id"]))
+        plan = _provider_plan(
+            {**combined, "cache_identifier": combined["recovery_cache_identifier"]},
+            records,
+            expected_record_set_sha256=str(combined["unresolved_set_sha256"]),
+            cache_identifier=str(combined["recovery_cache_identifier"]),
+            display_name=f"phase4d-recovery-{public_id}-{int(combined['attempt_number']):03d}",
+        )
+        batch_value = provider.status(str(combined["recovery_provider_job_id"]))
+        domain_codes = tuple(
+            label.code for label in production_codebook()["taxonomy"].labels
+        )
+        results, coverage = collect_inline_batch(
+            batch_value=batch_value, plan=plan, domain_codes=domain_codes
+        )
+        lineage = {
+            str(value["record_id"]): dict(value)
+            for value in connection.execute(
+                """
+                SELECT record_id,original_request_index,original_validation_error
+                FROM ai_annotation_campaign_recovery_records WHERE recovery_id=%s
+                """,
+                (combined["recovery_id"],),
+            ).fetchall()
+        }
+        for result in results:
+            details = lineage[str(result["record_id"])]
+            result.update(
+                campaign_id=public_id,
+                recovery_attempt_number=int(combined["attempt_number"]),
+                recovery_provider_job_id=combined["recovery_provider_job_id"],
+                original_request_index=details["original_request_index"],
+                original_validation_error=details["original_validation_error"],
+                replacement_validation_result=result.get("status"),
+                provider=combined["provider"],
+                configured_model=combined["configured_model"],
+                prompt_version=combined["prompt_version"],
+                prompt_sha256=combined["prompt_sha256"],
+                schema_sha256=combined["canonical_schema_sha256"],
+                execution_mode=combined["execution_mode"],
+                cache_identifier=combined["recovery_cache_identifier"],
+                batch_id=combined["recovery_provider_job_id"],
+                pricing_effective_date=plan["provenance"]["pricing_effective_date"],
+            )
+            result.update(combined["generation_config"])
+        cache_metadata = combined.get("recovery_cache_metadata")
+        cache_receipt = None
+        if isinstance(cache_metadata, dict) and cache_metadata.get("created_for_recovery"):
+            cache_receipt = {
+                "response": {
+                    "createTime": str(combined["recovery_cache_created_at"]),
+                    "expireTime": str(combined["recovery_cache_expires_at"]),
+                    "usageMetadata": cache_metadata.get("usageMetadata", {}),
+                }
+            }
+        pricing = load_pricing(ROOT / "config/llm_eval/pricing.yaml")
+        summary = _collection_summary(
+            batch_value, plan, results, coverage, pricing, cache_receipt
+        )
+        directory = _recovery_directory(public_id, int(combined["attempt_number"]))
+        if not directory.exists():
+            raise CampaignError("recovery request artifact directory is missing")
+        (directory / "provider_response.json").write_text(
+            json.dumps(batch_value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        (directory / "predictions.jsonl").write_text(
+            "".join(
+                json.dumps(result, ensure_ascii=False, sort_keys=True) + "\n"
+                for result in results
+            ),
+            encoding="utf-8",
+        )
+        failures = [result for result in results if result.get("status") != "success"]
+        (directory / "failures.jsonl").write_text(
+            "".join(
+                json.dumps(result, ensure_ascii=False, sort_keys=True) + "\n"
+                for result in failures
+            ),
+            encoding="utf-8",
+        )
+        (directory / "summary.json").write_text(
+            json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        recovery_hash = hashlib.sha256(
+            (directory / "summary.json").read_bytes()
+            + (directory / "predictions.jsonl").read_bytes()
+        ).hexdigest()
+        current_recovery = {
+            "attempt_number": combined["attempt_number"],
+            "provider_job_id": combined["recovery_provider_job_id"],
+            "artifact_reference": str(directory),
+            "artifact_sha256": recovery_hash,
+            "valid_count": summary["coverage"]["valid_structured_predictions"],
+            "invalid_count": summary["coverage"]["invalid_structured_predictions"],
+            "operational_metadata": {
+                "coverage": summary["coverage"],
+                "tokens": summary["tokens"],
+                "cost": summary["cost"],
+            },
+        }
+        collected = _collected_recoveries(connection, int(combined["id"]))
+        effective_directory = directory / "effective"
+        effective_summary, effective_rows, effective_hash = build_effective_artifact(
+            Path(str(combined["artifact_reference"])),
+            [*collected, current_recovery],
+            effective_directory,
+        )
+        effective_invalid = int(
+            effective_summary["coverage"]["invalid_structured_predictions"]
+        )
+        updated = connection.execute(
+            """
+            UPDATE ai_annotation_campaign_recoveries SET status='COLLECTED',
+              artifact_reference=%s,artifact_sha256=%s,
+              effective_artifact_reference=%s,effective_artifact_sha256=%s,
+              valid_count=%s,invalid_count=%s,operational_metadata=%s,collected_at=now()
+            WHERE id=%s AND status='PROVIDER_COMPLETED' RETURNING *
+            """,
+            (
+                str(directory),
+                recovery_hash,
+                str(effective_directory),
+                effective_hash,
+                current_recovery["valid_count"],
+                current_recovery["invalid_count"],
+                Jsonb(current_recovery["operational_metadata"]),
+                combined["recovery_id"],
+            ),
+        ).fetchone()
+        if updated is None:
+            raise CampaignError("recovery collection could not be persisted")
+        connection.execute(
+            """
+            UPDATE ai_annotation_campaigns SET valid_count=%s,invalid_count=%s
+            WHERE id=%s
+            """,
+            (len(effective_rows) - effective_invalid, effective_invalid, combined["id"]),
+        )
+        return dict(updated)
+
+
 def validate_campaign(
     settings: WebSettings, principal: Principal, public_id: str
 ) -> dict[str, Any]:
@@ -1432,8 +2095,23 @@ def validate_campaign(
             return dict(campaign)
         if campaign["status"] != "COLLECTED":
             raise CampaignError("campaign results have not been collected")
-        directory = Path(str(campaign["artifact_reference"]))
-        summary, rows, artifact_hash = load_prediction_artifact(directory)
+        latest_recovery = connection.execute(
+            """
+            SELECT effective_artifact_reference FROM ai_annotation_campaign_recoveries
+            WHERE campaign_id=%s AND status='COLLECTED'
+            ORDER BY attempt_number DESC LIMIT 1
+            """,
+            (campaign["id"],),
+        ).fetchone()
+        directory = Path(
+            str(
+                latest_recovery["effective_artifact_reference"]
+                if latest_recovery is not None
+                and latest_recovery.get("effective_artifact_reference")
+                else campaign["artifact_reference"]
+            )
+        )
+        summary, rows, _artifact_hash = load_prediction_artifact(directory)
         coverage = summary["coverage"]
         if len(rows) != int(campaign["planned_count"]):
             raise CampaignError("validated result coverage does not equal planned records")
@@ -1442,10 +2120,10 @@ def validate_campaign(
         updated = connection.execute(
             """
             UPDATE ai_annotation_campaigns SET status='VALIDATED',validated_at=now(),
-              artifact_sha256=%s,valid_count=%s,invalid_count=%s
+              valid_count=%s,invalid_count=%s
             WHERE id=%s RETURNING *
             """,
-            (artifact_hash, len(rows), coverage["invalid_structured_predictions"], campaign["id"]),
+            (len(rows), coverage["invalid_structured_predictions"], campaign["id"]),
         ).fetchone()
         assert updated is not None
         return dict(updated)
@@ -1466,7 +2144,22 @@ def import_campaign(
             return dict(campaign)
         if campaign["status"] != "VALIDATED" or campaign["model_prediction_run_id"] is not None:
             raise CampaignError("campaign is not ready for a first prediction import")
-        artifact = Path(str(campaign["artifact_reference"]))
+        latest_recovery = connection.execute(
+            """
+            SELECT effective_artifact_reference FROM ai_annotation_campaign_recoveries
+            WHERE campaign_id=%s AND status='COLLECTED'
+            ORDER BY attempt_number DESC LIMIT 1
+            """,
+            (campaign["id"],),
+        ).fetchone()
+        artifact = Path(
+            str(
+                latest_recovery["effective_artifact_reference"]
+                if latest_recovery is not None
+                and latest_recovery.get("effective_artifact_reference")
+                else campaign["artifact_reference"]
+            )
+        )
         result = import_predictions(artifact, settings.database, dry_run=False)
         run = connection.execute(
             "SELECT id FROM model_prediction_runs WHERE artifact_sha256=%s",
