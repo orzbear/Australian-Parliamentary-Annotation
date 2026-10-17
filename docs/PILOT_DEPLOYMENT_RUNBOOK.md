@@ -26,6 +26,13 @@ Only Caddy publishes host ports. PostgreSQL has no host port and is attached to 
 Docker network. The web service is non-root, read-only, capability-free and reachable only
 through Caddy. Caddy obtains and renews HTTPS certificates for the dedicated subdomain.
 
+The image creates `/var/lib/hansard-campaign-artifacts` as `hansard:hansard` (UID/GID
+10001) before switching to the non-root application user. Docker copies this ownership into
+a newly created named volume when it is first mounted at that path. Existing volumes keep
+their existing filesystem metadata and are not changed by the image or deployment scripts;
+repair an incorrectly owned existing volume as an explicit operator action outside the
+application container.
+
 PostgreSQL uses an owner role for explicit migration/backup operations and a separate
 application login for the web service. The role-init script reapplies grants after restore
 and migration. Web startup never runs migrations.

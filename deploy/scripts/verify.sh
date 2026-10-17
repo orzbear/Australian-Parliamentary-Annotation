@@ -9,6 +9,8 @@ compose ps
 compose exec -T web python -m hansard_annotator.db.cli connection-test
 compose exec -T web python -m hansard_annotator.db.cli migration-status
 compose exec -T web python -m hansard_annotator.product.cli verify
+compose exec -T web sh -c \
+  'probe=/var/lib/hansard-campaign-artifacts/.deployment-write-test.$$; touch "$probe"; rm -f "$probe"'
 
 curl --fail --silent --show-error "https://$HANSARD_DOMAIN/health/live"
 echo
