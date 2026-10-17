@@ -25,6 +25,7 @@ from hansard_annotator.web.campaigns.service import (
     recover_recovery_submission,
     refresh_campaign,
     refresh_recovery,
+    repair_campaign_results,
     submit_campaign,
     submit_recovery,
     transition_campaign,
@@ -58,6 +59,9 @@ def _notice_message(code: str | None, campaign: dict[str, object]) -> str | None
         "recovery-submitted": "Paid targeted recovery submitted.",
         "recovery-status-refreshed": "Recovery provider status refreshed.",
         "recovery-collected": "Recovery results collected and effective validation refreshed.",
+        "structural-repair-applied": (
+            "Approved deterministic structural repairs applied locally; no provider call was made."
+        ),
         "campaign-cancelled": "Campaign cancelled.",
     }
     if code == "validation-passed":
@@ -255,6 +259,8 @@ async def _action(
             collect_campaign(settings, principal, campaign_id)
         elif operation == "validate":
             validate_campaign(settings, principal, campaign_id)
+        elif operation == "repair-structural":
+            repair_campaign_results(settings, principal, campaign_id)
         elif operation == "import":
             import_campaign(settings, principal, campaign_id)
         elif operation == "retry-invalid":
@@ -274,6 +280,7 @@ async def _action(
         "refresh": "status-refreshed",
         "collect": "results-collected",
         "validate": "validation-passed",
+        "repair-structural": "structural-repair-applied",
         "import": "predictions-imported",
         "retry-invalid": "recovery-submitted",
         "recovery-refresh": "recovery-status-refreshed",
@@ -324,6 +331,16 @@ async def campaign_validate(
     principal: Annotated[Principal, Depends(require_admin)],
 ) -> RedirectResponse:
     return await _action(request, settings, principal, campaign_id, "validate")
+
+
+@router.post("/{campaign_id}/repair-structural")
+async def campaign_repair_structural(
+    request: Request,
+    campaign_id: str,
+    settings: Annotated[WebSettings, Depends(get_settings)],
+    principal: Annotated[Principal, Depends(require_admin)],
+) -> RedirectResponse:
+    return await _action(request, settings, principal, campaign_id, "repair-structural")
 
 
 @router.post("/{campaign_id}/import")

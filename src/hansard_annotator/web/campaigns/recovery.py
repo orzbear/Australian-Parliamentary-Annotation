@@ -9,19 +9,30 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
+from hansard_annotator.llm_eval.validation import InvalidPrediction, validate_prediction
+
+STRUCTURAL_REPAIR_RULE = "remove_primary_from_secondary_v1"
+STRUCTURAL_REPAIR_VERSION = 1
+STRUCTURAL_REPAIR_DIRECTORY = f"structural-repair-{STRUCTURAL_REPAIR_RULE}"
+
 
 class RecoveryArtifactError(ValueError):
     """A campaign or recovery artifact cannot be resolved safely."""
 
 
+def iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:
+    with path.open(encoding="utf-8") as source:
+        for number, line in enumerate(source, 1):
+            value = json.loads(line)
+            if not isinstance(value, dict):
+                raise RecoveryArtifactError(
+                    f"{path.name} line {number} is not an object"
+                )
+            yield value
+
+
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-        value = json.loads(line)
-        if not isinstance(value, dict):
-            raise RecoveryArtifactError(f"{path.name} line {number} is not an object")
-        rows.append(value)
-    return rows
+    return list(iter_jsonl(path))
 
 
 def _unique_by_record_id(rows: Iterable[dict[str, Any]], label: str) -> dict[str, dict[str, Any]]:
@@ -90,6 +101,173 @@ def artifact_sha256(directory: Path) -> str:
         digest.update(b"\0")
         digest.update((directory / name).read_bytes())
     return digest.hexdigest()
+
+
+def structural_repair_directory(source_directory: Path) -> Path:
+    """Return the deterministic append-only repair location for an effective artifact."""
+    return source_directory.parent / f"{source_directory.name}-{STRUCTURAL_REPAIR_DIRECTORY}"
+
+
+def _provider_prediction(row: dict[str, Any]) -> object:
+    """Recover the exact JSON value retained in a Gemini campaign result."""
+    response = row.get("provider_response")
+    candidates = response.get("candidates") if isinstance(response, dict) else None
+    candidate = candidates[0] if isinstance(candidates, list) and candidates else None
+    content = candidate.get("content") if isinstance(candidate, dict) else None
+    parts = content.get("parts") if isinstance(content, dict) else None
+    if not isinstance(parts, list):
+        return None
+    for part in parts:
+        text = part.get("text") if isinstance(part, dict) else None
+        if isinstance(text, str):
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return None
+    return None
+
+
+def _repair_primary_in_secondary(
+    row: dict[str, Any], domain_codes: tuple[str, ...]
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    if row.get("status") != "invalid":
+        return None
+    before = _provider_prediction(row)
+    if not isinstance(before, dict):
+        return None
+    primary = before.get("primary_australian_domain")
+    secondary = before.get("secondary_australian_domains")
+    if (
+        not isinstance(primary, str)
+        or primary not in domain_codes
+        or not isinstance(secondary, list)
+        or primary not in secondary
+    ):
+        return None
+    try:
+        validate_prediction(before, domain_codes)
+    except InvalidPrediction:
+        pass
+    else:
+        return None
+    after = copy.deepcopy(before)
+    after["secondary_australian_domains"] = [
+        value for value in secondary if value != primary
+    ]
+    try:
+        validated_prediction = validate_prediction(after, domain_codes)
+    except InvalidPrediction:
+        return None
+    validated = validated_prediction.to_dict()
+    validated["secondary_australian_domains"] = list(
+        validated_prediction.secondary_australian_domains
+    )
+    replacement = copy.deepcopy(row)
+    lineage = {
+        "record_id": row.get("record_id"),
+        "rule_id": STRUCTURAL_REPAIR_RULE,
+        "rule_version": STRUCTURAL_REPAIR_VERSION,
+        "source_status": row.get("status"),
+        "source_validation_error": row.get("validation_error"),
+        "source_request_index": row.get("request_index"),
+        "source_response_index": row.get("response_index"),
+        "source_recovery_attempt_number": row.get("recovery_attempt_number"),
+        "before_prediction": before,
+        "after_prediction": validated,
+    }
+    replacement.update(
+        status="success",
+        prediction=validated,
+        validation_error=None,
+        effective_source="structural_repair",
+        structural_repair=copy.deepcopy(lineage),
+    )
+    return replacement, lineage
+
+
+def apply_structural_repairs(
+    rows: Iterable[dict[str, Any]], domain_codes: tuple[str, ...]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Apply only allow-listed repairs; every accepted replacement passes strict validation."""
+    effective: list[dict[str, Any]] = []
+    lineage: list[dict[str, Any]] = []
+    for row in rows:
+        repaired = _repair_primary_in_secondary(row, domain_codes)
+        if repaired is None:
+            effective.append(copy.deepcopy(row))
+            continue
+        replacement, repair_lineage = repaired
+        effective.append(replacement)
+        lineage.append(repair_lineage)
+    return effective, lineage
+
+
+def structural_repair_count(
+    rows: Iterable[dict[str, Any]], domain_codes: tuple[str, ...]
+) -> int:
+    return sum(
+        _repair_primary_in_secondary(row, domain_codes) is not None for row in rows
+    )
+
+
+def build_structurally_repaired_artifact(
+    source_directory: Path,
+    output_directory: Path,
+    domain_codes: tuple[str, ...],
+) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+    """Write an append-only derived artifact and exact deterministic repair lineage."""
+    if output_directory.exists():
+        raise RecoveryArtifactError("structural repair artifact already exists")
+    summary = json.loads(
+        (source_directory / "operational_summary.json").read_text(encoding="utf-8")
+    )
+    if not isinstance(summary, dict):
+        raise RecoveryArtifactError("source operational summary is not an object")
+    source_rows = read_jsonl(source_directory / "predictions.jsonl")
+    rows, lineage = apply_structural_repairs(source_rows, domain_codes)
+    if not lineage:
+        raise RecoveryArtifactError("no approved deterministic structural repair applies")
+    valid = sum(row.get("status") == "success" for row in rows)
+    invalid = len(rows) - valid
+    coverage = summary.setdefault("coverage", {})
+    planned = int(coverage.get("planned_requests") or len(rows))
+    coverage.update(
+        valid_structured_predictions=valid,
+        invalid_structured_predictions=invalid,
+        accounting_invariant_ok=planned == len(rows),
+    )
+    lineage_text = "".join(
+        json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n"
+        for value in lineage
+    )
+    lineage_sha256 = hashlib.sha256(lineage_text.encode("utf-8")).hexdigest()
+    provenance = summary.setdefault("provenance", {})
+    provenance["structural_repair_rules"] = [STRUCTURAL_REPAIR_RULE]
+    summary["structural_repair"] = {
+        "append_only": True,
+        "rule_id": STRUCTURAL_REPAIR_RULE,
+        "rule_version": STRUCTURAL_REPAIR_VERSION,
+        "repaired_count": len(lineage),
+        "unresolved_count": invalid,
+        "source_artifact_sha256": artifact_sha256(source_directory),
+        "lineage_file": "structural_repairs.jsonl",
+        "lineage_sha256": lineage_sha256,
+        "validation": "existing strict Phase 4A prediction validator",
+    }
+    output_directory.mkdir(parents=True)
+    (output_directory / "structural_repairs.jsonl").write_text(
+        lineage_text, encoding="utf-8"
+    )
+    (output_directory / "predictions.jsonl").write_text(
+        "".join(
+            json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in rows
+        ),
+        encoding="utf-8",
+    )
+    (output_directory / "operational_summary.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return summary, rows, artifact_sha256(output_directory)
 
 
 def _sum_metric(

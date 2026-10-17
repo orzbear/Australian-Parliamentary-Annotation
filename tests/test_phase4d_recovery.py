@@ -15,8 +15,12 @@ from hansard_annotator.llm_eval.operations import (
 )
 from hansard_annotator.llm_eval.validation import InvalidPrediction, validate_prediction
 from hansard_annotator.web.campaigns.recovery import (
+    STRUCTURAL_REPAIR_RULE,
+    apply_structural_repairs,
     build_effective_artifact,
+    build_structurally_repaired_artifact,
     effective_results,
+    structural_repair_directory,
     unresolved_results,
 )
 
@@ -28,6 +32,23 @@ def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
         "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
         encoding="utf-8",
     )
+
+
+def _provider_response(prediction: dict[str, object]) -> dict[str, object]:
+    return {
+        "candidates": [
+            {"content": {"parts": [{"text": json.dumps(prediction)}]}}
+        ]
+    }
+
+
+def _repairable_prediction() -> dict[str, object]:
+    return {
+        "is_non_policy": False,
+        "primary_australian_domain": "AU07",
+        "secondary_australian_domains": ["AU08", "AU07"],
+        "reasoning": "The policy concerns AU07 with a secondary AU08 dimension.",
+    }
 
 
 def _original_artifact(path: Path, *, records: int = 1_000) -> bytes:
@@ -53,6 +74,7 @@ def _original_artifact(path: Path, *, records: int = 1_000) -> bytes:
             "status": "invalid",
             "prediction": None,
             "validation_error": "primary domain cannot also be secondary",
+            "provider_response": _provider_response(_repairable_prediction()),
         }
     )
     _write_jsonl(path / "predictions.jsonl", rows)
@@ -124,6 +146,9 @@ def _recovery(
             else None
         ),
         "validation_error": None if status == "success" else "still invalid",
+        "provider_response": (
+            None if status == "success" else _provider_response(_repairable_prediction())
+        ),
     }
     _write_jsonl(path / "predictions.jsonl", [row])
     return {
@@ -216,6 +241,107 @@ def test_local_validation_still_rejects_primary_as_secondary() -> None:
         )
 
 
+def test_append_only_structural_repair_resolves_current_case_and_allows_import(
+    tmp_path: Path,
+) -> None:
+    original = tmp_path / "original"
+    _original_artifact(original)
+    recovery_directory = tmp_path / "attempt-001"
+    recovery = _recovery(recovery_directory, attempt=1, status="invalid")
+    original_before = {
+        path.name: path.read_bytes() for path in original.iterdir() if path.is_file()
+    }
+    recovery_before = {
+        path.name: path.read_bytes()
+        for path in recovery_directory.iterdir()
+        if path.is_file()
+    }
+    original_entries_before = sorted(
+        path.relative_to(original).as_posix() for path in original.rglob("*")
+    )
+    recovery_entries_before = sorted(
+        path.relative_to(recovery_directory).as_posix()
+        for path in recovery_directory.rglob("*")
+    )
+    effective = tmp_path / "effective"
+    build_effective_artifact(original, [recovery], effective)
+    repaired_directory = structural_repair_directory(effective)
+    summary, rows, artifact_hash = build_structurally_repaired_artifact(
+        effective, repaired_directory, DOMAIN_CODES
+    )
+
+    repaired = rows[-1]
+    assert repaired["status"] == "success"
+    assert repaired["prediction"] == {
+        "is_non_policy": False,
+        "primary_australian_domain": "AU07",
+        "secondary_australian_domains": ["AU08"],
+        "reasoning": "The policy concerns AU07 with a secondary AU08 dimension.",
+    }
+    assert summary["coverage"]["valid_structured_predictions"] == 1_000
+    assert summary["coverage"]["invalid_structured_predictions"] == 0
+    assert summary["structural_repair"]["rule_id"] == STRUCTURAL_REPAIR_RULE
+    assert summary["structural_repair"]["repaired_count"] == 1
+    lineage = json.loads(
+        (repaired_directory / "structural_repairs.jsonl").read_text(encoding="utf-8")
+    )
+    assert lineage["before_prediction"] == _repairable_prediction()
+    assert lineage["after_prediction"] == repaired["prediction"]
+    assert lineage["rule_version"] == 1
+
+    loaded_summary, loaded_rows, loaded_hash = load_prediction_artifact(
+        repaired_directory
+    )
+    assert len(loaded_rows) == 1_000
+    assert loaded_summary["coverage"]["invalid_structured_predictions"] == 0
+    assert loaded_hash == artifact_hash
+    repeated_directory = tmp_path / "repeated-repair"
+    _repeated_summary, _repeated_rows, repeated_hash = (
+        build_structurally_repaired_artifact(
+            effective, repeated_directory, DOMAIN_CODES
+        )
+    )
+    assert repeated_hash == artifact_hash
+    assert (repeated_directory / "structural_repairs.jsonl").read_bytes() == (
+        repaired_directory / "structural_repairs.jsonl"
+    ).read_bytes()
+    assert (repeated_directory / "predictions.jsonl").read_bytes() == (
+        repaired_directory / "predictions.jsonl"
+    ).read_bytes()
+    assert {
+        path.name: path.read_bytes() for path in original.iterdir() if path.is_file()
+    } == original_before
+    assert sorted(
+        path.relative_to(original).as_posix() for path in original.rglob("*")
+    ) == original_entries_before
+    assert {
+        path.name: path.read_bytes()
+        for path in recovery_directory.iterdir()
+        if path.is_file()
+    } == recovery_before
+    assert sorted(
+        path.relative_to(recovery_directory).as_posix()
+        for path in recovery_directory.rglob("*")
+    ) == recovery_entries_before
+
+
+def test_structural_repair_does_not_broaden_permitted_changes() -> None:
+    raw = _repairable_prediction()
+    raw["reasoning"] = "x" * 1_001
+    row = {
+        "record_id": "turn:1",
+        "request_index": 0,
+        "status": "invalid",
+        "prediction": None,
+        "validation_error": "reasoning must be a short string",
+        "provider_response": _provider_response(raw),
+    }
+    before = json.loads(json.dumps(row))
+    rows, lineage = apply_structural_repairs([row], DOMAIN_CODES)
+    assert rows == [before]
+    assert lineage == []
+
+
 def test_recovery_migration_enforces_active_set_idempotency_and_lineage() -> None:
     migration = Path(
         "migrations/versions/20261017_08_campaign_recovery.py"
@@ -239,6 +365,9 @@ def test_recovery_ui_resets_progress_state_and_labels_paid_action() -> None:
     assert "Retry {{ campaign.invalid_count }} invalid record" in detail
     assert "paid provider action" in detail
     assert "RETRY INVALID RECORDS" in detail
+    assert "remove_primary_from_secondary_v1" in detail
+    assert "Apply deterministic structural repair" in detail
+    assert "/repair-structural" in detail
     assert 'window.addEventListener("pageshow", resetProgressForms)' in javascript
     assert "delete progressForm.dataset.submitting" in javascript
     assert "button.disabled = false" in javascript
