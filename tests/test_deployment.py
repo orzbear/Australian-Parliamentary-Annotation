@@ -64,6 +64,40 @@ def test_production_runtime_versions_and_https_host_are_pinned() -> None:
     assert "Host {$HANSARD_DOMAIN}" in caddy
 
 
+def test_campaign_artifact_volume_is_initialized_for_non_root_web_user() -> None:
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    compose = yaml.safe_load(
+        (ROOT / "compose.production.yaml").read_text(encoding="utf-8")
+    )
+    verify_script = (ROOT / "deploy" / "scripts" / "verify.sh").read_text(
+        encoding="utf-8"
+    )
+
+    artifact_path = "/var/lib/hansard-campaign-artifacts"
+    mkdir_statement = (
+        "mkdir -p /var/empty/hansard-processed "
+        "/var/lib/hansard-campaign-artifacts"
+    )
+    chown_statement = "chown hansard:hansard /var/lib/hansard-campaign-artifacts"
+
+    assert mkdir_statement in dockerfile
+    assert chown_statement in dockerfile
+    assert dockerfile.index(chown_statement) < dockerfile.index("USER 10001:10001")
+
+    web = compose["services"]["web"]
+    assert (
+        "hansard-campaign-artifacts:/var/lib/hansard-campaign-artifacts"
+        in web["volumes"]
+    )
+    assert web["read_only"] is True
+    assert web["cap_drop"] == ["ALL"]
+
+    assert f"probe={artifact_path}/.deployment-write-test.$$" in verify_script
+    assert 'touch "$probe"' in verify_script
+    assert 'rm -f "$probe"' in verify_script
+    assert "chown" not in verify_script
+
+
 def test_daily_backup_timer_is_persistent_and_non_destructive() -> None:
     service = (
         ROOT / "deploy/systemd/hansard-annotator-backup.service"
