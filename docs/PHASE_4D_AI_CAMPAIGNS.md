@@ -68,6 +68,13 @@ after submission. Selected records are append-only. Restrictive foreign keys pre
 corpus, user, turn, and prediction-run provenance. Downgrade refuses to destroy campaign
 data.
 
+Migration `20261017_08` adds append-only targeted-recovery lineage. One recovery-attempt
+row owns its deterministic unresolved-set hash, attempt number, provider/cache identity,
+cost telemetry, and separate artifact references. Recovery-record rows pin the campaign
+record, original request index, and original validation error. A partial unique index permits
+only one active attempt for the same unresolved set, while a failed or still-invalid collected
+attempt can be followed by a new numbered attempt.
+
 ## State machine
 
 The service—not route handlers—owns transitions:
@@ -170,6 +177,15 @@ immutable UUID under technical details. Runs remain separate and sort newest-fir
 full-review, edited-case, and codebook-flag CSVs are explicitly labelled; summary JSON, audit
 Markdown, and audit ZIP artifacts require zero unreviewed predictions.
 
+When original provider coverage is complete but a result is structurally invalid or
+provider-failed, an administrator may explicitly approve a paid retry of only the unresolved
+record IDs. Every attempt is written under `recovery/attempt-NNN`; original Batch responses,
+predictions, failures, summaries, and costs are never rewritten. The effective artifact is a
+derived view: the latest successful recovery replaces its original result, otherwise the
+original remains effective. Import remains all-or-nothing and is enabled only when this view
+contains every planned record with zero missing, duplicate, or invalid results. Recovery
+usage/cost stays separately attributable and is added to the displayed campaign total.
+
 ## Idempotency and recovery
 
 - READY plus a null provider job is required for first submission.
@@ -179,6 +195,11 @@ Markdown, and audit ZIP artifacts require zero unreviewed predictions.
 - Validation is repeat-safe in the same state.
 - Phase 4C artifact hashing and database uniqueness make import idempotent.
 - A campaign can link to one prediction run, and a run can link to one campaign.
+- An active unresolved-set recovery is unique, so double-clicks cannot submit a second job.
+- Recovery display names are deterministic; a lost submission receipt is recovered by
+  listing Gemini batches and matching the exact display name and model before any new submit.
+- Compatible live explicit caches are verified and reused. An unavailable cache is recreated
+  from the same frozen V2 canonical prefix and its provenance is stored on that attempt.
 
 There is no polling worker or Redis. Provider lookup, collection, validation, and import are
 explicit short web actions and remain available through the Phase 4B/4C CLIs for operational
