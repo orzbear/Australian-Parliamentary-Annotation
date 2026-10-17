@@ -56,8 +56,11 @@ from hansard_annotator.web.auth.models import Principal
 from hansard_annotator.web.campaigns.recovery import (
     RecoveryArtifactError,
     build_effective_artifact,
+    build_structurally_repaired_artifact,
+    iter_jsonl,
     read_jsonl,
-    unresolved_results,
+    structural_repair_count,
+    structural_repair_directory,
 )
 from hansard_annotator.web.codebook.service import ROOT, production_codebook
 from hansard_annotator.web.config import WebSettings
@@ -912,6 +915,27 @@ def get_campaign(
             ),
             None,
         )
+        result["structural_repair_available_count"] = 0
+        result["structural_repair_applied_count"] = 0
+        if result.get("artifact_reference"):
+            source_directory = _base_effective_artifact_directory(result, recoveries)
+            repaired_directory = structural_repair_directory(source_directory)
+            if repaired_directory.exists():
+                repair_summary = json.loads(
+                    (repaired_directory / "operational_summary.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                repair_metadata = repair_summary.get("structural_repair", {})
+                if isinstance(repair_metadata, dict):
+                    result["structural_repair_applied_count"] = int(
+                        repair_metadata.get("repaired_count") or 0
+                    )
+            elif result["status"] == "COLLECTED" and int(result["invalid_count"]) > 0:
+                result["structural_repair_available_count"] = structural_repair_count(
+                    iter_jsonl(source_directory / "predictions.jsonl"),
+                    _production_domain_codes(),
+                )
         original_metadata = cast(
             dict[str, Any], result.get("operational_metadata") or {}
         )
@@ -1403,6 +1427,28 @@ def _artifact_directory(public_id: str) -> Path:
     return target
 
 
+def _production_domain_codes() -> tuple[str, ...]:
+    return tuple(label.code for label in production_codebook()["taxonomy"].labels)
+
+
+def _base_effective_artifact_directory(
+    campaign: dict[str, Any], recoveries: list[dict[str, Any]]
+) -> Path:
+    for recovery in reversed(recoveries):
+        reference = recovery.get("effective_artifact_reference")
+        if recovery.get("status") == "COLLECTED" and isinstance(reference, str):
+            return Path(reference)
+    return Path(str(campaign["artifact_reference"]))
+
+
+def _current_effective_artifact_directory(
+    campaign: dict[str, Any], recoveries: list[dict[str, Any]]
+) -> Path:
+    source = _base_effective_artifact_directory(campaign, recoveries)
+    repaired = structural_repair_directory(source)
+    return repaired if repaired.exists() else source
+
+
 def collect_campaign(
     settings: WebSettings,
     principal: Principal,
@@ -1631,8 +1677,12 @@ def submit_recovery(
         if active is not None:
             raise CampaignError("an unresolved-record recovery job is already active")
         collected = _collected_recoveries(connection, int(campaign["id"]))
-        original_directory = Path(str(campaign["artifact_reference"]))
-        unresolved = unresolved_results(original_directory, collected)
+        source_directory = _current_effective_artifact_directory(campaign, collected)
+        unresolved = [
+            result
+            for result in read_jsonl(source_directory / "predictions.jsonl")
+            if result.get("status") in {"invalid", "provider_failure"}
+        ]
         if not unresolved:
             raise CampaignError("campaign has no unresolved retry-eligible records")
         unresolved_ids = [str(result["record_id"]) for result in unresolved]
@@ -1663,13 +1713,13 @@ def submit_recovery(
             ),
         ).fetchone()
         assert recovery is not None
-        original = {
+        source_results = {
             str(value["record_id"]): value
-            for value in read_jsonl(original_directory / "predictions.jsonl")
+            for value in read_jsonl(source_directory / "predictions.jsonl")
         }
         for result in unresolved:
             record_id = str(result["record_id"])
-            source = original[record_id]
+            source = source_results[record_id]
             error = source.get("validation_error") or source.get("provider_error")
             rendered_error = (
                 str(error)
@@ -1854,6 +1904,61 @@ def refresh_recovery(
                 Jsonb({"provider_error": status["error"]}),
                 recovery["id"],
             ),
+        ).fetchone()
+        assert updated is not None
+        return dict(updated)
+
+
+def repair_campaign_results(
+    settings: WebSettings, principal: Principal, public_id: str
+) -> dict[str, Any]:
+    """Create an append-only local repair artifact without contacting a provider."""
+    _require_admin(principal)
+    with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
+        row = connection.execute(
+            "SELECT * FROM ai_annotation_campaigns WHERE public_id::text=%s FOR UPDATE",
+            (public_id,),
+        ).fetchone()
+        if row is None:
+            raise LookupError("AI annotation campaign not found")
+        campaign = dict(row)
+        if campaign["status"] != "COLLECTED" or campaign.get("model_prediction_run_id"):
+            raise CampaignError("campaign is not eligible for structural repair")
+        active = connection.execute(
+            """
+            SELECT id FROM ai_annotation_campaign_recoveries
+            WHERE campaign_id=%s AND status IN
+              ('PREPARING','SUBMITTED','RUNNING','PROVIDER_COMPLETED')
+            LIMIT 1
+            """,
+            (campaign["id"],),
+        ).fetchone()
+        if active is not None:
+            raise CampaignError("structural repair is blocked by an active recovery job")
+        recoveries = _collected_recoveries(connection, int(campaign["id"]))
+        source_directory = _base_effective_artifact_directory(campaign, recoveries)
+        output_directory = structural_repair_directory(source_directory)
+        if output_directory.exists():
+            summary = json.loads(
+                (output_directory / "operational_summary.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            rows = read_jsonl(output_directory / "predictions.jsonl")
+        else:
+            summary, rows, _artifact_hash = build_structurally_repaired_artifact(
+                source_directory, output_directory, _production_domain_codes()
+            )
+        coverage = summary.get("coverage")
+        if not isinstance(coverage, dict):
+            raise CampaignError("structural repair artifact has no coverage metadata")
+        invalid = int(coverage.get("invalid_structured_predictions") or 0)
+        updated = connection.execute(
+            """
+            UPDATE ai_annotation_campaigns SET valid_count=%s,invalid_count=%s
+            WHERE id=%s RETURNING *
+            """,
+            (len(rows) - invalid, invalid, campaign["id"]),
         ).fetchone()
         assert updated is not None
         return dict(updated)
@@ -2095,21 +2200,8 @@ def validate_campaign(
             return dict(campaign)
         if campaign["status"] != "COLLECTED":
             raise CampaignError("campaign results have not been collected")
-        latest_recovery = connection.execute(
-            """
-            SELECT effective_artifact_reference FROM ai_annotation_campaign_recoveries
-            WHERE campaign_id=%s AND status='COLLECTED'
-            ORDER BY attempt_number DESC LIMIT 1
-            """,
-            (campaign["id"],),
-        ).fetchone()
-        directory = Path(
-            str(
-                latest_recovery["effective_artifact_reference"]
-                if latest_recovery is not None
-                and latest_recovery.get("effective_artifact_reference")
-                else campaign["artifact_reference"]
-            )
+        directory = _current_effective_artifact_directory(
+            dict(campaign), _collected_recoveries(connection, int(campaign["id"]))
         )
         summary, rows, _artifact_hash = load_prediction_artifact(directory)
         coverage = summary["coverage"]
@@ -2144,21 +2236,8 @@ def import_campaign(
             return dict(campaign)
         if campaign["status"] != "VALIDATED" or campaign["model_prediction_run_id"] is not None:
             raise CampaignError("campaign is not ready for a first prediction import")
-        latest_recovery = connection.execute(
-            """
-            SELECT effective_artifact_reference FROM ai_annotation_campaign_recoveries
-            WHERE campaign_id=%s AND status='COLLECTED'
-            ORDER BY attempt_number DESC LIMIT 1
-            """,
-            (campaign["id"],),
-        ).fetchone()
-        artifact = Path(
-            str(
-                latest_recovery["effective_artifact_reference"]
-                if latest_recovery is not None
-                and latest_recovery.get("effective_artifact_reference")
-                else campaign["artifact_reference"]
-            )
+        artifact = _current_effective_artifact_directory(
+            dict(campaign), _collected_recoveries(connection, int(campaign["id"]))
         )
         result = import_predictions(artifact, settings.database, dry_run=False)
         run = connection.execute(

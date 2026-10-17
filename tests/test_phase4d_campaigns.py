@@ -629,6 +629,7 @@ def test_phase4d_routers_expose_campaign_codebook_and_export_endpoints() -> None
     assert "/ai-annotation" in paths
     assert "/ai-annotation/{campaign_id}/submit" in paths
     assert "/ai-annotation/{campaign_id}/provider-status" in paths
+    assert "/ai-annotation/{campaign_id}/repair-structural" in paths
     assert "/codebook" in paths
     assert "/exports" in paths
 
@@ -639,6 +640,9 @@ class _Result:
 
     def fetchone(self) -> dict[str, Any] | None:
         return self.row
+
+    def fetchall(self) -> list[dict[str, Any]]:
+        return []
 
 
 class _Connection:

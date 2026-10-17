@@ -186,6 +186,19 @@ original remains effective. Import remains all-or-nothing and is enabled only wh
 contains every planned record with zero missing, duplicate, or invalid results. Recovery
 usage/cost stays separately attributable and is added to the displayed campaign total.
 
+Before another paid retry, the campaign UI detects whether an approved deterministic local
+structural repair applies. The initial allow-list contains only
+`remove_primary_from_secondary_v1`: if a valid primary domain code is repeated in the
+secondary-domain list, the identical secondary occurrence is removed. Policy status, primary
+domain, every other secondary domain, reasoning, and all other prediction fields remain
+unchanged, and the existing strict validator must accept the result before it becomes
+effective. The stage writes a new append-only derived directory containing effective
+predictions and a separately hashed `structural_repairs.jsonl` with exact before/after values,
+source validation details, rule ID, and rule version. Original campaign and provider-recovery
+artifacts remain byte-identical. Unrepairable records remain invalid and eligible for targeted
+provider recovery; the UI does not encourage another paid retry while this approved repair is
+available.
+
 ## Idempotency and recovery
 
 - READY plus a null provider job is required for first submission.
