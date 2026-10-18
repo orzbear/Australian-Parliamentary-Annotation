@@ -13,7 +13,7 @@ def test_production_compose_isolates_database_and_hermes() -> None:
     compose = yaml.safe_load(raw)
     services = compose["services"]
 
-    assert set(services) == {"postgres", "web", "migrate", "caddy"}
+    assert set(services) == {"postgres", "web", "migrate", "campaign-worker", "caddy"}
     assert "hermes" not in raw.lower()
     assert "ports" not in services["postgres"]
     assert services["postgres"]["networks"] == ["database"]
@@ -24,6 +24,21 @@ def test_production_compose_isolates_database_and_hermes() -> None:
     assert services["web"]["environment"]["HANSARD_COOKIE_SECURE"] == "true"
     assert services["caddy"]["ports"] == ["80:80", "443:443", "443:443/udp"]
     assert services["migrate"]["profiles"] == ["tools"]
+    worker = services["campaign-worker"]
+    assert worker["command"] == [
+        "hansard-campaign-worker",
+        "--watch",
+        "--interval-seconds",
+        "15",
+    ]
+    assert worker["read_only"] is True
+    assert worker["cap_drop"] == ["ALL"]
+    assert worker["networks"] == ["database"]
+    assert "frontend" not in worker["networks"]
+    assert (
+        "hansard-campaign-artifacts:/var/lib/hansard-campaign-artifacts"
+        in worker["volumes"]
+    )
 
 
 def test_production_templates_contain_no_real_secrets_or_destructive_volume_down() -> None:
@@ -167,7 +182,7 @@ def test_restricted_release_command_backs_up_before_migration() -> None:
     assert backup_position < migration_position
     assert "sha256sum" in release
     assert "flock -n" in release
-    assert "--no-build web caddy" in release
+    assert "--no-build web campaign-worker caddy" in release
     assert "docker compose down" not in release
     assert "hansard-postgres-data" not in release
     assert "NOPASSWD: %s" in bootstrap

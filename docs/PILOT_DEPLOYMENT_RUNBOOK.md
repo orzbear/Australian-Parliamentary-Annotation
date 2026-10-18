@@ -108,7 +108,7 @@ printing secrets.
 ## 5. Build without starting public services
 
 ```bash
-docker compose --env-file .env.production -f compose.production.yaml build web migrate
+docker compose --env-file .env.production -f compose.production.yaml build web migrate campaign-worker
 ```
 
 Review the service boundary:
@@ -151,7 +151,7 @@ Copy the dump and `.sha256` off the VPS before continuing.
 ## 7. Start HTTPS application services
 
 ```bash
-docker compose --env-file .env.production -f compose.production.yaml up -d web caddy
+docker compose --env-file .env.production -f compose.production.yaml up -d web campaign-worker caddy
 ```
 
 Do not run `up` from `/docker/hermes-agent-vtxm`, and do not use the Hermes compose file.
@@ -162,7 +162,7 @@ docker compose --env-file .env.production -f compose.production.yaml ps
 ```
 
 ```bash
-docker compose --env-file .env.production -f compose.production.yaml logs --tail=100 web caddy
+docker compose --env-file .env.production -f compose.production.yaml logs --tail=100 web campaign-worker caddy
 ```
 
 Run the verification suite:

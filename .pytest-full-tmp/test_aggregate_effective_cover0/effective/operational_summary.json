@@ -1,0 +1,60 @@
+{
+  "batch_status": {
+    "model": "gemini-3.1-flash-lite",
+    "state": "CAMPAIGN_AGGREGATED"
+  },
+  "cost": {
+    "explicit_cache_storage_cost_usd": 0.0,
+    "token_processing_cost_usd": 0.0,
+    "total_pilot_cost_usd": 0.0
+  },
+  "coverage": {
+    "accounting_invariant_ok": true,
+    "collected_responses": 3,
+    "duplicate": 0,
+    "duplicate_mappings": 0,
+    "failed_provider_responses": 0,
+    "invalid_structured_predictions": 0,
+    "missing": 0,
+    "missing_responses": 0,
+    "original_valid": 2,
+    "planned": 3,
+    "planned_requests": 3,
+    "provider_failed": 0,
+    "structurally_repaired": 1,
+    "successful_provider_responses": 3,
+    "unresolved_invalid": 0,
+    "valid_structured_predictions": 3
+  },
+  "provenance": {
+    "assembled_prompt_sha256": "a41027b001f10b61074c196996606c86b5dac4c0788ae185a05ff68fcf3b7cc6",
+    "batch_id": "phase4e:test",
+    "canonical_schema_sha256": "9c94bab9cd2976559c79b1c31991aef4138a2071a5d3b3d6186a26448f117126",
+    "execution_mode": "batch",
+    "model": "gemini-3.1-flash-lite",
+    "prediction_contract_sha256": "99cafa6c473293dc076793ee6baeca44b6961d7cb11de8f9174517defc4a0879",
+    "pricing_effective_date": "2026-10-01",
+    "pricing_format_version": 1,
+    "prompt_version": "phase4a-policy-v2",
+    "provider": "gemini",
+    "provider_schema_sha256": "980b0ed6d6002a8eadd326f84942ba60dcdf8f2abd9e70ea6aaecf7d78de3c22",
+    "record_ids_sha256": "64915b60b5a3e488502439dc3964e34c15bbb84c21bbd17b8f8e501d8537791f",
+    "structural_repair_rules": [
+      "remove_primary_from_secondary_v1"
+    ],
+    "thinking_level": "minimal"
+  },
+  "structural_repair": {
+    "lineage_file": "structural_repairs.jsonl",
+    "lineage_sha256": "dd22346b48bf7e5ad19239024537bb93d93df83d1db76305da54c5a7b5e8e388",
+    "repaired_count": 1,
+    "rule_id": "remove_primary_from_secondary_v1"
+  },
+  "tokens": {
+    "cached_input_tokens": 0,
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "reasoning_tokens": 0,
+    "total_tokens": 0
+  }
+}

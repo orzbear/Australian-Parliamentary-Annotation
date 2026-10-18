@@ -1,0 +1,178 @@
+{
+  "acceptance_gate_passed": true,
+  "chamber": "Australian Federal House of Representatives",
+  "completed_at": "2026-10-18T12:29:50.349043+00:00",
+  "configuration_hashes": {
+    "business_types": "5bc2fcbdfcfdb0930494843c3324d6b22f3ba5efdfe45d784e6e469490b0abed",
+    "reconstruction": "7c721d94b205acd1a073792cb25c70759aceada995e5936287392256f4e827f3"
+  },
+  "configuration_versions": {
+    "business_types": "1.0.0",
+    "reconstruction": "1.0.0"
+  },
+  "dependency_versions": {
+    "PyYAML": "6.0.3",
+    "lxml": "6.1.1",
+    "psutil": "7.2.2",
+    "pyarrow": "24.0.0"
+  },
+  "error_count": 0,
+  "file_counts": {
+    "completed": 1,
+    "discovered": 1,
+    "failed": 0,
+    "terminal": 1,
+    "unreconciled": 0
+  },
+  "git_commit": "e0b3d5627c042f0ad8f705c72117482dd2bdd585",
+  "input_inventory_sha256": "a762c0d3ecfefde2a872d50fd2811b1aa0185e02310542bef0e3c00ac47be700",
+  "observed_tag_counts": {
+    "debates": 1,
+    "img": 2,
+    "li": 2,
+    "major-heading": 1,
+    "minor-heading": 1,
+    "p": 5,
+    "speech": 5,
+    "sup": 1,
+    "table": 1,
+    "td": 2,
+    "tr": 1,
+    "ul": 1
+  },
+  "observed_talktype_counts": {
+    "speech": 5
+  },
+  "output_files": [
+    {
+      "bytes": 4727,
+      "path": "debate_sections/year=2016/part-00000.parquet",
+      "sha256": "0168b777bf1d40213fc22164e786b845b8751dc73fe45bda642e612799213694"
+    },
+    {
+      "bytes": 234,
+      "path": "reports/continuation_anomalies.csv",
+      "sha256": "c1f4e3d41b39e27dd78c379680497635af3785cc6fb174064e2759fd5f0e3308"
+    },
+    {
+      "bytes": 1007,
+      "path": "reports/corpus_summary.csv",
+      "sha256": "a23786dbd7cf60ec4b56ef88973c2d80c80b5fa0f58c30fee8b3c36eb2fd8129"
+    },
+    {
+      "bytes": 263,
+      "path": "reports/duplicate_ids.csv",
+      "sha256": "02fddc8e7c49caabf463f9000c4dfcf09f6aa8741e53a517ac8e0946d66dd115"
+    },
+    {
+      "bytes": 385,
+      "path": "reports/file_processing_report.csv",
+      "sha256": "6e2c5728a65d6e57a6c3c58288ef2e6146ed36fe1227ff5ee6de9473b7b5b6f8"
+    },
+    {
+      "bytes": 723,
+      "path": "reports/image_elements.csv",
+      "sha256": "8b1eee03696918ec52e56591d271f864e2b42e0427d2768e59e8b640c28595ee"
+    },
+    {
+      "bytes": 57,
+      "path": "reports/malformed_files.csv",
+      "sha256": "3a84f10bae3fb2b7b543a77800577b82897a9511ae5c0934134ea9fad794d86a"
+    },
+    {
+      "bytes": 215,
+      "path": "reports/missing_speakers.csv",
+      "sha256": "2ff9d4ece23ddfcaaf8510ab97eb2b4abe44c44990bb4a7eebcf6420e068274c"
+    },
+    {
+      "bytes": 33,
+      "path": "reports/reconciliation_failures.csv",
+      "sha256": "cfc525e1cd5694a939f866149697eb5b854a90f3bcf2375ff175366b5146d4b0"
+    },
+    {
+      "bytes": 65,
+      "path": "reports/source_url_exceptions.csv",
+      "sha256": "fd0ee4709090b4433b9dc3a4f2ae466692ec99b74eaf527c4365374725095290"
+    },
+    {
+      "bytes": 59,
+      "path": "reports/unknown_headings.csv",
+      "sha256": "d502cdec7be835a3f25ad8c04a53bb1d6bd39d15d0ba9798720ee14b1baebc79"
+    },
+    {
+      "bytes": 3177,
+      "path": "source_files/year=2016/part-00000.parquet",
+      "sha256": "ae0b5df9c649d5488e7fb1ce6d3ac9e8907bfa97a2f02b41e61dd804fca7c313"
+    },
+    {
+      "bytes": 3169,
+      "path": "speaker_turn_fragments/year=2016/part-00000.parquet",
+      "sha256": "d0c4f5b85cc302e0ba4d2290e4552246e23f5866c3e05234395b77877fb46eb7"
+    },
+    {
+      "bytes": 11190,
+      "path": "speaker_turns/year=2016/part-00000.parquet",
+      "sha256": "8f0c5db5a7e2913bfd30296bc2d344230135d61f2348753f8ea59628d8537c46"
+    },
+    {
+      "bytes": 18618,
+      "path": "speech_fragments/year=2016/part-00000.parquet",
+      "sha256": "3f578b8fa9747e1f9761eeb8d2de4a469dabd3be06c62b7daa69ad059e970bad"
+    }
+  ],
+  "overall_status": "completed",
+  "package_version": "0.1.0",
+  "peak_resident_memory_bytes": 353386496,
+  "phase_0_baseline_comparison": null,
+  "pipeline_version": "1.0.0",
+  "processing_duration_seconds": 0.105425,
+  "provenance": "OpenAustralia/PublicWhip-style normalised XML derived from Australian Parliament ParlInfo",
+  "python_version": "3.12.8",
+  "reconstruction_counts": {
+    "collective_exception_applications": 0,
+    "collective_interjections": 0,
+    "interjections_linked": 0,
+    "interjections_total": 0
+  },
+  "record_counts": {
+    "continuation_anomalies": 0,
+    "debate_events": 0,
+    "debate_sections": 2,
+    "image_elements": 2,
+    "interjections": 0,
+    "source_files": 1,
+    "speaker_turn_fragments": 5,
+    "speaker_turns": 5,
+    "speech_fragments": 5
+  },
+  "run_id": "manifest-test",
+  "selected_scope": {
+    "is_full_run": false,
+    "one_file": null,
+    "phase_0_baseline_expected": false,
+    "prior_manifest": null,
+    "sample_size": 1,
+    "year": null
+  },
+  "source_files": [
+    {
+      "byte_size": 1981,
+      "modification_time_ns": 1784790971240613700,
+      "source_file": "2016/2016-08-31.xml",
+      "source_file_sha256": "dd7dcc8d68db15a5d5616e5374d5433ca817eec5360239394add6912340d24dd"
+    }
+  ],
+  "started_at": "2026-10-18T12:29:50.317766+00:00",
+  "warning_counts": {
+    "DUPLICATE_SOURCE_FRAGMENT_ID": 2,
+    "DURATION_MISSING": 2,
+    "EMPTY_SPEECH_TEXT": 2,
+    "IMAGE_CONTENT_NOT_FETCHED": 1,
+    "SPEAKER_ID_MISSING": 1,
+    "SPEAKER_NAME_MISSING": 1,
+    "TIME_MALFORMED": 1,
+    "TIME_MISSING_OR_UNKNOWN": 1,
+    "WORDCOUNT_MALFORMED": 1,
+    "WORDCOUNT_MISSING": 1
+  }
+}

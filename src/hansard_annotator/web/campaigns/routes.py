@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Annotated, cast
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
@@ -9,6 +10,13 @@ from fastapi.responses import RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from hansard_annotator.web.auth.models import Principal
+from hansard_annotator.web.campaigns.phase4e import (
+    authorize_full_production,
+    configured_orchestration_limits,
+    orchestration_tick,
+    plan_campaign_chunks,
+    set_orchestration_paused,
+)
 from hansard_annotator.web.campaigns.service import (
     DEFAULT_EXCLUDE_HUMAN_ANNOTATED,
     CampaignError,
@@ -62,6 +70,11 @@ def _notice_message(code: str | None, campaign: dict[str, object]) -> str | None
         "structural-repair-applied": (
             "Approved deterministic structural repairs applied locally; no provider call was made."
         ),
+        "chunks-planned": "Deterministic full-corpus child Batches planned offline.",
+        "full-authorized": "Full-production orchestration authorized.",
+        "orchestration-paused": "New child Batch submissions paused.",
+        "orchestration-resumed": "Child Batch orchestration resumed.",
+        "orchestration-ticked": "One orchestration iteration completed.",
         "campaign-cancelled": "Campaign cancelled.",
     }
     if code == "validation-passed":
@@ -134,11 +147,15 @@ def campaign_detail(
     settings: Annotated[WebSettings, Depends(get_settings)],
     principal: Annotated[Principal, Depends(require_admin)],
     notice: str | None = None,
+    chunk_page: int = 1,
 ) -> object:
     try:
-        campaign = get_campaign(settings, principal, campaign_id)
+        campaign = get_campaign(
+            settings, principal, campaign_id, chunk_page=chunk_page
+        )
     except (CampaignError, LookupError, PermissionError) as error:
         raise _http_error(error) from error
+    ceiling, safety_factor, max_chunk_records = configured_orchestration_limits()
     return _templates(request).TemplateResponse(
         request,
         "campaigns/detail.html",
@@ -147,6 +164,11 @@ def campaign_detail(
             "campaign": campaign,
             "credentials": credential_status(),
             "notice_message": _notice_message(notice, campaign),
+            "phase4e_defaults": {
+                "enqueued_token_ceiling": ceiling,
+                "safety_factor": safety_factor,
+                "max_chunk_records": max_chunk_records,
+            },
         },
     )
 
@@ -261,6 +283,16 @@ async def _action(
             validate_campaign(settings, principal, campaign_id)
         elif operation == "repair-structural":
             repair_campaign_results(settings, principal, campaign_id)
+        elif operation == "orchestration-pause":
+            set_orchestration_paused(
+                settings, principal, campaign_id, paused=True
+            )
+        elif operation == "orchestration-resume":
+            set_orchestration_paused(
+                settings, principal, campaign_id, paused=False
+            )
+        elif operation == "orchestration-tick":
+            orchestration_tick(settings, campaign_id)
         elif operation == "import":
             import_campaign(settings, principal, campaign_id)
         elif operation == "retry-invalid":
@@ -281,6 +313,9 @@ async def _action(
         "collect": "results-collected",
         "validate": "validation-passed",
         "repair-structural": "structural-repair-applied",
+        "orchestration-pause": "orchestration-paused",
+        "orchestration-resume": "orchestration-resumed",
+        "orchestration-tick": "orchestration-ticked",
         "import": "predictions-imported",
         "retry-invalid": "recovery-submitted",
         "recovery-refresh": "recovery-status-refreshed",
@@ -341,6 +376,88 @@ async def campaign_repair_structural(
     principal: Annotated[Principal, Depends(require_admin)],
 ) -> RedirectResponse:
     return await _action(request, settings, principal, campaign_id, "repair-structural")
+
+
+@router.post("/{campaign_id}/plan-chunks")
+async def campaign_plan_chunks(
+    request: Request,
+    campaign_id: str,
+    settings: Annotated[WebSettings, Depends(get_settings)],
+    principal: Annotated[Principal, Depends(require_admin)],
+    enqueued_token_ceiling: Annotated[int, Form()],
+    safety_factor: Annotated[float, Form()],
+    max_chunk_records: Annotated[int, Form()],
+) -> RedirectResponse:
+    await enforce_csrf(request, principal, settings)
+    try:
+        plan_campaign_chunks(
+            settings,
+            principal,
+            campaign_id,
+            enqueued_token_ceiling=enqueued_token_ceiling,
+            safety_factor=safety_factor,
+            max_chunk_records=max_chunk_records,
+        )
+    except (CampaignError, LookupError, PermissionError, ValueError) as error:
+        raise _http_error(error) from error
+    return RedirectResponse(
+        f"/ai-annotation/{campaign_id}?notice=chunks-planned", status_code=303
+    )
+
+
+@router.post("/{campaign_id}/authorize-full")
+async def campaign_authorize_full(
+    request: Request,
+    campaign_id: str,
+    settings: Annotated[WebSettings, Depends(get_settings)],
+    principal: Annotated[Principal, Depends(require_admin)],
+    confirmation: Annotated[str, Form()],
+    spend_ceiling_usd: Annotated[Decimal, Form()],
+) -> RedirectResponse:
+    await enforce_csrf(request, principal, settings)
+    try:
+        authorize_full_production(
+            settings,
+            principal,
+            campaign_id,
+            confirmation=confirmation,
+            spend_ceiling_usd=spend_ceiling_usd,
+        )
+    except (CampaignError, LookupError, PermissionError, ValueError) as error:
+        raise _http_error(error) from error
+    return RedirectResponse(
+        f"/ai-annotation/{campaign_id}?notice=full-authorized", status_code=303
+    )
+
+
+@router.post("/{campaign_id}/orchestration-pause")
+async def campaign_orchestration_pause(
+    request: Request,
+    campaign_id: str,
+    settings: Annotated[WebSettings, Depends(get_settings)],
+    principal: Annotated[Principal, Depends(require_admin)],
+) -> RedirectResponse:
+    return await _action(request, settings, principal, campaign_id, "orchestration-pause")
+
+
+@router.post("/{campaign_id}/orchestration-resume")
+async def campaign_orchestration_resume(
+    request: Request,
+    campaign_id: str,
+    settings: Annotated[WebSettings, Depends(get_settings)],
+    principal: Annotated[Principal, Depends(require_admin)],
+) -> RedirectResponse:
+    return await _action(request, settings, principal, campaign_id, "orchestration-resume")
+
+
+@router.post("/{campaign_id}/orchestration-tick")
+async def campaign_orchestration_tick(
+    request: Request,
+    campaign_id: str,
+    settings: Annotated[WebSettings, Depends(get_settings)],
+    principal: Annotated[Principal, Depends(require_admin)],
+) -> RedirectResponse:
+    return await _action(request, settings, principal, campaign_id, "orchestration-tick")
 
 
 @router.post("/{campaign_id}/import")

@@ -1,0 +1,105 @@
+{
+  "adjudicated_policy_gate": {
+    "accuracy": 1.0,
+    "confusion": {
+      "false_non_policy": 0,
+      "false_policy": 0,
+      "true_non_policy": 2,
+      "true_policy": 2
+    },
+    "f1": 1.0,
+    "policy_labels_changed_by_adjudication": 1,
+    "positive_class": "policy",
+    "precision": 1.0,
+    "recall": 1.0
+  },
+  "adjudicated_primary_domain": {
+    "confusion_matrix": {
+      "AU01": {
+        "AU01": 0,
+        "AU02": 0,
+        "AU03": 0,
+        "__NON_POLICY__": 0
+      },
+      "AU02": {
+        "AU01": 0,
+        "AU02": 0,
+        "AU03": 0,
+        "__NON_POLICY__": 0
+      },
+      "AU03": {
+        "AU01": 0,
+        "AU02": 0,
+        "AU03": 1,
+        "__NON_POLICY__": 0
+      }
+    },
+    "evaluated_policy_records": 1,
+    "exact_match_accuracy": 1.0,
+    "excluded_record_ids": [
+      "two"
+    ],
+    "excluded_unresolved_taxonomy_ambiguity": 1,
+    "macro_f1": 0.3333333333333333,
+    "per_domain": {
+      "AU01": {
+        "f1": 0.0,
+        "precision": 0.0,
+        "recall": 0.0,
+        "support": 0
+      },
+      "AU02": {
+        "f1": 0.0,
+        "precision": 0.0,
+        "recall": 0.0,
+        "support": 0
+      },
+      "AU03": {
+        "f1": 1.0,
+        "precision": 1.0,
+        "recall": 1.0,
+        "support": 1
+      }
+    },
+    "resolvable_policy_domain_cases": 1
+  },
+  "adjudication_outcomes": {
+    "codebook_ambiguous": 1,
+    "human_correct": 0,
+    "human_label_revision_recommendations": 1,
+    "human_needs_revision": 1,
+    "model_error": 0,
+    "original_agreements_not_manually_disputed": 2,
+    "total_adjudicated_mismatches": 2,
+    "unresolved_taxonomy_or_codebook_cases": 1
+  },
+  "analysis_type": "post-hoc adjudication/error analysis, not the original held-out benchmark",
+  "issue_type_counts": {
+    "domain_boundary": 1,
+    "policy_gate": 1
+  },
+  "issue_type_summary": [
+    {
+      "count": 1,
+      "general_tendency": "remained ambiguous",
+      "issue_type": "domain_boundary"
+    },
+    {
+      "count": 1,
+      "general_tendency": "favoured model prediction",
+      "issue_type": "policy_gate"
+    }
+  ],
+  "methodological_warning": "The 120-record set remains the held-out validation/model-selection set. Adjudication occurred after observing model disagreements, so these adjusted metrics are diagnostic and post-hoc and do not replace the original human-reference benchmark. phase4a-policy-v2 remains frozen; future substantive prompt changes require V3 and a new evaluation strategy.",
+  "original_human_reference_held_out_result": {
+    "original_disagreement_count": 2,
+    "policy_accuracy": 0.5,
+    "policy_f1": 0.5,
+    "policy_precision": 0.5,
+    "policy_recall": 0.5,
+    "primary_domain_exact_match": 0.5,
+    "primary_domain_macro_f1": 0.4,
+    "selected_records": 4,
+    "valid_predictions": 4
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "configuration": {
+    "exclusion_record_count": 0,
+    "exclusion_set_sha256": null,
+    "generation": {},
+    "inclusion_record_count": 0,
+    "inclusion_set_sha256": null,
+    "model": "gemini-2.5-flash",
+    "package_snapshot_sha256": "f86850a19dd0e1607096534c523033c6052ddf99c379fc474d32e5b837ce66b5",
+    "prompt_sha256": "b773e846842c9519f276835bc8d2e8489036086c81d78cb3d9c14534924f0d93",
+    "prompt_version": "phase4a-policy-v1",
+    "provider": "gemini",
+    "provider_prediction_schema_sha256": null,
+    "schema_sha256": "schema-hash",
+    "schema_version": "0.2.0"
+  },
+  "format_version": 1,
+  "run_identity": "58974c1e38d4e4d454577f1eac3eac7dcd7a87d03ffe6ec4f6b80ceda78c240f",
+  "software_git_revision": "e0b3d5627c042f0ad8f705c72117482dd2bdd585",
+  "started_at": "2026-10-18T12:29:49.113822+00:00"
+}

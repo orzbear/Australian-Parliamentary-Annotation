@@ -1,0 +1,1 @@
+{"configuration": {"provider": "gemini", "model": "gemini-2.5-flash", "package_snapshot_sha256": "package", "schema_version": "0.2.0", "schema_sha256": "schema", "prompt_version": "phase4a-policy-v2", "prompt_sha256": "prompt", "exclusion_record_count": 30, "exclusion_set_sha256": "exclusions", "generation": {}}, "run_identity": "gemini-identity"}

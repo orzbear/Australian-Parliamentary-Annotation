@@ -22,6 +22,9 @@ x-app-environment: &app-environment
   HANSARD_LOGIN_LOCKOUT_FAILURES: ${HANSARD_LOGIN_LOCKOUT_FAILURES:-5}
   HANSARD_LOGIN_LOCKOUT_MINUTES: ${HANSARD_LOGIN_LOCKOUT_MINUTES:-15}
   HANSARD_LOG_LEVEL: ${HANSARD_LOG_LEVEL:-INFO}
+  HANSARD_GEMINI_ENQUEUED_TOKEN_CEILING: ${HANSARD_GEMINI_ENQUEUED_TOKEN_CEILING:-10000000}
+  HANSARD_GEMINI_ENQUEUED_TOKEN_SAFETY_FACTOR: ${HANSARD_GEMINI_ENQUEUED_TOKEN_SAFETY_FACTOR:-0.90}
+  HANSARD_GEMINI_MAX_CHUNK_RECORDS: ${HANSARD_GEMINI_MAX_CHUNK_RECORDS:-1000}
 
 services:
   postgres:
@@ -99,6 +102,30 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+    logging: *default-logging
+
+  campaign-worker:
+    image: hansard-annotator:${HANSARD_IMAGE_TAG:-pilot}
+    restart: unless-stopped
+    environment: *app-environment
+    command: ["hansard-campaign-worker", "--watch", "--interval-seconds", "15"]
+    networks:
+      - database
+    depends_on:
+      postgres:
+        condition: service_healthy
+    read_only: true
+    volumes:
+      - hansard-campaign-artifacts:/var/lib/hansard-campaign-artifacts
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 1g
+    cpus: 0.5
+    stop_grace_period: 30s
     logging: *default-logging
 
   caddy:

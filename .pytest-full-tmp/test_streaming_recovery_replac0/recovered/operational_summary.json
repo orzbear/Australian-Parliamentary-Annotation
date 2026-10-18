@@ -1,0 +1,50 @@
+{
+  "cost": {
+    "batch_uncached_input_cost_usd": 0.0,
+    "cached_input_cost_usd": 0.0,
+    "cost_per_valid_annotation_usd": 0.0,
+    "explicit_cache_storage_cost_usd": 0.0,
+    "output_including_reasoning_cost_usd": 0.0,
+    "token_processing_cost_usd": 0.0,
+    "total_pilot_cost_usd": 0.0
+  },
+  "coverage": {
+    "accounting_invariant_ok": true,
+    "collected_responses": 2,
+    "duplicate_mappings": 0,
+    "failed_provider_responses": 0,
+    "invalid_structured_predictions": 0,
+    "missing_responses": 0,
+    "planned_requests": 2,
+    "provider_failures_collected": 0,
+    "provider_request_count": 2,
+    "successful_provider_responses": 2,
+    "valid_structured_predictions": 2
+  },
+  "provenance": {
+    "recovery_batch_ids": [
+      "batches/recovery"
+    ]
+  },
+  "recovery": {
+    "attempt_count": 1,
+    "attempts": [
+      {
+        "artifact_sha256": null,
+        "attempt_number": 1,
+        "invalid_count": 0,
+        "provider_job_id": "batches/recovery",
+        "valid_count": 0
+      }
+    ],
+    "resolution_rule": "latest successful recovery, otherwise original result"
+  },
+  "tokens": {
+    "cached_input_tokens": 0,
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "reasoning_tokens": 0,
+    "total_tokens": 0,
+    "uncached_input_tokens": 0
+  }
+}

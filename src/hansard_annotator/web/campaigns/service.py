@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from collections import Counter
 from contextlib import nullcontext
@@ -20,6 +21,7 @@ from psycopg.types.json import Jsonb
 from hansard_annotator.llm_eval.costs import load_pricing
 from hansard_annotator.llm_eval.import_predictions import (
     import_predictions,
+    inspect_prediction_artifact,
     load_prediction_artifact,
 )
 from hansard_annotator.llm_eval.operations import (
@@ -56,6 +58,7 @@ from hansard_annotator.web.auth.models import Principal
 from hansard_annotator.web.campaigns.recovery import (
     RecoveryArtifactError,
     build_effective_artifact,
+    build_effective_artifact_streaming,
     build_structurally_repaired_artifact,
     iter_jsonl,
     read_jsonl,
@@ -843,9 +846,15 @@ def _legacy_other_exclusion_breakdown(
 
 
 def get_campaign(
-    settings: WebSettings, principal: Principal, public_id: str
+    settings: WebSettings,
+    principal: Principal,
+    public_id: str,
+    *,
+    chunk_page: int = 1,
 ) -> dict[str, Any]:
     _require_admin(principal)
+    if chunk_page < 1:
+        raise CampaignError("child Batch page must be positive")
     with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
         row = connection.execute(
             """
@@ -915,6 +924,50 @@ def get_campaign(
             ),
             None,
         )
+        batch_progress = connection.execute(
+            """
+            SELECT count(*) AS chunks_total,
+              count(*) FILTER (WHERE status='PENDING') AS chunks_pending,
+              count(*) FILTER (WHERE status IN ('SUBMITTING','SUBMITTED')) AS chunks_submitted,
+              count(*) FILTER (WHERE status='RUNNING') AS chunks_running,
+              count(*) FILTER (WHERE status='PROVIDER_COMPLETED') AS chunks_completed,
+              count(*) FILTER (WHERE status='COLLECTED') AS chunks_collected,
+              COALESCE(sum(record_count),0) AS chunk_records,
+              COALESCE(sum(estimated_input_tokens),0) AS chunk_estimated_input_tokens,
+              COALESCE(sum(valid_count),0) AS chunk_valid,
+              COALESCE(sum(repaired_count),0) AS chunk_repaired,
+              COALESCE(sum(invalid_count),0) AS chunk_invalid,
+              COALESCE(sum(provider_failure_count),0) AS chunk_provider_failures,
+              COALESCE(sum(missing_count),0) AS chunk_missing,
+              COALESCE(sum(duplicate_count),0) AS chunk_duplicates,
+              COALESCE(sum(input_tokens),0) AS chunk_input_tokens,
+              COALESCE(sum(cached_input_tokens),0) AS chunk_cached_input_tokens,
+              COALESCE(sum(output_tokens),0) AS chunk_output_tokens,
+              COALESCE(sum(reasoning_tokens),0) AS chunk_reasoning_tokens,
+              COALESCE(sum(processing_cost_usd),0) AS chunk_processing_cost,
+              COALESCE(sum(cache_cost_usd),0) AS chunk_cache_cost
+            FROM ai_annotation_campaign_batches WHERE campaign_id=%s
+            """,
+            (row["id"],),
+        ).fetchone()
+        result["batch_progress"] = dict(batch_progress) if batch_progress else {}
+        result["chunk_preview"] = [
+            dict(value)
+            for value in connection.execute(
+                """
+                SELECT chunk_number,first_selection_order,last_selection_order,record_count,
+                       estimated_input_tokens,status,provider_state,provider_job_id,
+                       cache_identifier,valid_count,repaired_count,invalid_count,
+                       missing_count,duplicate_count,processing_cost_usd,cache_cost_usd
+                FROM ai_annotation_campaign_batches WHERE campaign_id=%s
+                ORDER BY chunk_number LIMIT 20 OFFSET %s
+                """,
+                (row["id"], (chunk_page - 1) * 20),
+            ).fetchall()
+        ]
+        chunk_total = int(result["batch_progress"].get("chunks_total") or 0)
+        result["chunk_page"] = chunk_page
+        result["chunk_pages"] = max(1, math.ceil(chunk_total / 20))
         result["structural_repair_available_count"] = 0
         result["structural_repair_applied_count"] = 0
         if result.get("artifact_reference"):
@@ -1678,15 +1731,27 @@ def submit_recovery(
             raise CampaignError("an unresolved-record recovery job is already active")
         collected = _collected_recoveries(connection, int(campaign["id"]))
         source_directory = _current_effective_artifact_directory(campaign, collected)
-        unresolved = [
-            result
-            for result in read_jsonl(source_directory / "predictions.jsonl")
-            if result.get("status") in {"invalid", "provider_failure"}
-        ]
-        if not unresolved:
+        source_path = source_directory / "predictions.jsonl"
+        unresolved_digest = hashlib.sha256(b"[")
+        unresolved_count = 0
+        for result in iter_jsonl(source_path):
+            if result.get("status") not in {"invalid", "provider_failure", "missing"}:
+                continue
+            record_id = result.get("record_id")
+            if not isinstance(record_id, str):
+                raise CampaignError("unresolved result has no stable record ID")
+            if unresolved_count:
+                unresolved_digest.update(b",")
+            unresolved_digest.update(
+                json.dumps(record_id, ensure_ascii=False, separators=(",", ":")).encode(
+                    "utf-8"
+                )
+            )
+            unresolved_count += 1
+        unresolved_digest.update(b"]")
+        if not unresolved_count:
             raise CampaignError("campaign has no unresolved retry-eligible records")
-        unresolved_ids = [str(result["record_id"]) for result in unresolved]
-        unresolved_hash = canonical_hash(unresolved_ids)
+        unresolved_hash = unresolved_digest.hexdigest()
         attempt_row = connection.execute(
             """
             SELECT COALESCE(max(attempt_number),0)+1 AS attempt_number
@@ -1708,19 +1773,16 @@ def submit_recovery(
                 campaign["id"],
                 attempt_number,
                 unresolved_hash,
-                len(unresolved_ids),
+                unresolved_count,
                 display_name,
             ),
         ).fetchone()
         assert recovery is not None
-        source_results = {
-            str(value["record_id"]): value
-            for value in read_jsonl(source_directory / "predictions.jsonl")
-        }
-        for result in unresolved:
+        for result in iter_jsonl(source_path):
+            if result.get("status") not in {"invalid", "provider_failure", "missing"}:
+                continue
             record_id = str(result["record_id"])
-            source = source_results[record_id]
-            error = source.get("validation_error") or source.get("provider_error")
+            error = result.get("validation_error") or result.get("provider_error")
             rendered_error = (
                 str(error)
                 if isinstance(error, str)
@@ -1746,7 +1808,7 @@ def submit_recovery(
                     recovery["id"],
                     campaign_record["id"],
                     record_id,
-                    int(source["request_index"]),
+                    int(result["request_index"]),
                     rendered_error,
                 ),
             )
@@ -2146,11 +2208,21 @@ def collect_recovery(
         }
         collected = _collected_recoveries(connection, int(combined["id"]))
         effective_directory = directory / "effective"
-        effective_summary, effective_rows, effective_hash = build_effective_artifact(
-            Path(str(combined["artifact_reference"])),
-            [*collected, current_recovery],
-            effective_directory,
-        )
+        if combined.get("orchestration_mode") == "CHUNKED":
+            effective_summary, effective_row_count, effective_hash = (
+                build_effective_artifact_streaming(
+                    Path(str(combined["artifact_reference"])),
+                    [*collected, current_recovery],
+                    effective_directory,
+                )
+            )
+        else:
+            effective_summary, effective_rows, effective_hash = build_effective_artifact(
+                Path(str(combined["artifact_reference"])),
+                [*collected, current_recovery],
+                effective_directory,
+            )
+            effective_row_count = len(effective_rows)
         effective_invalid = int(
             effective_summary["coverage"]["invalid_structured_predictions"]
         )
@@ -2180,7 +2252,11 @@ def collect_recovery(
             UPDATE ai_annotation_campaigns SET valid_count=%s,invalid_count=%s
             WHERE id=%s
             """,
-            (len(effective_rows) - effective_invalid, effective_invalid, combined["id"]),
+            (
+                effective_row_count - effective_invalid,
+                effective_invalid,
+                combined["id"],
+            ),
         )
         return dict(updated)
 
@@ -2203,9 +2279,13 @@ def validate_campaign(
         directory = _current_effective_artifact_directory(
             dict(campaign), _collected_recoveries(connection, int(campaign["id"]))
         )
-        summary, rows, _artifact_hash = load_prediction_artifact(directory)
+        if campaign.get("orchestration_mode") == "CHUNKED":
+            summary, row_count, _artifact_hash = inspect_prediction_artifact(directory)
+        else:
+            summary, rows, _artifact_hash = load_prediction_artifact(directory)
+            row_count = len(rows)
         coverage = summary["coverage"]
-        if len(rows) != int(campaign["planned_count"]):
+        if row_count != int(campaign["planned_count"]):
             raise CampaignError("validated result coverage does not equal planned records")
         if coverage.get("missing_responses") or coverage.get("duplicate_mappings"):
             raise CampaignError("missing or duplicate provider mappings block import")
@@ -2215,7 +2295,7 @@ def validate_campaign(
               valid_count=%s,invalid_count=%s
             WHERE id=%s RETURNING *
             """,
-            (len(rows), coverage["invalid_structured_predictions"], campaign["id"]),
+            (row_count, coverage["invalid_structured_predictions"], campaign["id"]),
         ).fetchone()
         assert updated is not None
         return dict(updated)

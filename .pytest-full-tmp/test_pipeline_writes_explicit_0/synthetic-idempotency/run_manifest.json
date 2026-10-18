@@ -1,0 +1,339 @@
+{
+  "acceptance_gate_passed": true,
+  "chamber": "Australian Federal House of Representatives",
+  "completed_at": "2026-10-18T12:29:49.708400+00:00",
+  "configuration_hashes": {
+    "business_types": "5bc2fcbdfcfdb0930494843c3324d6b22f3ba5efdfe45d784e6e469490b0abed",
+    "reconstruction": "7c721d94b205acd1a073792cb25c70759aceada995e5936287392256f4e827f3"
+  },
+  "configuration_versions": {
+    "business_types": "1.0.0",
+    "reconstruction": "1.0.0"
+  },
+  "dependency_versions": {
+    "PyYAML": "6.0.3",
+    "lxml": "6.1.1",
+    "psutil": "7.2.2",
+    "pyarrow": "24.0.0"
+  },
+  "error_count": 0,
+  "file_counts": {
+    "completed": 3,
+    "discovered": 3,
+    "failed": 0,
+    "terminal": 3,
+    "unreconciled": 0
+  },
+  "git_commit": "e0b3d5627c042f0ad8f705c72117482dd2bdd585",
+  "input_inventory_sha256": "18ca586c1342e3db4aba0bdef6f791aaca3f088c302c0b26ccdcf48b75d66544",
+  "observed_tag_counts": {
+    "a": 1,
+    "b": 1,
+    "bill": 2,
+    "bills": 2,
+    "debates": 3,
+    "division": 1,
+    "divisioncount": 1,
+    "i": 1,
+    "img": 2,
+    "li": 2,
+    "major-heading": 3,
+    "member": 1,
+    "memberlist": 1,
+    "minor-heading": 4,
+    "p": 23,
+    "speech": 21,
+    "stage-direction": 1,
+    "sup": 1,
+    "table": 1,
+    "td": 2,
+    "tr": 1,
+    "ul": 1
+  },
+  "observed_talktype_counts": {
+    "continuation": 7,
+    "interjection": 2,
+    "speech": 12
+  },
+  "output_files": [
+    {
+      "bytes": 5691,
+      "path": "continuation_anomalies/year=2010/part-00000.parquet",
+      "sha256": "017a6de9b99a3380fd3f0792d9a018e0e88e5652855921d25d1f8cda643f6697"
+    },
+    {
+      "bytes": 5311,
+      "path": "continuation_anomalies/year=2010/part-00001.parquet",
+      "sha256": "6fbafebc3db0a8d781b3cb0beec49dee6d5cf4b288189ba65948b9bada45d5e1"
+    },
+    {
+      "bytes": 8904,
+      "path": "debate_events/year=2010/part-00000.parquet",
+      "sha256": "ff163b828d6c1b76d2858e046618963604074c15657378ebaa0bf1734438e4fc"
+    },
+    {
+      "bytes": 4822,
+      "path": "debate_sections/year=2010/part-00000.parquet",
+      "sha256": "531e03b4e831eef2e273156e9ecfa216d343da93312b293ffd158e3a78a54f94"
+    },
+    {
+      "bytes": 4727,
+      "path": "debate_sections/year=2016/part-00000.parquet",
+      "sha256": "0168b777bf1d40213fc22164e786b845b8751dc73fe45bda642e612799213694"
+    },
+    {
+      "bytes": 4793,
+      "path": "debate_sections/year=2025/part-00000.parquet",
+      "sha256": "2a3756d1b5f0e5e7f26cb4acfe8836b1d55d9c9b7b4b001ed78ad6701122e4fe"
+    },
+    {
+      "bytes": 7797,
+      "path": "interjections/year=2010/part-00000.parquet",
+      "sha256": "f3dce7ded11794a646d141e2440574503b2c9921aa68f264f530aa693ca6dc2f"
+    },
+    {
+      "bytes": 1572,
+      "path": "reports/continuation_anomalies.csv",
+      "sha256": "fd0d5160aae080e8638902732f98190c101f0928f3aa4ee00e6b9462ffa055dc"
+    },
+    {
+      "bytes": 1395,
+      "path": "reports/corpus_summary.csv",
+      "sha256": "8db2e0575317dcf517836038bdfaed4b931ee2b107159be0080bb99fe025c77e"
+    },
+    {
+      "bytes": 263,
+      "path": "reports/duplicate_ids.csv",
+      "sha256": "02fddc8e7c49caabf463f9000c4dfcf09f6aa8741e53a517ac8e0946d66dd115"
+    },
+    {
+      "bytes": 701,
+      "path": "reports/file_processing_report.csv",
+      "sha256": "21a43282c854e89a68e56dcd596f8e04274e15f3959d68ed375b7092e363f381"
+    },
+    {
+      "bytes": 723,
+      "path": "reports/image_elements.csv",
+      "sha256": "8b1eee03696918ec52e56591d271f864e2b42e0427d2768e59e8b640c28595ee"
+    },
+    {
+      "bytes": 57,
+      "path": "reports/malformed_files.csv",
+      "sha256": "3a84f10bae3fb2b7b543a77800577b82897a9511ae5c0934134ea9fad794d86a"
+    },
+    {
+      "bytes": 352,
+      "path": "reports/missing_speakers.csv",
+      "sha256": "8cb0a660df400d0f4fffdf106c3cf66163e69de482be0322bac341e6934691c0"
+    },
+    {
+      "bytes": 33,
+      "path": "reports/reconciliation_failures.csv",
+      "sha256": "cfc525e1cd5694a939f866149697eb5b854a90f3bcf2375ff175366b5146d4b0"
+    },
+    {
+      "bytes": 171,
+      "path": "reports/source_url_exceptions.csv",
+      "sha256": "d49986d818252c8cca9a1e68259626f6f192a5d493408ced3d708c08cbeac5e9"
+    },
+    {
+      "bytes": 110,
+      "path": "reports/unknown_headings.csv",
+      "sha256": "800e5f10f7da49edffaac43026b0834670a2d2ca5140be28120bcb89689c8ef9"
+    },
+    {
+      "bytes": 3181,
+      "path": "source_files/year=2010/part-00000.parquet",
+      "sha256": "15e97c8f504b6ff061acae0ce48a9064fbae205ecc5a0103ec2f465e07dad454"
+    },
+    {
+      "bytes": 3177,
+      "path": "source_files/year=2016/part-00000.parquet",
+      "sha256": "ae0b5df9c649d5488e7fb1ce6d3ac9e8907bfa97a2f02b41e61dd804fca7c313"
+    },
+    {
+      "bytes": 3175,
+      "path": "source_files/year=2025/part-00000.parquet",
+      "sha256": "196a5b4e755dae39e3ca6db8637057bd66c47a7007a739010245d60f0a264777"
+    },
+    {
+      "bytes": 3028,
+      "path": "speaker_turn_fragments/year=2010/part-00000.parquet",
+      "sha256": "81398f3b0a9c102438ed485c8160063fbec342796e0286085c90844c1372a611"
+    },
+    {
+      "bytes": 3103,
+      "path": "speaker_turn_fragments/year=2010/part-00001.parquet",
+      "sha256": "83bedfba74c2fbe771d372fd3a0ac6b7e4706ec5b9e16afa0009481dc8259a1b"
+    },
+    {
+      "bytes": 3102,
+      "path": "speaker_turn_fragments/year=2010/part-00002.parquet",
+      "sha256": "605dcb76f5188eab3bb41c90bde05ea433b275923abdcd2b7af2c3c9c20c5d64"
+    },
+    {
+      "bytes": 3161,
+      "path": "speaker_turn_fragments/year=2010/part-00003.parquet",
+      "sha256": "b163f078b52e0fe85492ed432fa60c95b46c45449fa7cddefce0fcee7df3b5d9"
+    },
+    {
+      "bytes": 2999,
+      "path": "speaker_turn_fragments/year=2016/part-00000.parquet",
+      "sha256": "5ca1c0b2db17fc550ef905b7b8eb37bc96d23e0fbaba47560f56a5fe395a35b9"
+    },
+    {
+      "bytes": 2923,
+      "path": "speaker_turn_fragments/year=2016/part-00001.parquet",
+      "sha256": "d665d88b08f4a797a9dd13833ff426c0ba3c898de6b0e7c27df34e79b6160a87"
+    },
+    {
+      "bytes": 2851,
+      "path": "speaker_turn_fragments/year=2025/part-00000.parquet",
+      "sha256": "52f15e310370e5a231393dec33a5e118a0ee36d30a04d4159a1e64d7f04c4b65"
+    },
+    {
+      "bytes": 11074,
+      "path": "speaker_turns/year=2010/part-00000.parquet",
+      "sha256": "18982d412615b5f456b78c4ec92d401821faf2c6f412d7e9a674d387b0e43eeb"
+    },
+    {
+      "bytes": 11052,
+      "path": "speaker_turns/year=2010/part-00001.parquet",
+      "sha256": "6015d4ff7354734761c466de9cad5e9c73d6f2b53e54e51f3c5acea5a1ece8a9"
+    },
+    {
+      "bytes": 11422,
+      "path": "speaker_turns/year=2010/part-00002.parquet",
+      "sha256": "2d2b5d42154af013ea6f17c6da0277c8543dfa199e01b8260a9d6dc6a4d0889f"
+    },
+    {
+      "bytes": 11234,
+      "path": "speaker_turns/year=2016/part-00000.parquet",
+      "sha256": "423e76abf5153c73685a03089c7bc50c1a22d91307785ff9f97d5184d83d0d14"
+    },
+    {
+      "bytes": 10848,
+      "path": "speaker_turns/year=2016/part-00001.parquet",
+      "sha256": "be140cb786917f172a006fa003a8365d83e51d870adf2778a3167b5d55bfd4ff"
+    },
+    {
+      "bytes": 10637,
+      "path": "speaker_turns/year=2025/part-00000.parquet",
+      "sha256": "684b6f2b1ee82d65da7b373cfd45bebed0ad25b24994173202c95cf871fc4e46"
+    },
+    {
+      "bytes": 17565,
+      "path": "speech_fragments/year=2010/part-00000.parquet",
+      "sha256": "c1c71ea76e6aabce22c95ecaa34f8d660dd49dfb4cdda63e387a875f856b043f"
+    },
+    {
+      "bytes": 17355,
+      "path": "speech_fragments/year=2010/part-00001.parquet",
+      "sha256": "9555cc83c24b4915b0f4836d3ba42d6b275532aca9818bb73c900f1c3b97ba9b"
+    },
+    {
+      "bytes": 17300,
+      "path": "speech_fragments/year=2010/part-00002.parquet",
+      "sha256": "eb79fcb88be721bef47b10d84926b479921c3509c2c0f00fe5a20ff87af0b059"
+    },
+    {
+      "bytes": 17289,
+      "path": "speech_fragments/year=2010/part-00003.parquet",
+      "sha256": "f6d4d25d48abd881ed8888d05781ae8f33a6b833bde6b51f33ba7040c37f01c9"
+    },
+    {
+      "bytes": 17585,
+      "path": "speech_fragments/year=2010/part-00004.parquet",
+      "sha256": "ac327458e7957a671de70af7c70d20c82d4cc38b966cfe9a1bf162e630870f76"
+    },
+    {
+      "bytes": 18413,
+      "path": "speech_fragments/year=2016/part-00000.parquet",
+      "sha256": "2fb9b5ae770674469ee553cb03b0ee5e56abeb268c2002f629d6d2f82f5cc031"
+    },
+    {
+      "bytes": 16575,
+      "path": "speech_fragments/year=2016/part-00001.parquet",
+      "sha256": "b99c9cc7f0e4bfa267d969f14a13a862c2f5332e94208913ba28141053e9d0d3"
+    },
+    {
+      "bytes": 16479,
+      "path": "speech_fragments/year=2025/part-00000.parquet",
+      "sha256": "2209e9ded787415f23cd995f26b9240e006b0350e18496b087ea1e1a42038c22"
+    }
+  ],
+  "overall_status": "completed",
+  "package_version": "0.1.0",
+  "peak_resident_memory_bytes": 353230848,
+  "phase_0_baseline_comparison": null,
+  "pipeline_version": "1.0.0",
+  "processing_duration_seconds": 0.331134,
+  "provenance": "OpenAustralia/PublicWhip-style normalised XML derived from Australian Parliament ParlInfo",
+  "python_version": "3.12.8",
+  "reconstruction_counts": {
+    "collective_exception_applications": 1,
+    "collective_interjections": 1,
+    "continuations_merged": 3,
+    "continuations_orphaned": 4,
+    "interjections_linked": 3,
+    "interjections_total": 3
+  },
+  "record_counts": {
+    "continuation_anomalies": 4,
+    "debate_events": 3,
+    "debate_sections": 7,
+    "image_elements": 2,
+    "interjections": 3,
+    "source_files": 3,
+    "speaker_turn_fragments": 18,
+    "speaker_turns": 15,
+    "speech_fragments": 21
+  },
+  "run_id": "synthetic-idempotency",
+  "selected_scope": {
+    "is_full_run": true,
+    "one_file": null,
+    "phase_0_baseline_expected": false,
+    "prior_manifest": null,
+    "sample_size": null,
+    "year": null
+  },
+  "source_files": [
+    {
+      "byte_size": 6170,
+      "modification_time_ns": 1784790970124299600,
+      "source_file": "2010/2010-02-02.xml",
+      "source_file_sha256": "28723c4d79b793fab944b0da95055ab14dc1695ea0bbe1a53203c031fc9d3093"
+    },
+    {
+      "byte_size": 1981,
+      "modification_time_ns": 1784790971240613700,
+      "source_file": "2016/2016-08-31.xml",
+      "source_file_sha256": "dd7dcc8d68db15a5d5616e5374d5433ca817eec5360239394add6912340d24dd"
+    },
+    {
+      "byte_size": 660,
+      "modification_time_ns": 1784790972309530400,
+      "source_file": "2025/2025-02-04.xml",
+      "source_file_sha256": "f5d242cd5f6cca818931670dd5056a464216fa5aff86831dfc84a5378800526a"
+    }
+  ],
+  "started_at": "2026-10-18T12:29:49.596225+00:00",
+  "warning_counts": {
+    "COLLECTIVE_INTERJECTION_EXPLICIT_PATTERN": 1,
+    "DUPLICATE_SOURCE_FRAGMENT_ID": 2,
+    "DURATION_MISSING": 2,
+    "EMPTY_HEADING": 1,
+    "EMPTY_SPEECH_TEXT": 2,
+    "IMAGE_CONTENT_NOT_FETCHED": 1,
+    "SOURCE_URL_DATASET_MARKER_MISSING": 1,
+    "SPEAKER_ID_MISSING": 2,
+    "SPEAKER_NAME_MISSING": 1,
+    "TIME_MALFORMED": 1,
+    "TIME_MISSING_OR_UNKNOWN": 1,
+    "UNKNOWN_BUSINESS_HEADING": 1,
+    "UNKNOWN_TOP_LEVEL_EVENT": 1,
+    "WORDCOUNT_MALFORMED": 1,
+    "WORDCOUNT_MISSING": 1
+  }
+}

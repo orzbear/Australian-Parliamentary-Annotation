@@ -90,7 +90,7 @@ def unresolved_results(
     return [
         row
         for row in effective_results(original_directory, collected_recoveries)
-        if row.get("status") in {"invalid", "provider_failure"}
+        if row.get("status") in {"invalid", "provider_failure", "missing"}
     ]
 
 
@@ -298,6 +298,7 @@ def build_effective_artifact(
     valid = sum(row.get("status") == "success" for row in rows)
     invalid = len(rows) - valid
     provider_failures = sum(row.get("status") == "provider_failure" for row in rows)
+    missing = sum(row.get("status") == "missing" for row in rows)
     summary = copy.deepcopy(original_summary)
     coverage = summary.setdefault("coverage", {})
     planned = int(coverage.get("planned_requests") or len(rows))
@@ -305,14 +306,14 @@ def build_effective_artifact(
         {
             "provider_request_count": planned,
             "collected_responses": len(rows),
-            "missing_responses": max(0, planned - len(rows)),
+            "missing_responses": missing + max(0, planned - len(rows)),
             "duplicate_mappings": 0,
             "successful_provider_responses": planned - provider_failures,
             "failed_provider_responses": provider_failures,
             "valid_structured_predictions": valid,
             "invalid_structured_predictions": invalid,
             "provider_failures_collected": provider_failures,
-            "accounting_invariant_ok": planned == len(rows),
+            "accounting_invariant_ok": planned == len(rows) and missing == 0,
         }
     )
     token_fields = (
@@ -375,3 +376,137 @@ def build_effective_artifact(
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     return summary, rows, artifact_sha256(output_directory)
+
+
+def build_effective_artifact_streaming(
+    original_directory: Path,
+    collected_recoveries: list[dict[str, Any]],
+    output_directory: Path,
+) -> tuple[dict[str, Any], int, str]:
+    """Build the Phase 4E effective artifact without materializing original rows."""
+    if output_directory.exists():
+        raise RecoveryArtifactError("effective artifact already exists")
+    original_summary = json.loads(
+        (original_directory / "operational_summary.json").read_text(encoding="utf-8")
+    )
+    if not isinstance(original_summary, dict):
+        raise RecoveryArtifactError("original operational summary is not an object")
+    replacements: dict[str, dict[str, Any]] = {}
+    for recovery in sorted(collected_recoveries, key=lambda row: int(row["attempt_number"])):
+        reference = recovery.get("artifact_reference")
+        if not isinstance(reference, str):
+            continue
+        for row in iter_jsonl(Path(reference) / "predictions.jsonl"):
+            record_id = row.get("record_id")
+            if not isinstance(record_id, str):
+                raise RecoveryArtifactError("recovery contains an invalid record ID")
+            if row.get("status") == "success":
+                replacement = copy.deepcopy(row)
+                replacement["effective_source"] = "recovery"
+                replacement["recovery_attempt_number"] = int(
+                    recovery["attempt_number"]
+                )
+                replacement["recovery_provider_job_id"] = recovery.get(
+                    "provider_job_id"
+                )
+                replacements[record_id] = replacement
+
+    output_directory.mkdir(parents=True)
+    output_path = output_directory / "predictions.jsonl"
+    row_count = 0
+    valid = 0
+    provider_failures = 0
+    missing = 0
+    seen_replacements: set[str] = set()
+    with output_path.open("w", encoding="utf-8", newline="\n") as target:
+        for original in iter_jsonl(original_directory / "predictions.jsonl"):
+            record_id = original.get("record_id")
+            if not isinstance(record_id, str):
+                raise RecoveryArtifactError("original predictions contain an invalid record ID")
+            row = replacements.get(record_id, original)
+            if record_id in replacements:
+                seen_replacements.add(record_id)
+                row["request_index"] = original.get("request_index", row_count)
+            status = row.get("status")
+            valid += status == "success"
+            provider_failures += status == "provider_failure"
+            missing += status == "missing"
+            target.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+            row_count += 1
+    outside = set(replacements) - seen_replacements
+    if outside:
+        raise RecoveryArtifactError("recovery contains a record outside the campaign")
+
+    summary = copy.deepcopy(original_summary)
+    coverage = summary.setdefault("coverage", {})
+    planned = int(coverage.get("planned_requests") or row_count)
+    invalid = row_count - valid
+    coverage.update(
+        {
+            "provider_request_count": planned,
+            "collected_responses": row_count - missing,
+            "missing_responses": missing + max(0, planned - row_count),
+            "duplicate_mappings": 0,
+            "successful_provider_responses": row_count - provider_failures - missing,
+            "failed_provider_responses": provider_failures,
+            "valid_structured_predictions": valid,
+            "invalid_structured_predictions": invalid,
+            "provider_failures_collected": provider_failures,
+            "accounting_invariant_ok": planned == row_count and missing == 0,
+        }
+    )
+    token_fields = (
+        "input_tokens",
+        "cached_input_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+        "total_tokens",
+    )
+    tokens = summary.setdefault("tokens", {})
+    for field in token_fields:
+        tokens[field] = int(tokens.get(field) or 0) + sum(
+            int(metadata.get("tokens", {}).get(field) or 0)
+            for recovery in collected_recoveries
+            if isinstance((metadata := recovery.get("operational_metadata")), dict)
+            and isinstance(metadata.get("tokens"), dict)
+        )
+    tokens["uncached_input_tokens"] = max(
+        0,
+        int(tokens.get("input_tokens") or 0)
+        - int(tokens.get("cached_input_tokens") or 0),
+    )
+    cost = summary.setdefault("cost", {})
+    for field in (
+        "batch_uncached_input_cost_usd",
+        "cached_input_cost_usd",
+        "output_including_reasoning_cost_usd",
+        "token_processing_cost_usd",
+        "explicit_cache_storage_cost_usd",
+        "total_pilot_cost_usd",
+    ):
+        cost[field] = _sum_metric(cost, collected_recoveries, field)
+    cost["cost_per_valid_annotation_usd"] = (
+        float(cost["total_pilot_cost_usd"]) / valid if valid else None
+    )
+    provenance = summary.setdefault("provenance", {})
+    provenance["recovery_batch_ids"] = [
+        recovery.get("provider_job_id") for recovery in collected_recoveries
+    ]
+    summary["recovery"] = {
+        "attempt_count": len(collected_recoveries),
+        "attempts": [
+            {
+                "attempt_number": int(recovery["attempt_number"]),
+                "provider_job_id": recovery.get("provider_job_id"),
+                "artifact_sha256": recovery.get("artifact_sha256"),
+                "valid_count": int(recovery.get("valid_count") or 0),
+                "invalid_count": int(recovery.get("invalid_count") or 0),
+            }
+            for recovery in collected_recoveries
+        ],
+        "resolution_rule": "latest successful recovery, otherwise original result",
+    }
+    (output_directory / "operational_summary.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return summary, row_count, artifact_sha256(output_directory)

@@ -1,0 +1,117 @@
+{
+  "acceptance_gate_passed": false,
+  "chamber": "Australian Federal House of Representatives",
+  "completed_at": "2026-10-18T12:29:49.968922+00:00",
+  "configuration_hashes": {
+    "business_types": "5bc2fcbdfcfdb0930494843c3324d6b22f3ba5efdfe45d784e6e469490b0abed",
+    "reconstruction": "7c721d94b205acd1a073792cb25c70759aceada995e5936287392256f4e827f3"
+  },
+  "configuration_versions": {
+    "business_types": "1.0.0",
+    "reconstruction": "1.0.0"
+  },
+  "dependency_versions": {
+    "PyYAML": "6.0.3",
+    "lxml": "6.1.1",
+    "psutil": "7.2.2",
+    "pyarrow": "24.0.0"
+  },
+  "error_count": 1,
+  "file_counts": {
+    "completed": 0,
+    "discovered": 1,
+    "failed": 1,
+    "terminal": 1,
+    "unreconciled": 0
+  },
+  "git_commit": "e0b3d5627c042f0ad8f705c72117482dd2bdd585",
+  "input_inventory_sha256": "9f4af8bf863483404f4d8021573b4fca18c5f812cd662dcffb514f432567c4a5",
+  "observed_tag_counts": {},
+  "observed_talktype_counts": {},
+  "output_files": [
+    {
+      "bytes": 234,
+      "path": "reports/continuation_anomalies.csv",
+      "sha256": "c1f4e3d41b39e27dd78c379680497635af3785cc6fb174064e2759fd5f0e3308"
+    },
+    {
+      "bytes": 302,
+      "path": "reports/corpus_summary.csv",
+      "sha256": "02eae1e7b407cf12c8e652c4c915ebab355fb9bce06d6b53d7ad6fa9d9f023f9"
+    },
+    {
+      "bytes": 61,
+      "path": "reports/duplicate_ids.csv",
+      "sha256": "ccfa95c94e7cb50806f8b08c8aded9039353b3a9ef123e12e53c5ef184230d50"
+    },
+    {
+      "bytes": 597,
+      "path": "reports/file_processing_report.csv",
+      "sha256": "4655e0f2540e4785f8d06c7aaa6f02f95d5bbf4e7f3d02552987af3340322090"
+    },
+    {
+      "bytes": 158,
+      "path": "reports/image_elements.csv",
+      "sha256": "fd1e7d3ee35edab1c31774f1f2f285ad03dd2071367a70d7b89bf82931ec6a9f"
+    },
+    {
+      "bytes": 361,
+      "path": "reports/malformed_files.csv",
+      "sha256": "64c2336dde4658b39b72ab14161adfc127e5e8ed344030ed2b3e701e9d86f884"
+    },
+    {
+      "bytes": 107,
+      "path": "reports/missing_speakers.csv",
+      "sha256": "724221294b4fa1defc135667b56bdbc0ee6971481c9c6704bd5dc5add2b1551e"
+    },
+    {
+      "bytes": 33,
+      "path": "reports/reconciliation_failures.csv",
+      "sha256": "cfc525e1cd5694a939f866149697eb5b854a90f3bcf2375ff175366b5146d4b0"
+    },
+    {
+      "bytes": 65,
+      "path": "reports/source_url_exceptions.csv",
+      "sha256": "fd0ee4709090b4433b9dc3a4f2ae466692ec99b74eaf527c4365374725095290"
+    },
+    {
+      "bytes": 59,
+      "path": "reports/unknown_headings.csv",
+      "sha256": "d502cdec7be835a3f25ad8c04a53bb1d6bd39d15d0ba9798720ee14b1baebc79"
+    },
+    {
+      "bytes": 3180,
+      "path": "source_files/year=2010/part-00000.parquet",
+      "sha256": "a2b2063547643cfbcf0e327f655caf33373b59313aa8fe521bfd946272adbcf7"
+    }
+  ],
+  "overall_status": "completed_with_errors",
+  "package_version": "0.1.0",
+  "peak_resident_memory_bytes": 353345536,
+  "phase_0_baseline_comparison": null,
+  "pipeline_version": "1.0.0",
+  "processing_duration_seconds": 0.063614,
+  "provenance": "OpenAustralia/PublicWhip-style normalised XML derived from Australian Parliament ParlInfo",
+  "python_version": "3.12.8",
+  "reconstruction_counts": {},
+  "record_counts": {},
+  "run_id": "malformed-quality-gate",
+  "selected_scope": {
+    "is_full_run": true,
+    "one_file": null,
+    "phase_0_baseline_expected": false,
+    "prior_manifest": null,
+    "sample_size": null,
+    "year": null
+  },
+  "source_files": [
+    {
+      "byte_size": 539,
+      "modification_time_ns": 1784788778995233800,
+      "source_file": "2010/2010-02-03.xml",
+      "source_file_sha256": "e1cf00eb5e5c82deb9a05d9daa1c5c0e5bcb2bf34a586329ecf734b34654e1c8"
+    }
+  ],
+  "started_at": "2026-10-18T12:29:49.953284+00:00",
+  "warning_counts": {}
+}
