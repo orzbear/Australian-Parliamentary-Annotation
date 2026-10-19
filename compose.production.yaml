@@ -109,6 +109,8 @@ services:
     restart: unless-stopped
     environment: *app-environment
     command: ["hansard-campaign-worker", "--watch", "--interval-seconds", "15"]
+    healthcheck:
+      disable: true
     networks:
       - database
     depends_on:
