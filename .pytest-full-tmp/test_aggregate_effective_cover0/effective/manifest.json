@@ -1,0 +1,16 @@
+{
+  "chunks": [
+    {
+      "artifact_reference": "C:\\Users\\Orzbear\\Desktop\\parliament speech annotator\\.pytest-full-tmp\\test_aggregate_effective_cover0\\chunk-1",
+      "artifact_sha256": "f73e000efc08bbd886cceaf88bdc7753f27d85667c2fec5afe2e83f84f78348a",
+      "chunk_number": 1,
+      "record_count": 2
+    },
+    {
+      "artifact_reference": "C:\\Users\\Orzbear\\Desktop\\parliament speech annotator\\.pytest-full-tmp\\test_aggregate_effective_cover0\\chunk-2",
+      "artifact_sha256": "e5eb59174963c3734884461d8eb33e1a4c154604039f079ed2714854a47f4865",
+      "chunk_number": 2,
+      "record_count": 1
+    }
+  ]
+}

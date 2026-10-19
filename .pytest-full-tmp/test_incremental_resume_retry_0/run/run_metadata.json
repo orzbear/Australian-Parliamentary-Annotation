@@ -1,0 +1,23 @@
+{
+  "configuration": {
+    "exclusion_record_count": 0,
+    "exclusion_set_sha256": null,
+    "generation": {
+      "temperature": 0
+    },
+    "inclusion_record_count": 0,
+    "inclusion_set_sha256": null,
+    "model": "model-a",
+    "package_snapshot_sha256": "f86850a19dd0e1607096534c523033c6052ddf99c379fc474d32e5b837ce66b5",
+    "prompt_sha256": "b773e846842c9519f276835bc8d2e8489036086c81d78cb3d9c14534924f0d93",
+    "prompt_version": "phase4a-policy-v1",
+    "provider": "fake",
+    "provider_prediction_schema_sha256": null,
+    "schema_sha256": "schema-hash",
+    "schema_version": "0.2.0"
+  },
+  "format_version": 1,
+  "run_identity": "d847bf0e3a7397762caae28b5c38ce9b7915bd309358b48dfc6dc5adbfa33184",
+  "software_git_revision": "e0b3d5627c042f0ad8f705c72117482dd2bdd585",
+  "started_at": "2026-10-18T12:29:48.897289+00:00"
+}

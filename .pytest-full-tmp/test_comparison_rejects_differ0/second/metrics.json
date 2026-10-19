@@ -1,0 +1,1 @@
+{"total_records": 120, "evaluated_records": 120, "api_failure_rate": 0.0, "invalid_rate": 0.0, "policy": {"accuracy": 0.9, "precision": 0.8, "recall": 0.7, "f1": 0.75}, "primary_domain": {"exact_match_accuracy": 0.6, "macro_f1": 0.5, "per_domain": {"AU01": {"support": 120, "recall": 0.6}}}}

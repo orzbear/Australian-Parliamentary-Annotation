@@ -1,0 +1,10 @@
+{
+  "chunks": [
+    {
+      "artifact_reference": "C:\\Users\\Orzbear\\Desktop\\parliament speech annotator\\.pytest-full-tmp\\test_aggregate_detects_missing0\\chunk",
+      "artifact_sha256": "098eabdb6e4ebbf6a3bbc0b8f8e4386642864d6daaa2893ec2b9920647a1b4ee",
+      "chunk_number": 1,
+      "record_count": 2
+    }
+  ]
+}

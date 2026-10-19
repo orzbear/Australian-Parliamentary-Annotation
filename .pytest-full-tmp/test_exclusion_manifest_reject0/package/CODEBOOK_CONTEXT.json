@@ -1,0 +1,1 @@
+{"schema": {"slug": "australian_policy_annotation", "version": "0.2.0", "content_sha256": "schema-hash", "fields": []}, "taxonomies": [{"slug": "australian_policy_domains", "version": "0.1.0", "content_sha256": "taxonomy-hash", "labels": [{"code": "AU01"}, {"code": "AU02"}, {"code": "AU03"}, {"code": "AU_OTHER_REVIEW"}]}]}

@@ -1,0 +1,87 @@
+{
+  "comparison_type": "original-human-reference-model-comparison",
+  "exclusion_set_sha256": "exclusions",
+  "methodological_note": "All models use the same 120 held-out model-selection records; this is not a new independent test set. Original human annotations are the shared reference. Post-hoc Gemini adjudications are not used, and this report does not select a winner. Cost projections are mechanical linear extrapolations, not production forecasts.",
+  "models": [
+    {
+      "api_failure_rate": 0.0,
+      "cost_per_valid_prediction_usd": 0.001,
+      "human_model_disagreement_count": 1,
+      "invalid_structured_output_rate": 0.0,
+      "mechanical_160k_cost_estimate_usd": 160.0,
+      "model": "gemini-2.5-flash",
+      "policy_accuracy": 0.9,
+      "policy_f1": 0.75,
+      "policy_precision": 0.8,
+      "policy_recall": 0.7,
+      "primary_domain_exact_match": 0.6,
+      "primary_domain_macro_f1": 0.5,
+      "primary_domain_per_domain": {
+        "AU01": {
+          "exact_match_rate": 0.6,
+          "support": 120
+        }
+      },
+      "provider": "gemini",
+      "run_identity": "gemini-identity",
+      "selected_records": 120,
+      "total_benchmark_cost_usd": 0.12,
+      "valid_output_rate": 1.0,
+      "valid_predictions": 120
+    },
+    {
+      "api_failure_rate": 0.0,
+      "cost_per_valid_prediction_usd": 0.001,
+      "human_model_disagreement_count": 1,
+      "invalid_structured_output_rate": 0.0,
+      "mechanical_160k_cost_estimate_usd": 160.0,
+      "model": "gpt-6-luna",
+      "policy_accuracy": 0.9,
+      "policy_f1": 0.75,
+      "policy_precision": 0.8,
+      "policy_recall": 0.7,
+      "primary_domain_exact_match": 0.6,
+      "primary_domain_macro_f1": 0.5,
+      "primary_domain_per_domain": {
+        "AU01": {
+          "exact_match_rate": 0.6,
+          "support": 120
+        }
+      },
+      "provider": "openai",
+      "run_identity": "openai-identity",
+      "selected_records": 120,
+      "total_benchmark_cost_usd": 0.12,
+      "valid_output_rate": 1.0,
+      "valid_predictions": 120
+    }
+  ],
+  "package_snapshot_sha256": "package",
+  "prompt_sha256": "prompt",
+  "prompt_version": "phase4a-policy-v2",
+  "quality_cost_frontier_dominated_by": {
+    "policy_f1": {
+      "gemini:gemini-2.5-flash": [],
+      "openai:gpt-6-luna": []
+    },
+    "primary_domain_exact_match": {
+      "gemini:gemini-2.5-flash": [],
+      "openai:gpt-6-luna": []
+    },
+    "primary_domain_macro_f1": {
+      "gemini:gemini-2.5-flash": [],
+      "openai:gpt-6-luna": []
+    }
+  },
+  "record_count": 120,
+  "relative_total_cost_ratios": {
+    "gemini:gemini-2.5-flash": {
+      "gemini:gemini-2.5-flash": 1.0,
+      "openai:gpt-6-luna": 1.0
+    },
+    "openai:gpt-6-luna": {
+      "gemini:gemini-2.5-flash": 1.0,
+      "openai:gpt-6-luna": 1.0
+    }
+  }
+}

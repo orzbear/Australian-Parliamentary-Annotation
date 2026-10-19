@@ -8,6 +8,7 @@ import os
 import zipfile
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal
 from pathlib import Path
 
 import psycopg
@@ -38,6 +39,7 @@ from hansard_annotator.db.review_export import (
     ReviewExportOptions,
     export_review_sample,
 )
+from hansard_annotator.llm_eval.import_predictions import import_predictions
 from hansard_annotator.product.cli import main as product_cli
 from hansard_annotator.product.loaders import (
     load_annotation_schema,
@@ -54,6 +56,11 @@ from hansard_annotator.web.auth.service import (
     resolve_session,
     revoke_session,
     set_user_enabled,
+)
+from hansard_annotator.web.campaigns.phase4e import (
+    authorize_full_production,
+    plan_campaign_chunks,
+    set_orchestration_paused,
 )
 from hansard_annotator.web.campaigns.service import (
     create_campaign,
@@ -134,6 +141,7 @@ PHASE4D_RECOVERY_TABLES = {
     "ai_annotation_campaign_recoveries",
     "ai_annotation_campaign_recovery_records",
 }
+PHASE4E_TABLES = {"ai_annotation_campaign_batches"}
 
 
 @pytest.fixture
@@ -149,7 +157,7 @@ def database_url(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
         connection.execute(
             "TRUNCATE ai_annotation_campaign_recovery_records,"
             "ai_annotation_campaign_recoveries,ai_annotation_campaign_records,"
-            "ai_annotation_campaigns,"
+            "ai_annotation_campaign_batches,ai_annotation_campaigns,"
             "model_prediction_reviews,model_predictions,model_prediction_runs"
         )
         connection.execute("TRUNCATE users,projects CASCADE")
@@ -1021,6 +1029,9 @@ def test_phase4d_migration_constraints_immutability_linkage_and_downgrade_guard(
     assert {fk["referred_table"] for fk in recovery_fks} == {
         "ai_annotation_campaigns"
     }
+    command.upgrade(config, "20261018_09")
+    inspector = inspect(create_database_engine(settings))
+    assert set(inspector.get_table_names()) >= PHASE4E_TABLES
 
     import_validated_run(settings, _fixture_run(tmp_path, run_id="phase4d-db-fixture"))
     password = "phase4d database test password"
@@ -1190,6 +1201,161 @@ def test_phase4d_migration_constraints_immutability_linkage_and_downgrade_guard(
     monkeypatch.setenv("HANSARD_DATABASE_URL", database_url)
     with pytest.raises(RuntimeError, match="recovery downgrade refused"):
         command.downgrade(config, "20261009_06")
+
+
+def test_phase4e_chunk_persistence_authorization_and_downgrade_guard(
+    database_url: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _web_settings(database_url)
+    import_validated_run(
+        settings.database,
+        _fixture_run(tmp_path, run_id="phase4e-chunk-fixture"),
+    )
+    password = "phase4e database test password"
+    create_user(
+        settings,
+        "phase4e-planner",
+        "Phase 4E Planner",
+        password,
+        admin=True,
+        must_change_password=False,
+    )
+    admin, _ = authenticate(settings, "phase4e-planner", password)
+    url = database_url.replace("postgresql+psycopg://", "postgresql://")
+    with psycopg.connect(url) as connection:
+        corpus_id = int(connection.execute("SELECT id FROM corpora LIMIT 1").fetchone()[0])
+    campaign = create_campaign(settings, admin, name="Phase 4E DB", corpus_id=corpus_id)
+    planned = plan_campaign(
+        settings,
+        admin,
+        str(campaign["public_id"]),
+        limit=1,
+        seed="phase4e-db",
+        exclude_human_annotated=False,
+    ).campaign
+    chunked = plan_campaign_chunks(
+        settings,
+        admin,
+        str(campaign["public_id"]),
+        enqueued_token_ceiling=10_000_000,
+        safety_factor=0.9,
+        max_chunk_records=1,
+    )
+    assert chunked["orchestration_status"] == "PLANNED"
+    with psycopg.connect(url) as connection:
+        batches = connection.execute(
+            """
+            SELECT chunk_number,first_selection_order,last_selection_order,record_count
+            FROM ai_annotation_campaign_batches WHERE campaign_id=%s ORDER BY chunk_number
+            """,
+            (campaign["id"],),
+        ).fetchall()
+        assert batches == [(1, 0, 0, 1)]
+        with pytest.raises(psycopg.errors.RaiseException, match="provenance is immutable"):
+            connection.execute(
+                """
+                UPDATE ai_annotation_campaign_batches SET record_set_sha256=%s
+                WHERE campaign_id=%s AND chunk_number=1
+                """,
+                ("f" * 64, campaign["id"]),
+            )
+        connection.rollback()
+    authorized = authorize_full_production(
+        settings,
+        admin,
+        str(campaign["public_id"]),
+        confirmation="START FULL PRODUCTION",
+        spend_ceiling_usd=Decimal(str(planned["estimated_total_cost_usd"])),
+    )
+    assert authorized["status"] == "READY"
+    assert authorized["orchestration_status"] == "RUNNING"
+    assert set_orchestration_paused(
+        settings, admin, str(campaign["public_id"]), paused=True
+    )["orchestration_status"] == "PAUSED"
+    assert set_orchestration_paused(
+        settings, admin, str(campaign["public_id"]), paused=False
+    )["orchestration_status"] == "RUNNING"
+    with psycopg.connect(url) as connection:
+        with pytest.raises(psycopg.errors.RaiseException, match="authorization is immutable"):
+            connection.execute(
+                """
+                UPDATE ai_annotation_campaigns SET authorized_spend_ceiling_usd=999
+                WHERE id=%s
+                """,
+                (campaign["id"],),
+            )
+        connection.rollback()
+        record_id = connection.execute(
+            "SELECT record_id FROM ai_annotation_campaign_records WHERE campaign_id=%s",
+            (campaign["id"],),
+        ).fetchone()[0]
+
+    rollback_artifact = tmp_path / "phase4e-import-rollback"
+    rollback_artifact.mkdir()
+    prediction = {
+        "record_id": record_id,
+        "request_index": 0,
+        "status": "success",
+        "prediction": {
+            "is_non_policy": True,
+            "primary_australian_domain": None,
+            "secondary_australian_domains": [],
+            "reasoning": "Non-policy.",
+        },
+        "usage": {},
+    }
+    summary = {
+        "provenance": {
+            "provider": planned["provider"],
+            "model": planned["configured_model"],
+            "prompt_version": planned["prompt_version"],
+            "assembled_prompt_sha256": planned["prompt_sha256"],
+            "canonical_schema_sha256": planned["canonical_schema_sha256"],
+            "prediction_contract_sha256": planned["prediction_contract_sha256"],
+            "provider_schema_sha256": planned["provider_schema_sha256"],
+            **planned["generation_config"],
+            "execution_mode": "batch",
+            "batch_id": "phase4e:rollback-test",
+            "record_ids_sha256": "f" * 64,
+        },
+        "coverage": {
+            "accounting_invariant_ok": True,
+            "planned_requests": 2,
+            "successful_provider_responses": 2,
+            "failed_provider_responses": 0,
+            "valid_structured_predictions": 2,
+            "invalid_structured_predictions": 0,
+        },
+        "tokens": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_tokens": 0,
+        },
+        "cost": {
+            "token_processing_cost_usd": 0,
+            "explicit_cache_storage_cost_usd": 0,
+            "total_pilot_cost_usd": 0,
+        },
+        "batch_status": {"model": planned["configured_model"]},
+    }
+    (rollback_artifact / "operational_summary.json").write_text(
+        json.dumps(summary), encoding="utf-8"
+    )
+    (rollback_artifact / "predictions.jsonl").write_text(
+        json.dumps(prediction) + "\n" + json.dumps(prediction) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        import_predictions(rollback_artifact, settings.database, dry_run=False)
+    with psycopg.connect(url) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM model_prediction_runs WHERE provider_job_id=%s",
+            ("phase4e:rollback-test",),
+        ).fetchone()[0] == 0
+    monkeypatch.setenv("HANSARD_DATABASE_URL", database_url)
+    with pytest.raises(RuntimeError, match="Phase 4E downgrade refused"):
+        command.downgrade(Config("alembic.ini"), "20261017_08")
 
 
 def test_phase4d_planning_matches_historical_selection_and_rolls_back_atomically(
