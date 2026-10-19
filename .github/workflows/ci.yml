@@ -87,7 +87,7 @@ jobs:
           HANSARD_SESSION_SECRET: ci-session-secret-that-is-long-enough-for-validation
         run: |
           docker compose -f compose.production.yaml config --quiet
-          test "$(docker compose -f compose.production.yaml config --services | sort | xargs)" = "caddy postgres web"
+          test "$(docker compose -f compose.production.yaml config --services | sort | xargs)" = "caddy campaign-worker postgres web"
 
       - name: Validate Caddy configuration
         run: >-
