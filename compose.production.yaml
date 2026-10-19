@@ -113,6 +113,7 @@ services:
       disable: true
     networks:
       - database
+      - provider-egress
     depends_on:
       postgres:
         condition: service_healthy
@@ -157,6 +158,8 @@ services:
 
 networks:
   frontend:
+  provider-egress:
+    internal: false
   database:
     internal: true
 

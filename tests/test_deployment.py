@@ -18,6 +18,8 @@ def test_production_compose_isolates_database_and_hermes() -> None:
     assert "ports" not in services["postgres"]
     assert services["postgres"]["networks"] == ["database"]
     assert compose["networks"]["database"]["internal"] is True
+    assert set(compose["networks"]) == {"frontend", "provider-egress", "database"}
+    assert compose["networks"]["provider-egress"]["internal"] is False
     assert services["web"]["read_only"] is True
     assert services["web"]["cap_drop"] == ["ALL"]
     assert services["web"]["environment"]["HANSARD_APP_ENV"] == "production"
@@ -34,8 +36,12 @@ def test_production_compose_isolates_database_and_hermes() -> None:
     assert worker["read_only"] is True
     assert worker["cap_drop"] == ["ALL"]
     assert worker["healthcheck"] == {"disable": True}
-    assert worker["networks"] == ["database"]
+    assert worker["networks"] == ["database", "provider-egress"]
     assert "frontend" not in worker["networks"]
+    assert "ports" not in worker
+    assert "expose" not in worker
+    assert services["caddy"]["networks"] == ["frontend"]
+    assert "provider-egress" not in services["caddy"]["networks"]
     assert (
         "hansard-campaign-artifacts:/var/lib/hansard-campaign-artifacts"
         in worker["volumes"]

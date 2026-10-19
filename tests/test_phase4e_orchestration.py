@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import psutil
+import pytest
 
 from hansard_annotator.llm_eval.import_predictions import (
     IMPORT_BATCH_SIZE,
@@ -24,6 +25,8 @@ from hansard_annotator.llm_eval.operations import (
     FROZEN_PROMPT_VERSION,
     canonical_hash,
 )
+from hansard_annotator.llm_eval.providers import ProviderError
+from hansard_annotator.web.campaigns import worker as worker_module
 from hansard_annotator.web.campaigns.phase4e import (
     CHUNK_PLANNER_VERSION,
     PHASE4E_ADVISORY_LOCK_NAMESPACE,
@@ -168,6 +171,48 @@ def test_worker_holds_cross_transaction_lock_and_uses_lost_receipt_lookup() -> N
         "ensure_campaign_cache("
     )
     assert "summary_coverage[\"missing_responses\"]" in locked_source
+
+
+def test_watch_worker_isolates_tick_errors_but_one_shot_remains_fail_fast(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[str] = []
+
+    class Result:
+        def __init__(self, action: str) -> None:
+            self.action = action
+
+    def fake_tick(_settings: object, campaign_id: str) -> Result:
+        calls.append(campaign_id)
+        if campaign_id == "cache-network-failure":
+            raise ProviderError("provider network request failed", retryable=True)
+        return Result("progressed")
+
+    monkeypatch.setattr(worker_module, "orchestration_tick", fake_tick)
+    worker_module._run_campaign_ticks(
+        object(),  # type: ignore[arg-type]
+        ["cache-network-failure", "healthy-campaign"],
+        tolerate_errors=True,
+    )
+
+    captured = capsys.readouterr()
+    error = json.loads(captured.err)
+    assert error == {
+        "action": "tick-error",
+        "campaign_id": "cache-network-failure",
+        "error_type": "ProviderError",
+        "message": "provider network request failed",
+    }
+    assert json.loads(captured.out) == {"action": "progressed"}
+    assert calls == ["cache-network-failure", "healthy-campaign"]
+
+    with pytest.raises(ProviderError, match="provider network request failed"):
+        worker_module._run_campaign_ticks(
+            object(),  # type: ignore[arg-type]
+            ["cache-network-failure"],
+            tolerate_errors=False,
+        )
 
 
 def test_cache_storage_receipt_is_attributed_only_to_the_creating_chunk() -> None:
