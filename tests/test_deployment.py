@@ -33,12 +33,27 @@ def test_production_compose_isolates_database_and_hermes() -> None:
     ]
     assert worker["read_only"] is True
     assert worker["cap_drop"] == ["ALL"]
+    assert worker["healthcheck"] == {"disable": True}
     assert worker["networks"] == ["database"]
     assert "frontend" not in worker["networks"]
     assert (
         "hansard-campaign-artifacts:/var/lib/hansard-campaign-artifacts"
         in worker["volumes"]
     )
+
+
+def test_worker_disables_inherited_http_healthcheck_without_altering_web() -> None:
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    compose = yaml.safe_load(
+        (ROOT / "compose.production.yaml").read_text(encoding="utf-8")
+    )
+
+    assert "HEALTHCHECK --interval=30s" in dockerfile
+    assert "http://127.0.0.1:8000/health/live" in dockerfile
+    assert "healthcheck" not in compose["services"]["web"]
+    assert compose["services"]["campaign-worker"]["healthcheck"] == {
+        "disable": True
+    }
 
 
 def test_production_templates_contain_no_real_secrets_or_destructive_volume_down() -> None:
