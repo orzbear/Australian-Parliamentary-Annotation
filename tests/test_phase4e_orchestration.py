@@ -153,7 +153,9 @@ def test_worker_holds_cross_transaction_lock_and_uses_lost_receipt_lookup() -> N
     assert "pg_try_advisory_lock" in source
     assert "pg_advisory_unlock" in source
     assert "PHASE4E_ADVISORY_LOCK_NAMESPACE" in source
-    assert "PHASE4E_ADVISORY_LOCK_NAMESPACE" in locked_source
+    assert "pg_try_advisory_xact_lock" not in module_source
+    assert "caller holds this campaign's session lock" in locked_source
+    assert source.count("_orchestration_tick_locked(") == 1
     assert PHASE4E_ADVISORY_LOCK_NAMESPACE == 0x50483445
     assert module_source.index("finder.find_batch") < module_source.index(
         "provider.submit(plan"

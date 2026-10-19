@@ -807,7 +807,11 @@ def _orchestration_tick_locked(
     *,
     gateway: GeminiGateway | None = None,
 ) -> TickResult:
-    """Advance at most one child state; safe for repeated/concurrent invocations."""
+    """Advance one state while the caller holds this campaign's session lock.
+
+    Call only through :func:`orchestration_tick`; row locks below protect each
+    transaction while that outer advisory lock spans provider operations.
+    """
     with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
         campaign_row = connection.execute(
             "SELECT * FROM ai_annotation_campaigns WHERE public_id::text=%s FOR UPDATE",
@@ -822,12 +826,6 @@ def _orchestration_tick_locked(
             return TickResult("paused", public_id)
         if campaign["orchestration_status"] not in {"RUNNING", "MAIN_COMPLETE"}:
             return TickResult("idle", public_id)
-        locked = connection.execute(
-            "SELECT pg_try_advisory_xact_lock(%s::integer,%s::integer) AS locked",
-            (PHASE4E_ADVISORY_LOCK_NAMESPACE, campaign["id"]),
-        ).fetchone()
-        if not locked or not locked["locked"]:
-            return TickResult("locked", public_id)
         chunk_row = connection.execute(
             """
             SELECT * FROM ai_annotation_campaign_batches
