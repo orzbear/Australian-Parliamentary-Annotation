@@ -5,9 +5,11 @@ import hashlib
 import io
 import json
 import os
+import threading
 import zipfile
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -57,8 +59,10 @@ from hansard_annotator.web.auth.service import (
     revoke_session,
     set_user_enabled,
 )
+from hansard_annotator.web.campaigns import phase4e as phase4e_module
 from hansard_annotator.web.campaigns.phase4e import (
     authorize_full_production,
+    orchestration_tick,
     plan_campaign_chunks,
     set_orchestration_paused,
 )
@@ -1356,6 +1360,163 @@ def test_phase4e_chunk_persistence_authorization_and_downgrade_guard(
     monkeypatch.setenv("HANSARD_DATABASE_URL", database_url)
     with pytest.raises(RuntimeError, match="Phase 4E downgrade refused"):
         command.downgrade(Config("alembic.ini"), "20261017_08")
+
+
+def test_phase4e_advisory_lock_allows_progress_and_is_scoped_per_campaign(
+    database_url: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _web_settings(database_url)
+    import_validated_run(
+        settings.database,
+        _fixture_run(tmp_path, run_id="phase4e-advisory-lock-fixture"),
+    )
+    password = "phase4e advisory lock test password"
+    create_user(
+        settings,
+        "phase4e-lock-tester",
+        "Phase 4E Lock Tester",
+        password,
+        admin=True,
+        must_change_password=False,
+    )
+    admin, _ = authenticate(settings, "phase4e-lock-tester", password)
+    url = database_url.replace("postgresql+psycopg://", "postgresql://")
+    with psycopg.connect(url) as connection:
+        corpus_id = int(connection.execute("SELECT id FROM corpora LIMIT 1").fetchone()[0])
+
+    def authorized_campaign(name: str, seed: str) -> dict[str, object]:
+        campaign = create_campaign(settings, admin, name=name, corpus_id=corpus_id)
+        planned = plan_campaign(
+            settings,
+            admin,
+            str(campaign["public_id"]),
+            limit=1,
+            seed=seed,
+            exclude_human_annotated=False,
+        ).campaign
+        plan_campaign_chunks(
+            settings,
+            admin,
+            str(campaign["public_id"]),
+            enqueued_token_ceiling=10_000_000,
+            safety_factor=0.9,
+            max_chunk_records=1,
+        )
+        return authorize_full_production(
+            settings,
+            admin,
+            str(campaign["public_id"]),
+            confirmation="START FULL PRODUCTION",
+            spend_ceiling_usd=Decimal(str(planned["estimated_total_cost_usd"])),
+        )
+
+    first = authorized_campaign("Phase 4E lock first", "phase4e-lock-first")
+    second = authorized_campaign("Phase 4E lock second", "phase4e-lock-second")
+    first_id = str(first["public_id"])
+    second_id = str(second["public_id"])
+
+    progressed = orchestration_tick(settings, first_id)
+    assert progressed.action == "reserved"
+    with psycopg.connect(url) as connection:
+        assert connection.execute(
+            """
+            SELECT batch.status FROM ai_annotation_campaign_batches batch
+            JOIN ai_annotation_campaigns campaign ON campaign.id=batch.campaign_id
+            WHERE campaign.public_id::text=%s
+            """,
+            (first_id,),
+        ).fetchone()[0] == "SUBMITTING"
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def hold_same_campaign(
+        _settings: WebSettings, public_id: str, *, gateway: object = None
+    ) -> phase4e_module.TickResult:
+        del gateway
+        entered.set()
+        assert release.wait(timeout=10)
+        return phase4e_module.TickResult("held", public_id)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(phase4e_module, "_orchestration_tick_locked", hold_same_campaign)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            holder = executor.submit(orchestration_tick, settings, first_id)
+            assert entered.wait(timeout=10)
+            contender = executor.submit(orchestration_tick, settings, first_id)
+            contender_result = contender.result(timeout=10)
+            release.set()
+            holder_result = holder.result(timeout=10)
+    assert {holder_result.action, contender_result.action} == {"held", "locked"}
+
+    barrier = threading.Barrier(2)
+
+    def hold_different_campaigns(
+        _settings: WebSettings, public_id: str, *, gateway: object = None
+    ) -> phase4e_module.TickResult:
+        del gateway
+        barrier.wait(timeout=10)
+        return phase4e_module.TickResult("independent", public_id)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            phase4e_module, "_orchestration_tick_locked", hold_different_campaigns
+        )
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = [
+                future.result(timeout=10)
+                for future in (
+                    executor.submit(orchestration_tick, settings, first_id),
+                    executor.submit(orchestration_tick, settings, second_id),
+                )
+            ]
+    assert [result.action for result in results] == ["independent", "independent"]
+
+    class Gateway:
+        def __init__(self) -> None:
+            self.submissions = 0
+
+        def create_cache(self, request: dict[str, object]) -> dict[str, object]:
+            now = datetime.now(UTC)
+            return {
+                "name": "cachedContents/phase4e-lock-test",
+                "model": request["model"],
+                "displayName": request["displayName"],
+                "createTime": now.isoformat(),
+                "expireTime": (now + timedelta(hours=24)).isoformat(),
+                "usageMetadata": {"totalTokenCount": 4_131},
+            }
+
+        def get_cache(self, _cache_identifier: str) -> dict[str, object]:
+            raise AssertionError("new cache should be created only once")
+
+        def find_batch(self, _display_name: str, _model: str) -> None:
+            return None
+
+        def submit(self, _plan: dict[str, object], _model: str) -> str:
+            self.submissions += 1
+            return "batches/phase4e-lock-test"
+
+        def status(self, provider_job_id: str) -> dict[str, object]:
+            return {
+                "name": provider_job_id,
+                "metadata": {
+                    "state": "BATCH_STATE_RUNNING",
+                    "batchStats": {
+                        "requestCount": "1",
+                        "successfulRequestCount": "0",
+                        "failedRequestCount": "0",
+                        "pendingRequestCount": "1",
+                    },
+                },
+            }
+
+    gateway = Gateway()
+    submitted = orchestration_tick(settings, first_id, gateway=gateway)
+    refreshed = orchestration_tick(settings, first_id, gateway=gateway)
+    assert submitted.action == "submitted"
+    assert refreshed.action == "refreshed"
+    assert gateway.submissions == 1
 
 
 def test_phase4d_planning_matches_historical_selection_and_rolls_back_atomically(
