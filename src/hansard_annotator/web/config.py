@@ -4,8 +4,15 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 from hansard_annotator.db.config import DatabaseSettings
+
+DEFAULT_PRODUCTION_EXPORT_WORK_ROOT = Path("/var/lib/hansard-export-work")
+DEFAULT_LOCAL_EXPORT_WORK_ROOT = Path("data/exports/work")
+DEFAULT_EXPORT_MIN_FREE_BYTES = 2 * 1024 * 1024 * 1024
+MINIMUM_EXPORT_MIN_FREE_BYTES = 256 * 1024 * 1024
+MAXIMUM_EXPORT_MIN_FREE_BYTES = 1024 * 1024 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -22,6 +29,8 @@ class WebSettings:
     lockout_failures: int
     lockout_minutes: int
     log_level: str
+    export_work_root: Path = DEFAULT_LOCAL_EXPORT_WORK_ROOT
+    export_min_free_bytes: int = DEFAULT_EXPORT_MIN_FREE_BYTES
 
     @classmethod
     def from_environment(cls) -> WebSettings:
@@ -53,6 +62,7 @@ class WebSettings:
         )
         if not hosts:
             raise ValueError("HANSARD_ALLOWED_HOSTS must contain at least one host")
+        export_work_root = _export_work_root(environment)
         return cls(
             database=DatabaseSettings.from_environment(),
             environment=environment,
@@ -74,7 +84,30 @@ class WebSettings:
                 "HANSARD_LOGIN_LOCKOUT_MINUTES", 15, 1, 1440
             ),
             log_level=os.getenv("HANSARD_LOG_LEVEL", "INFO").upper(),
+            export_work_root=export_work_root,
+            export_min_free_bytes=_bounded_int(
+                "HANSARD_EXPORT_MIN_FREE_BYTES",
+                DEFAULT_EXPORT_MIN_FREE_BYTES,
+                MINIMUM_EXPORT_MIN_FREE_BYTES,
+                MAXIMUM_EXPORT_MIN_FREE_BYTES,
+            ),
         )
+
+
+def _export_work_root(environment: str) -> Path:
+    raw = os.getenv("HANSARD_EXPORT_WORK_ROOT", "").strip()
+    if environment == "production":
+        if not raw:
+            raise ValueError("HANSARD_EXPORT_WORK_ROOT must be explicitly set in production")
+        normalised = raw.replace("\\", "/").rstrip("/") or "/"
+        if normalised in {"/tmp", "/var/tmp"} or normalised.startswith(("/tmp/", "/var/tmp/")):
+            raise ValueError(
+                "HANSARD_EXPORT_WORK_ROOT must be a disk-backed path outside /tmp in production"
+            )
+        return Path(raw)
+    if raw:
+        return Path(raw).resolve()
+    return DEFAULT_LOCAL_EXPORT_WORK_ROOT.resolve()
 
 
 def _bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:

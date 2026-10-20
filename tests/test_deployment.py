@@ -134,6 +134,54 @@ def test_campaign_artifact_volume_is_initialized_for_non_root_web_user() -> None
     assert "chown" not in verify_script
 
 
+def test_canonical_export_work_volume_is_web_only_and_preserves_tmpfs() -> None:
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    compose = yaml.safe_load(
+        (ROOT / "compose.production.yaml").read_text(encoding="utf-8")
+    )
+    verify_script = (ROOT / "deploy" / "scripts" / "verify.sh").read_text(
+        encoding="utf-8"
+    )
+
+    export_work_path = "/var/lib/hansard-export-work"
+    export_work_mount = f"hansard-export-work:{export_work_path}"
+    chown_statement = f"chown hansard:hansard {export_work_path}"
+
+    assert export_work_path in dockerfile
+    assert chown_statement in dockerfile
+    assert dockerfile.index(chown_statement) < dockerfile.index("USER 10001:10001")
+
+    services = compose["services"]
+    web = services["web"]
+    assert "hansard-export-work" in compose["volumes"]
+    assert export_work_mount in web["volumes"]
+    assert web["tmpfs"] == ["/tmp:size=64m,mode=1777"]
+    assert web["read_only"] is True
+    assert web["cap_drop"] == ["ALL"]
+    assert (
+        web["environment"]["HANSARD_EXPORT_WORK_ROOT"]
+        == "/var/lib/hansard-export-work"
+    )
+    assert "HANSARD_EXPORT_MIN_FREE_BYTES" in web["environment"]
+    assert "ports" not in web
+
+    for other_service in ("postgres", "migrate", "campaign-worker", "caddy"):
+        other_volumes = services[other_service].get("volumes", [])
+        assert all(
+            "hansard-export-work" not in str(volume) for volume in other_volumes
+        )
+        if other_service != "caddy":
+            assert "ports" not in services[other_service]
+    assert services["caddy"]["ports"] == ["80:80", "443:443", "443:443/udp"]
+
+    assert (
+        f"probe={export_work_path}/.deployment-write-test.$$"
+        in verify_script
+    )
+    assert 'touch "$probe"' in verify_script
+    assert 'rm -f "$probe"' in verify_script
+
+
 def test_daily_backup_timer_is_persistent_and_non_destructive() -> None:
     service = (
         ROOT / "deploy/systemd/hansard-annotator-backup.service"

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import shutil
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,6 +17,8 @@ from hansard_annotator.web.config import WebSettings
 from hansard_annotator.web.dependencies import enforce_csrf, get_settings, require_admin
 from hansard_annotator.web.research_exports.canonical_ai import (
     CanonicalAIExportError,
+    check_export_disk_space,
+    cleanup_canonical_export_work_dir,
     create_canonical_full_corpus_export,
 )
 from hansard_annotator.web.research_exports.service import (
@@ -87,26 +88,43 @@ async def download_canonical_ai(
     principal: Annotated[Principal, Depends(require_admin)],
 ) -> FileResponse:
     await enforce_csrf(request, principal, settings)
-    directory = Path(tempfile.mkdtemp(prefix="canonical-full-corpus-ai-"))
+    try:
+        settings.export_work_root.mkdir(parents=True, exist_ok=True)
+        check_export_disk_space(settings.export_work_root, settings.export_min_free_bytes)
+        directory = Path(
+            tempfile.mkdtemp(
+                prefix="canonical-full-corpus-ai-",
+                dir=settings.export_work_root,
+            )
+        )
+    except (CanonicalAIExportError, OSError, ValueError) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
     try:
         export = create_canonical_full_corpus_export(
             settings, principal, corpus_id, directory
         )
     except PermissionError as error:
-        shutil.rmtree(directory, ignore_errors=True)
+        cleanup_canonical_export_work_dir(directory, settings.export_work_root)
         raise HTTPException(status_code=403, detail=str(error)) from error
     except LookupError as error:
-        shutil.rmtree(directory, ignore_errors=True)
+        cleanup_canonical_export_work_dir(directory, settings.export_work_root)
         raise HTTPException(status_code=404, detail=str(error)) from error
     except (CanonicalAIExportError, OSError, ValueError) as error:
-        shutil.rmtree(directory, ignore_errors=True)
+        cleanup_canonical_export_work_dir(directory, settings.export_work_root)
         raise HTTPException(status_code=409, detail=str(error)) from error
+    except Exception:
+        cleanup_canonical_export_work_dir(directory, settings.export_work_root)
+        raise
     return FileResponse(
         export.zip_path,
         media_type="application/zip",
         filename=f"canonical-full-corpus-ai-{export.manifest['corpus']['slug']}.zip",
         headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
-        background=BackgroundTask(shutil.rmtree, directory, ignore_errors=True),
+        background=BackgroundTask(
+            cleanup_canonical_export_work_dir,
+            directory,
+            settings.export_work_root,
+        ),
     )
 
 
