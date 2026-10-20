@@ -51,6 +51,10 @@ from hansard_annotator.product.loaders import (
 )
 from hansard_annotator.product.seeds import SeedConflictError
 from hansard_annotator.product.verification import verify_product_foundation
+from hansard_annotator.web.annotations.ai_review import (
+    ensure_prediction_assignment,
+    record_prediction_review,
+)
 from hansard_annotator.web.annotations.service import save_annotation
 from hansard_annotator.web.app import create_app
 from hansard_annotator.web.auth.service import (
@@ -91,6 +95,13 @@ from hansard_annotator.web.projects.service import (
     create_project,
     set_membership,
     transition_project,
+)
+from hansard_annotator.web.research_exports.canonical_ai import (
+    OUTCOME_NO_USABLE_TEXT,
+    OUTCOME_PREDICTION,
+    OUTCOME_PROVIDER_REFUSAL,
+    CanonicalAIExportError,
+    create_canonical_full_corpus_export,
 )
 from hansard_annotator.web.research_exports.service import provider_refusal_export
 from hansard_annotator.web.security import SESSION_COOKIE
@@ -1895,6 +1906,502 @@ def test_provider_refusals_import_separately_and_exclude_same_configuration(
         }
     assert record_ids[0] not in override_selected
     assert record_ids[1] in override_selected
+
+
+def test_canonical_full_corpus_ai_export_combines_exact_configuration_runs(
+    database_url: str, tmp_path: Path
+) -> None:
+    settings = _web_settings(database_url)
+    import_validated_run(
+        settings.database,
+        _fixture_run(tmp_path, run_id="canonical-ai-export-fixture"),
+    )
+    password = "canonical AI export test password"
+    create_user(
+        settings,
+        "canonical-ai-exporter",
+        "Canonical AI Exporter",
+        password,
+        admin=True,
+        must_change_password=False,
+    )
+    admin, admin_token = authenticate(settings, "canonical-ai-exporter", password)
+    configuration = production_configuration()
+    url = database_url.replace("postgresql+psycopg://", "postgresql://")
+    with psycopg.connect(url, row_factory=dict_row) as connection:
+        corpus = connection.execute(
+            "SELECT id,public_id FROM corpora LIMIT 1"
+        ).fetchone()
+        assert corpus is not None
+        turns = connection.execute(
+            """
+            SELECT turn.id,turn.turn_key
+            FROM speaker_turns turn
+            JOIN reconstruction_runs reconstruction
+              ON reconstruction.id=turn.reconstruction_run_id
+            JOIN corpora corpus
+              ON corpus.current_preprocessing_run_id=reconstruction.preprocessing_run_id
+            WHERE corpus.id=%s ORDER BY turn.id
+            """,
+            (corpus["id"],),
+        ).fetchall()
+        assert len(turns) >= 4
+        run_one_turns = turns[:-3]
+        run_two_turn = turns[-3]
+        refused_turn = turns[-2]
+        no_text_turn = turns[-1]
+
+        connection.execute(
+            """
+            INSERT INTO speaker_turns
+              (turn_key,reconstruction_run_id,source_file_version_id,major_section_id,
+               minor_section_id,turn_sequence,first_fragment_sequence,last_fragment_sequence,
+               fragment_count,speech_date,chamber,major_heading_original,
+               minor_heading_original,speaker_id_raw,speaker_name_raw,text_raw,text_clean,
+               calculated_word_count,warning_codes,business_type,business_mapping_version,
+               is_interjection,is_orphan_continuation,interrupted,interruption_count,
+               has_known_speaker,eligible_50_words,eligible_100_words,record_sha256)
+            SELECT %s,reconstruction_run_id,source_file_version_id,major_section_id,
+                   minor_section_id,
+                   (SELECT max(turn_sequence)+1 FROM speaker_turns WHERE reconstruction_run_id=t.reconstruction_run_id),
+                   first_fragment_sequence,last_fragment_sequence,fragment_count,speech_date,
+                   chamber,major_heading_original,minor_heading_original,speaker_id_raw,
+                   speaker_name_raw,'   ','',0,warning_codes,business_type,business_mapping_version,
+                   is_interjection,is_orphan_continuation,interrupted,interruption_count,
+                   has_known_speaker,false,false,%s
+            FROM speaker_turns t WHERE t.id=%s
+            """,
+            ("f" * 64, "e" * 64, no_text_turn["id"]),
+        )
+        turns = connection.execute(
+            """
+            SELECT turn.id,turn.turn_key
+            FROM speaker_turns turn
+            JOIN reconstruction_runs reconstruction
+              ON reconstruction.id=turn.reconstruction_run_id
+            JOIN corpora corpus
+              ON corpus.current_preprocessing_run_id=reconstruction.preprocessing_run_id
+            WHERE corpus.id=%s ORDER BY turn.id
+            """,
+            (corpus["id"],),
+        ).fetchall()
+        run_one_turns = turns[:-3]
+        run_two_turn = turns[-3]
+        refused_turn = turns[-2]
+        no_text_turn = turns[-1]
+
+        production_run_1 = connection.execute(
+            """
+            INSERT INTO model_prediction_runs
+              (artifact_sha256,provider,configured_model,returned_model,prompt_version,
+               prompt_sha256,canonical_schema_sha256,prediction_contract_sha256,
+               provider_schema_sha256,generation_config,execution_mode,provider_job_id,
+               record_set_sha256,requested_count,provider_success_count,
+               provider_failure_count,valid_count,invalid_count,status)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0,%s,0,'imported')
+            RETURNING id,public_id
+            """,
+            (
+                "a" * 64,
+                configuration["provider"],
+                configuration["configured_model"],
+                configuration["configured_model"],
+                configuration["prompt_version"],
+                configuration["prompt_sha256"],
+                configuration["canonical_schema_sha256"],
+                configuration["prediction_contract_sha256"],
+                configuration["provider_schema_sha256"],
+                Jsonb(configuration["generation_config"]),
+                configuration["execution_mode"],
+                "batches/canonical-production-1",
+                "b" * 64,
+                len(run_one_turns),
+                len(run_one_turns),
+                len(run_one_turns),
+            ),
+        ).fetchone()
+        assert production_run_1 is not None
+        first_prediction_public_id: str | None = None
+        for index, turn in enumerate(run_one_turns):
+            inserted = connection.execute(
+                """
+                INSERT INTO model_predictions
+                  (run_id,speaker_turn_id,record_id,is_non_policy,
+                   primary_australian_domain,secondary_australian_domains,reasoning,
+                   validation_status,returned_model,artifact_reference)
+                VALUES (%s,%s,%s,false,'AU07','{"AU08"}','Immutable production prediction.',
+                        'success',%s,'data/predictions/run1/predictions.jsonl')
+                RETURNING public_id
+                """,
+                (
+                    production_run_1["id"],
+                    turn["id"],
+                    f"turn:{turn['turn_key']}",
+                    configuration["configured_model"],
+                ),
+            ).fetchone()
+            assert inserted is not None
+            if index == 0:
+                first_prediction_public_id = str(inserted["public_id"])
+
+        assert first_prediction_public_id is not None
+
+        production_run_2 = connection.execute(
+            """
+            INSERT INTO model_prediction_runs
+              (artifact_sha256,provider,configured_model,returned_model,prompt_version,
+               prompt_sha256,canonical_schema_sha256,prediction_contract_sha256,
+               provider_schema_sha256,generation_config,execution_mode,provider_job_id,
+               record_set_sha256,requested_count,provider_success_count,
+               provider_failure_count,valid_count,invalid_count,status)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,2,2,0,1,0,'imported')
+            RETURNING id,public_id
+            """,
+            (
+                "1" * 64,
+                configuration["provider"],
+                configuration["configured_model"],
+                configuration["configured_model"],
+                configuration["prompt_version"],
+                configuration["prompt_sha256"],
+                configuration["canonical_schema_sha256"],
+                configuration["prediction_contract_sha256"],
+                configuration["provider_schema_sha256"],
+                Jsonb(configuration["generation_config"]),
+                configuration["execution_mode"],
+                "batches/canonical-production-2",
+                "2" * 64,
+            ),
+        ).fetchone()
+        assert production_run_2 is not None
+        connection.execute(
+            """
+            INSERT INTO model_predictions
+              (run_id,speaker_turn_id,record_id,is_non_policy,
+               secondary_australian_domains,reasoning,validation_status,
+               returned_model,artifact_reference)
+            VALUES (%s,%s,%s,true,'{}','Second canonical campaign prediction.',
+                    'success',%s,'data/predictions/run2/predictions.jsonl')
+            """,
+            (
+                production_run_2["id"],
+                run_two_turn["id"],
+                f"turn:{run_two_turn['turn_key']}",
+                configuration["configured_model"],
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO model_prediction_abstentions
+              (run_id,speaker_turn_id,record_id,resolution_reason,
+               refusal_provenance,artifact_reference)
+            VALUES (%s,%s,%s,'PROHIBITED_CONTENT',%s,'test/provider_refusals.jsonl')
+            """,
+            (
+                production_run_2["id"],
+                refused_turn["id"],
+                f"turn:{refused_turn['turn_key']}",
+                Jsonb(
+                    {
+                        "resolution": "PROVIDER_REFUSAL",
+                        "reason": "PROHIBITED_CONTENT",
+                        "configuration_provenance": configuration,
+                    }
+                ),
+            ),
+        )
+        historical_run = connection.execute(
+            """
+            INSERT INTO model_prediction_runs
+              (artifact_sha256,provider,configured_model,returned_model,prompt_version,
+               prompt_sha256,canonical_schema_sha256,prediction_contract_sha256,
+               provider_schema_sha256,generation_config,execution_mode,provider_job_id,
+               record_set_sha256,requested_count,provider_success_count,
+               provider_failure_count,valid_count,invalid_count,status)
+            VALUES (%s,'gemini','gemini-2.5-flash','gemini-2.5-flash',%s,%s,%s,%s,%s,
+                    %s,'batch','batches/historical',%s,3,3,0,3,0,'imported')
+            RETURNING id
+            """,
+            (
+                "c" * 64,
+                configuration["prompt_version"],
+                configuration["prompt_sha256"],
+                configuration["canonical_schema_sha256"],
+                configuration["prediction_contract_sha256"],
+                configuration["provider_schema_sha256"],
+                Jsonb({"thinking_budget": 0}),
+                "d" * 64,
+            ),
+        ).fetchone()
+        assert historical_run is not None
+        for turn in (run_one_turns[0], refused_turn, no_text_turn):
+            connection.execute(
+                """
+                INSERT INTO model_predictions
+                  (run_id,speaker_turn_id,record_id,is_non_policy,
+                   secondary_australian_domains,reasoning,validation_status,
+                   returned_model)
+                VALUES (%s,%s,%s,true,'{}','HISTORICAL MODEL MUST NOT LEAK',
+                        'success','gemini-2.5-flash')
+                """,
+                (
+                    historical_run["id"],
+                    turn["id"],
+                    f"turn:{turn['turn_key']}",
+                ),
+            )
+
+    campaign_1 = create_campaign(
+        settings,
+        admin,
+        name="Canonical production provenance 1",
+        corpus_id=int(corpus["id"]),
+    )
+    campaign_2 = create_campaign(
+        settings,
+        admin,
+        name="Canonical production provenance 2",
+        corpus_id=int(corpus["id"]),
+    )
+    with psycopg.connect(url) as connection:
+        connection.execute(
+            """
+            UPDATE ai_annotation_campaigns SET status='IMPORTED',planned_count=%s,
+              record_set_sha256=%s,provider_job_id='phase4e:canonical-export-test-1',
+              artifact_reference='test/canonical-1',artifact_sha256=%s,
+              valid_count=%s,invalid_count=0,model_prediction_run_id=%s,imported_at=now()
+            WHERE id=%s
+            """,
+            (
+                len(run_one_turns),
+                "b" * 64,
+                "a" * 64,
+                len(run_one_turns),
+                production_run_1["id"],
+                campaign_1["id"],
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE ai_annotation_campaigns SET status='IMPORTED',planned_count=2,
+              record_set_sha256=%s,provider_job_id='phase4e:canonical-export-test-2',
+              artifact_reference='test/canonical-2',artifact_sha256=%s,
+              valid_count=1,invalid_count=0,model_prediction_run_id=%s,imported_at=now()
+            WHERE id=%s
+            """,
+            (
+                "2" * 64,
+                "1" * 64,
+                production_run_2["id"],
+                campaign_2["id"],
+            ),
+        )
+
+    load_taxonomy(
+        settings.database,
+        Path("config/taxonomies/australian_policy_domains/0.1.0.yaml"),
+        repository_root=Path("."),
+    )
+    load_annotation_schema(
+        settings.database,
+        Path("config/annotation_schemas/australian_policy_annotation/0.2.0.yaml"),
+        repository_root=Path("."),
+    )
+    with psycopg.connect(url, row_factory=dict_row) as connection:
+        pins = connection.execute(
+            """
+            SELECT pr.id AS run_id,asv.id AS schema_id
+            FROM corpora c JOIN preprocessing_runs pr ON pr.id=c.current_preprocessing_run_id
+            JOIN annotation_schemas s ON s.slug='australian_policy_annotation'
+            JOIN annotation_schema_versions asv
+              ON asv.annotation_schema_id=s.id AND asv.version='0.2.0'
+            WHERE c.id=%s
+            """,
+            (corpus["id"],),
+        ).fetchone()
+    assert pins is not None
+    review_project = create_project(
+        settings,
+        admin,
+        slug="canonical-review-layer",
+        name="Canonical Review Layer",
+        description="Optional human review layer",
+        mode="development",
+        corpus_id=int(corpus["id"]),
+        preprocessing_run_id=int(pins["run_id"]),
+        annotation_schema_version_id=int(pins["schema_id"]),
+    )
+    transition_project(settings, admin, int(review_project["id"]), "active")
+    assignment_id = ensure_prediction_assignment(settings, admin, first_prediction_public_id)
+    human_edit = save_annotation(
+        settings,
+        admin,
+        assignment_id,
+        {
+            "is_non_policy": False,
+            "primary_australian_domain": "AU12",
+            "secondary_australian_domains": [],
+            "fallback_explanation": None,
+            "annotation_notes": "Human reviewer edited domain to AU12.",
+        },
+        event_type="submitted",
+    )
+    record_prediction_review(
+        settings,
+        admin,
+        first_prediction_public_id,
+        "edited",
+        assignment_id=assignment_id,
+        annotation_version_id=int(human_edit["annotation_version_id"]),  # type: ignore[arg-type]
+        note="Human reviewer edited domain to AU12.",
+    )
+    record_prediction_review(
+        settings,
+        admin,
+        first_prediction_public_id,
+        "flagged_codebook",
+        assignment_id=assignment_id,
+        note="Boundary ambiguity noted.",
+    )
+
+    fixed = datetime(2026, 10, 20, 0, 0, tzinfo=UTC)
+    first = create_canonical_full_corpus_export(
+        settings, admin, str(corpus["public_id"]), tmp_path / "canonical-first", generated_at=fixed
+    )
+    second = create_canonical_full_corpus_export(
+        settings,
+        admin,
+        str(corpus["public_id"]),
+        tmp_path / "canonical-second",
+        generated_at=fixed + timedelta(seconds=1),
+    )
+    assert first.csv_path.read_bytes() == second.csv_path.read_bytes()
+    assert first.parquet_path.read_bytes() == second.parquet_path.read_bytes()
+    first_without_time = {**first.manifest}
+    second_without_time = {**second.manifest}
+    first_without_time.pop("generated_at")
+    second_without_time.pop("generated_at")
+    assert first_without_time == second_without_time
+
+    with first.csv_path.open(encoding="utf-8", newline="") as source:
+        csv_rows = list(csv.DictReader(source))
+    parquet_rows = pq.read_table(first.parquet_path).to_pylist()  # type: ignore[no-untyped-call]
+    assert len(csv_rows) == len(parquet_rows) == len(turns)
+    assert [row["turn_key"] for row in csv_rows] == [
+        str(row["turn_key"]) for row in parquet_rows
+    ]
+    assert [row["outcome_status"] for row in csv_rows] == [
+        str(row["outcome_status"]) for row in parquet_rows
+    ]
+    assert first.manifest["outcome_counts"] == {
+        OUTCOME_PREDICTION: len(turns) - 2,
+        OUTCOME_PROVIDER_REFUSAL: 1,
+        OUTCOME_NO_USABLE_TEXT: 1,
+    }
+    assert first.manifest["configuration"] == configuration
+    assert first.manifest["prediction_run_ids"] == sorted(
+        [str(production_run_1["public_id"]), str(production_run_2["public_id"])]
+    )
+    assert first.manifest["campaign_ids"] == sorted(
+        [str(campaign_1["public_id"]), str(campaign_2["public_id"])]
+    )
+    assert [int(row["corpus_order"]) for row in csv_rows] == list(
+        range(1, len(turns) + 1)
+    )
+    assert "HISTORICAL MODEL MUST NOT LEAK" not in first.csv_path.read_text(
+        encoding="utf-8"
+    )
+
+    reviewed_row = next(
+        row for row in csv_rows if row["turn_key"] == str(run_one_turns[0]["turn_key"])
+    )
+    assert reviewed_row["outcome_status"] == OUTCOME_PREDICTION
+    assert reviewed_row["is_non_policy"] == "false"
+    assert reviewed_row["primary_australian_domain"] == "AU07"
+    assert reviewed_row["secondary_australian_domains"] == '["AU08"]'
+    assert reviewed_row["reasoning"] == "Immutable production prediction."
+    assert reviewed_row["thinking_level"] == "minimal"
+    assert reviewed_row["latest_review_status"] == "edited"
+    assert reviewed_row["review_edited"] == "true"
+    assert reviewed_row["latest_review_note"] == "Human reviewer edited domain to AU12."
+    assert reviewed_row["has_codebook_flag"] == "true"
+    assert reviewed_row["latest_codebook_flag_note"] == "Boundary ambiguity noted."
+
+    refusal = next(
+        row for row in csv_rows if row["outcome_status"] == OUTCOME_PROVIDER_REFUSAL
+    )
+    assert refusal["record_id"] == f"turn:{refused_turn['turn_key']}"
+    assert refusal["is_non_policy"] == ""
+    assert refusal["primary_australian_domain"] == ""
+    assert refusal["secondary_australian_domains"] == ""
+    assert refusal["reasoning"] == ""
+    assert refusal["provider_block_reason"] == "PROHIBITED_CONTENT"
+    assert json.loads(refusal["refusal_provenance_json"])["reason"] == "PROHIBITED_CONTENT"
+    assert refusal["artifact_reference"] == "test/provider_refusals.jsonl"
+
+    no_text = next(
+        row for row in csv_rows if row["outcome_status"] == OUTCOME_NO_USABLE_TEXT
+    )
+    assert no_text["record_id"] == f"turn:{no_text_turn['turn_key']}"
+    assert no_text["is_non_policy"] == ""
+    assert no_text["primary_australian_domain"] == ""
+    assert no_text["secondary_australian_domains"] == ""
+    assert no_text["reasoning"] == ""
+    assert no_text["provider"] == ""
+    assert no_text["prediction_run_id"] == ""
+
+    assert any(row["text_raw"] for row in csv_rows)
+    with zipfile.ZipFile(first.zip_path) as archive:
+        assert archive.namelist() == [
+            "canonical_full_corpus_ai.csv",
+            "canonical_full_corpus_ai.parquet",
+            "manifest.json",
+        ]
+    for name, metadata in first.manifest["files"].items():
+        assert metadata["sha256"] == hashlib.sha256(
+            (first.directory / name).read_bytes()
+        ).hexdigest()
+
+    with TestClient(create_app(settings)) as client:
+        client.cookies.set(SESSION_COOKIE, admin_token)
+        exports_page = client.get("/exports")
+        assert exports_page.status_code == 200
+        assert "Canonical Full-Corpus AI Export" in exports_page.text
+        download = client.post(
+            f"/exports/canonical-ai/{corpus['public_id']}.zip",
+            data={"csrf_token": admin.csrf_token},
+        )
+        assert download.status_code == 200
+        assert download.headers["content-type"] == "application/zip"
+        with zipfile.ZipFile(io.BytesIO(download.content)) as archive:
+            assert archive.read("canonical_full_corpus_ai.csv") == first.csv_path.read_bytes()
+
+    with psycopg.connect(url) as connection:
+        connection.execute(
+            """
+            INSERT INTO model_predictions
+              (run_id,speaker_turn_id,record_id,is_non_policy,
+               secondary_australian_domains,reasoning,validation_status,
+               returned_model)
+            VALUES (%s,%s,%s,true,'{}','Duplicate canonical prediction.',
+                    'success',%s)
+            """,
+            (
+                production_run_2["id"],
+                run_one_turns[0]["id"],
+                f"turn:{run_one_turns[0]['turn_key']}",
+                configuration["configured_model"],
+            ),
+        )
+    with pytest.raises(CanonicalAIExportError, match="multiple production predictions"):
+        create_canonical_full_corpus_export(
+            settings,
+            admin,
+            str(corpus["public_id"]),
+            tmp_path / "canonical-duplicate",
+            generated_at=fixed,
+        )
+
 
 
 def test_phase4c_prediction_runs_allow_same_turn_across_immutable_runs(

@@ -88,7 +88,21 @@ def export_catalog(settings: WebSettings, principal: Principal) -> dict[str, Any
                 """
             ).fetchall()
         ]
-    return {"runs": runs, "projects": projects}
+        corpora = [
+            dict(row)
+            for row in connection.execute(
+                """
+                SELECT corpus.public_id,corpus.slug,corpus.name,
+                       count(turn.id)::bigint AS turn_count
+                FROM corpora corpus
+                JOIN reconstruction_runs reconstruction
+                  ON reconstruction.preprocessing_run_id=corpus.current_preprocessing_run_id
+                JOIN speaker_turns turn ON turn.reconstruction_run_id=reconstruction.id
+                GROUP BY corpus.id ORDER BY corpus.name,corpus.id
+                """
+            ).fetchall()
+        ]
+    return {"runs": runs, "projects": projects, "corpora": corpora}
 
 
 def prediction_export(
