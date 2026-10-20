@@ -465,6 +465,11 @@ def test_free_space_guard_rejects_low_disk_space_and_64mb_thresholds(
 def test_download_canonical_ai_uses_configured_work_root_and_cleans_up_success(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    default_temp_dir = tmp_path / "default-temp"
+    default_temp_dir.mkdir(parents=True)
+    monkeypatch.setattr("tempfile.tempdir", str(default_temp_dir))
+    monkeypatch.setattr("tempfile.gettempdir", lambda: str(default_temp_dir))
+
     work_root = tmp_path / "hansard-export-work"
     campaign_root = tmp_path / "campaign-artifacts"
     campaign_root.mkdir(parents=True)
@@ -492,8 +497,9 @@ def test_download_canonical_ai_uses_configured_work_root_and_cleans_up_success(
     ) -> CanonicalAIExport:
         created_dirs.append(output_directory)
         assert output_directory.resolve().parent == work_root.resolve()
+        assert output_directory.resolve().parent != default_temp_dir.resolve()
         assert output_directory.name.startswith(CANONICAL_EXPORT_DIR_PREFIX)
-        assert "/tmp" not in output_directory.as_posix().lower()
+        assert list(default_temp_dir.iterdir()) == []
         csv_path = output_directory / "canonical_full_corpus_ai.csv"
         parquet_path = output_directory / "canonical_full_corpus_ai.parquet"
         manifest_path = output_directory / "manifest.json"
@@ -534,6 +540,7 @@ def test_download_canonical_ai_uses_configured_work_root_and_cleans_up_success(
     assert sibling_export.exists()
     assert sibling_file.read_bytes() == b"concurrent-in-progress"
     assert persisted_artifact.exists()
+    assert list(default_temp_dir.iterdir()) == []
 
 
 @pytest.mark.parametrize(
