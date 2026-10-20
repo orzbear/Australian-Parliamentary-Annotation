@@ -53,6 +53,8 @@ def export_catalog(settings: WebSettings, principal: Principal) -> dict[str, Any
                 SELECT run.public_id,run.provider,run.configured_model,run.prompt_version,
                        run.valid_count,run.imported_at,campaign.name AS campaign_name,
                        count(prediction.id) AS prediction_count,
+                       (SELECT count(*) FROM model_prediction_abstentions abstention
+                        WHERE abstention.run_id=run.id) AS provider_refusal_count,
                        count(prediction.id) FILTER (WHERE terminal.review_status IS NOT NULL)
                          AS reviewed_count,
                        count(prediction.id) FILTER (WHERE terminal.review_status IS NULL)
@@ -179,6 +181,71 @@ def prediction_export(
         writer.writerow({field: row.get(field) for field in fields})
     return ResearchDownload(
         f"ai-predictions-{run_public_id}.csv",
+        "text/csv; charset=utf-8",
+        output.getvalue().encode("utf-8"),
+    )
+
+
+def provider_refusal_export(
+    settings: WebSettings, principal: Principal, run_public_id: str
+) -> ResearchDownload:
+    """Export terminal abstentions separately from genuine model predictions."""
+    _require_researcher(principal)
+    with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
+        connection.execute("SET TRANSACTION READ ONLY")
+        run = connection.execute(
+            "SELECT id,public_id FROM model_prediction_runs WHERE public_id::text=%s",
+            (run_public_id,),
+        ).fetchone()
+        if run is None:
+            raise LookupError("model prediction run not found")
+        rows = connection.execute(
+            """
+            SELECT abstention.public_id AS abstention_id,abstention.record_id,
+                   abstention.speaker_turn_id,turn.turn_key,turn.speech_date,turn.chamber,
+                   turn.speaker_name_raw,abstention.resolution_type,
+                   abstention.resolution_reason,abstention.refusal_provenance,
+                   abstention.artifact_reference,abstention.created_at
+            FROM model_prediction_abstentions abstention
+            JOIN speaker_turns turn ON turn.id=abstention.speaker_turn_id
+            WHERE abstention.run_id=%s ORDER BY abstention.record_id,abstention.id
+            """,
+            (run["id"],),
+        ).fetchall()
+    fields = [
+        "run_id",
+        "abstention_id",
+        "record_id",
+        "speaker_turn_id",
+        "turn_key",
+        "speech_date",
+        "chamber",
+        "speaker_name_raw",
+        "resolution_type",
+        "resolution_reason",
+        "refusal_provenance",
+        "artifact_reference",
+        "created_at",
+    ]
+    output = io.StringIO(newline="")
+    writer = csv.DictWriter(output, fieldnames=fields, lineterminator="\n")
+    writer.writeheader()
+    for raw in rows:
+        row = dict(raw)
+        row["run_id"] = str(run["public_id"])
+        for key, value in tuple(row.items()):
+            if isinstance(value, (list, dict)):
+                row[key] = json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            elif hasattr(value, "isoformat"):
+                row[key] = value.isoformat()
+        writer.writerow({field: row.get(field) for field in fields})
+    return ResearchDownload(
+        f"ai-provider-refusals-{run_public_id}.csv",
         "text/csv; charset=utf-8",
         output.getvalue().encode("utf-8"),
     )

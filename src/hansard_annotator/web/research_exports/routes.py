@@ -17,6 +17,7 @@ from hansard_annotator.web.research_exports.service import (
     ReviewArtifact,
     export_catalog,
     prediction_export,
+    provider_refusal_export,
     review_export,
 )
 
@@ -87,3 +88,19 @@ async def download_review(
         raise HTTPException(status_code=404, detail=str(error)) from error
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@router.post("/provider-refusals/{run_id}.csv")
+async def download_provider_refusals(
+    request: Request,
+    run_id: str,
+    settings: Annotated[WebSettings, Depends(get_settings)],
+    principal: Annotated[Principal, Depends(require_admin)],
+) -> Response:
+    await enforce_csrf(request, principal, settings)
+    try:
+        return _download(provider_refusal_export(settings, principal, run_id))
+    except PermissionError as error:
+        raise HTTPException(status_code=403, detail=str(error)) from error
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error

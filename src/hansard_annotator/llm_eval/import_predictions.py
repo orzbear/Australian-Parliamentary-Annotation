@@ -86,14 +86,78 @@ def _prediction_artifact_summary(directory: Path) -> dict[str, Any]:
         or coverage.get("invalid_structured_predictions") != 0
     ):
         raise ValueError("artifact coverage or structured validation is not importable")
+    refused = int(coverage.get("provider_refused") or 0)
+    planned = int(coverage.get("planned_requests") or 0)
+    valid = int(coverage.get("valid_structured_predictions") or 0)
+    if refused and valid + refused != planned:
+        raise ValueError("artifact valid predictions plus abstentions do not match coverage")
+    if refused:
+        refusal_metadata = summary.get("provider_refusals")
+        refusal_path = directory / "provider_refusals.jsonl"
+        if not isinstance(refusal_metadata, dict) or not refusal_path.is_file():
+            raise ValueError("artifact provider-refusal provenance is missing")
+        refusal_bytes = refusal_path.read_bytes()
+        if hashlib.sha256(refusal_bytes).hexdigest() != refusal_metadata.get(
+            "lineage_sha256"
+        ):
+            raise ValueError("artifact provider-refusal provenance hash mismatch")
+        record_ids = refusal_metadata.get("record_ids")
+        if (
+            not isinstance(record_ids, list)
+            or len(record_ids) != refused
+            or any(not isinstance(record_id, str) for record_id in record_ids)
+            or len(set(record_ids)) != refused
+            or hashlib.sha256(
+                json.dumps(record_ids, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            != refusal_metadata.get("record_ids_sha256")
+        ):
+            raise ValueError("artifact provider-refusal record identity mismatch")
     return summary
+
+
+def _has_candidate_text(response: object) -> bool:
+    candidates = response.get("candidates") if isinstance(response, dict) else None
+    if not isinstance(candidates, list):
+        return False
+    for candidate in candidates:
+        content = candidate.get("content") if isinstance(candidate, dict) else None
+        parts = content.get("parts") if isinstance(content, dict) else None
+        if isinstance(parts, list) and any(
+            isinstance(part, dict)
+            and isinstance(part.get("text"), str)
+            and bool(part["text"].strip())
+            for part in parts
+        ):
+            return True
+    return False
+
+
+def _validate_refusal_response(response: object) -> None:
+    feedback = response.get("promptFeedback") if isinstance(response, dict) else None
+    if (
+        not isinstance(feedback, dict)
+        or feedback.get("blockReason") != "PROHIBITED_CONTENT"
+        or _has_candidate_text(response)
+    ):
+        raise ValueError("provider-refusal evidence is not a prohibited-content abstention")
 
 
 def iter_prediction_artifact(directory: Path) -> Iterator[dict[str, Any]]:
     with (directory / "predictions.jsonl").open(encoding="utf-8") as source:
         for number, line in enumerate(source, 1):
             value = json.loads(line)
-            if not isinstance(value, dict) or value.get("status") != "success":
+            if not isinstance(value, dict):
+                raise ValueError(f"prediction line {number} is not an object")
+            if value.get("status") == "provider_refusal":
+                if value.get("prediction") is not None:
+                    raise ValueError(f"prediction line {number} synthesizes a refusal prediction")
+                resolution = value.get("terminal_resolution")
+                if not isinstance(resolution, dict) or resolution.get("type") != "PROVIDER_REFUSAL":
+                    raise ValueError(f"prediction line {number} has invalid refusal lineage")
+                _validate_refusal_response(value.get("provider_response"))
+                continue
+            if value.get("status") != "success":
                 raise ValueError(f"prediction line {number} is not successful")
             prediction = value.get("prediction")
             if not isinstance(prediction, dict):
@@ -105,6 +169,47 @@ def iter_prediction_artifact(directory: Path) -> Iterator[dict[str, Any]]:
                     f"prediction line {number} has an invalid production record ID"
                 )
             yield value
+
+
+def iter_provider_refusal_artifact(directory: Path) -> Iterator[dict[str, Any]]:
+    summary = json.loads(
+        (directory / "operational_summary.json").read_text(encoding="utf-8")
+    )
+    provenance = summary.get("provenance") if isinstance(summary, dict) else None
+    expected = int(summary.get("coverage", {}).get("provider_refused") or 0)
+    if expected == 0:
+        return
+    metadata = summary.get("provider_refusals")
+    expected_ids = metadata.get("record_ids") if isinstance(metadata, dict) else None
+    if not isinstance(expected_ids, list):
+        raise ValueError("provider refusal metadata has no record IDs")
+    seen = 0
+    seen_ids: list[str] = []
+    with (directory / "provider_refusals.jsonl").open(encoding="utf-8") as source:
+        for number, line in enumerate(source, 1):
+            value = json.loads(line)
+            if (
+                not isinstance(value, dict)
+                or value.get("resolution") != "PROVIDER_REFUSAL"
+                or value.get("reason") != "PROHIBITED_CONTENT"
+                or value.get("configuration_provenance") != provenance
+            ):
+                raise ValueError(f"provider refusal line {number} has invalid provenance")
+            record_id = value.get("record_id")
+            if not isinstance(record_id, str) or not record_id.startswith("turn:"):
+                raise ValueError(f"provider refusal line {number} has an invalid record ID")
+            attempts = value.get("attempts")
+            if not isinstance(attempts, list) or not attempts:
+                raise ValueError(f"provider refusal line {number} has no attempt evidence")
+            for attempt in attempts:
+                if not isinstance(attempt, dict):
+                    raise ValueError(f"provider refusal line {number} has malformed evidence")
+                _validate_refusal_response(attempt.get("provider_response"))
+            seen += 1
+            seen_ids.append(record_id)
+            yield value
+    if seen != expected or seen_ids != expected_ids:
+        raise ValueError("provider refusal rows do not match operational summary")
 
 
 def load_prediction_artifact(directory: Path) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
@@ -128,6 +233,17 @@ def inspect_prediction_artifact(directory: Path) -> tuple[dict[str, Any], int, s
 def _batched_rows(directory: Path) -> Iterator[list[dict[str, Any]]]:
     batch: list[dict[str, Any]] = []
     for value in iter_prediction_artifact(directory):
+        batch.append(value)
+        if len(batch) == IMPORT_BATCH_SIZE:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
+def _batched_refusals(directory: Path) -> Iterator[list[dict[str, Any]]]:
+    batch: list[dict[str, Any]] = []
+    for value in iter_provider_refusal_artifact(directory):
         batch.append(value)
         if len(batch) == IMPORT_BATCH_SIZE:
             yield batch
@@ -181,13 +297,20 @@ def import_predictions(
             "SELECT id FROM model_prediction_runs WHERE artifact_sha256=%s", (artifact_sha256,)
         ).fetchone()
         existing_predictions = 0
+        existing_refusals = 0
         if existing_run:
             count = connection.execute(
                 "SELECT count(*) AS count FROM model_predictions WHERE run_id=%s",
                 (existing_run["id"],),
             ).fetchone()
             existing_predictions = int(count["count"] if count else 0)
+            refusal_count = connection.execute(
+                "SELECT count(*) AS count FROM model_prediction_abstentions WHERE run_id=%s",
+                (existing_run["id"],),
+            ).fetchone()
+            existing_refusals = int(refusal_count["count"] if refusal_count else 0)
         artifact_records = 0
+        refusal_records = 0
         matching_turns = 0
         unknown_count = 0
         unknown: list[str] = []
@@ -201,19 +324,36 @@ def import_predictions(
                     unknown_count += 1
                     if len(unknown) < 100:
                         unknown.append(turn_key)
+        for batch in _batched_refusals(directory):
+            refusal_records += len(batch)
+            turn_ids = _turn_ids_for_rows(connection, batch)
+            matching_turns += len(turn_ids)
+            for row in batch:
+                turn_key = str(row["record_id"]).removeprefix("turn:")
+                if turn_key not in turn_ids:
+                    unknown_count += 1
+                    if len(unknown) < 100:
+                        unknown.append(turn_key)
         expected_records = int(summary["coverage"].get("valid_structured_predictions", -1))
+        expected_refusals = int(summary["coverage"].get("provider_refused") or 0)
         if artifact_records != expected_records:
             raise ValueError("artifact row count does not match operational summary")
+        if refusal_records != expected_refusals:
+            raise ValueError("artifact refusal count does not match operational summary")
         result = {
             "artifact_records": artifact_records,
             "valid_records": artifact_records,
+            "provider_refusal_records": refusal_records,
+            "resolved_records": artifact_records + refusal_records,
             "matching_db_turns": matching_turns,
             "unknown_turns": unknown,
             "unknown_turn_count": unknown_count,
             "existing_predictions": existing_predictions,
+            "existing_provider_refusals": existing_refusals,
             "inserted_runs": 0,
             "inserted_predictions": 0,
-            "skipped_rows": existing_predictions,
+            "inserted_provider_refusals": 0,
+            "skipped_rows": existing_predictions + existing_refusals,
             "dry_run": dry_run,
             "artifact_sha256": artifact_sha256,
         }
@@ -274,7 +414,12 @@ def import_predictions(
                 cost["explicit_cache_storage_cost_usd"],
                 cost["total_pilot_cost_usd"],
                 "imported",
-                Jsonb({"source_directory": str(directory)}),
+                Jsonb(
+                    {
+                        "source_directory": str(directory),
+                        "provider_refusals": summary.get("provider_refusals", {}),
+                    }
+                ),
             ),
         ).fetchone()
         assert run is not None
@@ -298,7 +443,37 @@ def import_predictions(
                 values,
             )
             inserted += len(values)
-        result.update(inserted_runs=1, inserted_predictions=inserted, skipped_rows=0)
+        inserted_refusals = 0
+        refusal_cursor = connection.cursor()
+        for batch in _batched_refusals(directory):
+            turn_ids = _turn_ids_for_rows(connection, batch)
+            values = [
+                (
+                    int(run["id"]),
+                    turn_ids[str(row["record_id"]).removeprefix("turn:")],
+                    row["record_id"],
+                    row["reason"],
+                    Jsonb(row),
+                    f"{directory}/provider_refusals.jsonl",
+                )
+                for row in batch
+            ]
+            refusal_cursor.executemany(
+                """
+                INSERT INTO model_prediction_abstentions
+                  (run_id,speaker_turn_id,record_id,resolution_reason,
+                   refusal_provenance,artifact_reference)
+                VALUES (%s,%s,%s,%s,%s,%s)
+                """,
+                values,
+            )
+            inserted_refusals += len(values)
+        result.update(
+            inserted_runs=1,
+            inserted_predictions=inserted,
+            inserted_provider_refusals=inserted_refusals,
+            skipped_rows=0,
+        )
         return result
 
 

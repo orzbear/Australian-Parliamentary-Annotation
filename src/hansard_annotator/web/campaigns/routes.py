@@ -34,6 +34,7 @@ from hansard_annotator.web.campaigns.service import (
     refresh_campaign,
     refresh_recovery,
     repair_campaign_results,
+    resolve_campaign_provider_refusals,
     submit_campaign,
     submit_recovery,
     transition_campaign,
@@ -69,6 +70,9 @@ def _notice_message(code: str | None, campaign: dict[str, object]) -> str | None
         "recovery-collected": "Recovery results collected and effective validation refreshed.",
         "structural-repair-applied": (
             "Approved deterministic structural repairs applied locally; no provider call was made."
+        ),
+        "provider-refusals-resolved": (
+            "Confirmed provider refusals recorded as terminal abstentions; no provider call was made."
         ),
         "chunks-planned": "Deterministic full-corpus child Batches planned offline.",
         "full-authorized": "Full-production orchestration authorized.",
@@ -211,6 +215,7 @@ async def campaign_plan(
     planned_count: Annotated[int, Form()],
     seed: Annotated[str, Form()],
     exclude_human_annotated: Annotated[bool, Form()] = DEFAULT_EXCLUDE_HUMAN_ANNOTATED,
+    retry_provider_refusals: Annotated[bool, Form()] = False,
 ) -> RedirectResponse:
     await enforce_csrf(request, principal, settings)
     try:
@@ -221,6 +226,7 @@ async def campaign_plan(
             limit=planned_count,
             seed=seed,
             exclude_human_annotated=exclude_human_annotated,
+            retry_provider_refusals=retry_provider_refusals,
         )
     except (CampaignError, LookupError, PermissionError) as error:
         raise _http_error(error) from error
@@ -283,6 +289,8 @@ async def _action(
             validate_campaign(settings, principal, campaign_id)
         elif operation == "repair-structural":
             repair_campaign_results(settings, principal, campaign_id)
+        elif operation == "resolve-provider-refusals":
+            resolve_campaign_provider_refusals(settings, principal, campaign_id)
         elif operation == "orchestration-pause":
             set_orchestration_paused(
                 settings, principal, campaign_id, paused=True
@@ -313,6 +321,7 @@ async def _action(
         "collect": "results-collected",
         "validate": "validation-passed",
         "repair-structural": "structural-repair-applied",
+        "resolve-provider-refusals": "provider-refusals-resolved",
         "orchestration-pause": "orchestration-paused",
         "orchestration-resume": "orchestration-resumed",
         "orchestration-tick": "orchestration-ticked",
@@ -376,6 +385,18 @@ async def campaign_repair_structural(
     principal: Annotated[Principal, Depends(require_admin)],
 ) -> RedirectResponse:
     return await _action(request, settings, principal, campaign_id, "repair-structural")
+
+
+@router.post("/{campaign_id}/resolve-provider-refusals")
+async def campaign_resolve_provider_refusals(
+    request: Request,
+    campaign_id: str,
+    settings: Annotated[WebSettings, Depends(get_settings)],
+    principal: Annotated[Principal, Depends(require_admin)],
+) -> RedirectResponse:
+    return await _action(
+        request, settings, principal, campaign_id, "resolve-provider-refusals"
+    )
 
 
 @router.post("/{campaign_id}/plan-chunks")
