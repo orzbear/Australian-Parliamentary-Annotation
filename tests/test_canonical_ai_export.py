@@ -1,26 +1,42 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import zipfile
 from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
+from fastapi import HTTPException
 from psycopg.types.json import Jsonb
+from starlette.requests import Request
 
+from hansard_annotator.db.config import DatabaseSettings
+from hansard_annotator.web.auth.models import Principal
 from hansard_annotator.web.campaigns.service import production_configuration
+from hansard_annotator.web.config import (
+    DEFAULT_EXPORT_MIN_FREE_BYTES,
+    MINIMUM_EXPORT_MIN_FREE_BYTES,
+    WebSettings,
+)
+from hansard_annotator.web.research_exports import routes as export_routes
 from hansard_annotator.web.research_exports.canonical_ai import (
+    CANONICAL_EXPORT_DIR_PREFIX,
     FIELDS,
     OUTCOME_NO_USABLE_TEXT,
     OUTCOME_PREDICTION,
     OUTCOME_PROVIDER_REFUSAL,
     PARQUET_SCHEMA,
+    CanonicalAIExport,
     CanonicalAIExportError,
     _canonical_query,
     _configuration_parameters,
     _csv_row,
     _output_row,
     _write_deterministic_zip,
+    check_export_disk_space,
+    cleanup_canonical_export_work_dir,
 )
 
 
@@ -347,3 +363,295 @@ def test_research_export_ui_has_separate_canonical_action() -> None:
     assert "/exports/canonical-ai/{{ corpus.public_id }}.zip" in template
     assert "never replaces the immutable AI result" in template
 
+
+def _test_settings(export_work_root: Path, **overrides: object) -> WebSettings:
+    defaults: dict[str, object] = {
+        "database": DatabaseSettings(
+            url="postgresql+psycopg://hansard:test@127.0.0.1:54321/hansard_test",
+            processed_data_root=Path("data/processed"),
+        ),
+        "environment": "test",
+        "session_secret": "x" * 32,
+        "cookie_secure": False,
+        "allowed_hosts": ("testserver", "localhost"),
+        "base_url": "http://testserver",
+        "idle_minutes": 60,
+        "absolute_hours": 12,
+        "minimum_password_length": 12,
+        "lockout_failures": 5,
+        "lockout_minutes": 15,
+        "log_level": "INFO",
+        "export_work_root": export_work_root,
+        "export_min_free_bytes": DEFAULT_EXPORT_MIN_FREE_BYTES,
+    }
+    defaults.update(overrides)
+    return WebSettings(**defaults)  # type: ignore[arg-type]
+
+
+def _admin_principal() -> Principal:
+    from uuid import UUID
+
+    return Principal(
+        user_id=1,
+        public_id=UUID("00000000-0000-0000-0000-000000000099"),
+        username="admin",
+        display_name="Admin",
+        must_change_password=False,
+        is_admin=True,
+        session_id=1,
+        csrf_token="csrf-token",
+    )
+
+
+def _dummy_request() -> Request:
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/exports/canonical-ai/00000000-0000-0000-0000-000000000001.zip",
+            "headers": [(b"x-csrf-token", b"csrf-token")],
+        }
+    )
+
+
+def test_web_settings_requires_explicit_non_tmp_export_work_root_in_production(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HANSARD_APP_ENV", "production")
+    monkeypatch.setenv("HANSARD_SESSION_SECRET", "s" * 40)
+    monkeypatch.setenv("HANSARD_COOKIE_SECURE", "true")
+    monkeypatch.setenv("HANSARD_ALLOWED_HOSTS", "annotator.polisde.tech")
+    monkeypatch.setenv(
+        "HANSARD_DATABASE_URL",
+        "postgresql+psycopg://u:p@postgres:5432/hansard",
+    )
+    monkeypatch.delenv("HANSARD_EXPORT_WORK_ROOT", raising=False)
+    monkeypatch.delenv("HANSARD_EXPORT_MIN_FREE_BYTES", raising=False)
+
+    with pytest.raises(ValueError, match="HANSARD_EXPORT_WORK_ROOT must be explicitly set"):
+        WebSettings.from_environment()
+
+    monkeypatch.setenv("HANSARD_EXPORT_WORK_ROOT", "/tmp/exports")
+    with pytest.raises(ValueError, match="disk-backed path outside /tmp"):
+        WebSettings.from_environment()
+
+    monkeypatch.setenv("HANSARD_EXPORT_WORK_ROOT", "/var/lib/hansard-export-work")
+    monkeypatch.setenv("HANSARD_EXPORT_MIN_FREE_BYTES", str(64 * 1024 * 1024))
+    with pytest.raises(ValueError, match="HANSARD_EXPORT_MIN_FREE_BYTES"):
+        WebSettings.from_environment()
+
+    monkeypatch.delenv("HANSARD_EXPORT_MIN_FREE_BYTES", raising=False)
+    configured = WebSettings.from_environment()
+    assert configured.export_work_root == Path("/var/lib/hansard-export-work")
+    assert configured.export_min_free_bytes == DEFAULT_EXPORT_MIN_FREE_BYTES
+
+
+def test_free_space_guard_rejects_low_disk_space_and_64mb_thresholds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with pytest.raises(CanonicalAIExportError, match="must be at least"):
+        check_export_disk_space(tmp_path, 64 * 1024 * 1024)
+
+    monkeypatch.setattr(
+        "hansard_annotator.web.research_exports.canonical_ai.shutil.disk_usage",
+        lambda _path: os.statvfs_result((0, 0, 0, 0, 0, 0, 0, 0, 0, 0))  # pragma: no cover
+        if False
+        else type("Usage", (), {"total": 100, "used": 90, "free": 64 * 1024 * 1024})(),
+    )
+    with pytest.raises(CanonicalAIExportError, match="insufficient free disk space"):
+        check_export_disk_space(tmp_path, MINIMUM_EXPORT_MIN_FREE_BYTES)
+
+
+def test_download_canonical_ai_uses_configured_work_root_and_cleans_up_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    default_temp_dir = tmp_path / "default-temp"
+    default_temp_dir.mkdir(parents=True)
+    monkeypatch.setattr("tempfile.tempdir", str(default_temp_dir))
+    monkeypatch.setattr("tempfile.gettempdir", lambda: str(default_temp_dir))
+
+    work_root = tmp_path / "hansard-export-work"
+    campaign_root = tmp_path / "campaign-artifacts"
+    campaign_root.mkdir(parents=True)
+    persisted_artifact = campaign_root / "campaign-1.jsonl"
+    persisted_artifact.write_text("{}", encoding="utf-8")
+
+    sibling_export = work_root / f"{CANONICAL_EXPORT_DIR_PREFIX}concurrent"
+    sibling_export.mkdir(parents=True)
+    sibling_file = sibling_export / "canonical_full_corpus_ai.zip"
+    sibling_file.write_bytes(b"concurrent-in-progress")
+
+    settings = _test_settings(work_root)
+    created_dirs: list[Path] = []
+
+    async def _noop_csrf(
+        _request: Request, _principal: Principal, _settings: WebSettings
+    ) -> None:
+        return None
+
+    def _fake_export(
+        _settings: WebSettings,
+        _principal: Principal,
+        _corpus_id: str,
+        output_directory: Path,
+    ) -> CanonicalAIExport:
+        created_dirs.append(output_directory)
+        assert output_directory.resolve().parent == work_root.resolve()
+        assert output_directory.resolve().parent != default_temp_dir.resolve()
+        assert output_directory.name.startswith(CANONICAL_EXPORT_DIR_PREFIX)
+        assert list(default_temp_dir.iterdir()) == []
+        csv_path = output_directory / "canonical_full_corpus_ai.csv"
+        parquet_path = output_directory / "canonical_full_corpus_ai.parquet"
+        manifest_path = output_directory / "manifest.json"
+        zip_path = output_directory / "canonical_full_corpus_ai.zip"
+        for file_path in (csv_path, parquet_path, manifest_path, zip_path):
+            file_path.write_bytes(b"ok")
+        return CanonicalAIExport(
+            directory=output_directory,
+            csv_path=csv_path,
+            parquet_path=parquet_path,
+            manifest_path=manifest_path,
+            zip_path=zip_path,
+            manifest={"corpus": {"slug": "house-hansard"}},
+        )
+
+    monkeypatch.setattr(export_routes, "enforce_csrf", _noop_csrf)
+    monkeypatch.setattr(
+        export_routes, "create_canonical_full_corpus_export", _fake_export
+    )
+
+    response = asyncio.run(
+        export_routes.download_canonical_ai(
+            _dummy_request(),
+            "00000000-0000-0000-0000-000000000001",
+            settings,
+            _admin_principal(),
+        )
+    )
+    assert len(created_dirs) == 1
+    request_dir = created_dirs[0]
+    assert request_dir.exists()
+    assert Path(response.path) == request_dir / "canonical_full_corpus_ai.zip"
+    assert response.background is not None
+
+    asyncio.run(response.background())
+
+    assert not request_dir.exists()
+    assert sibling_export.exists()
+    assert sibling_file.read_bytes() == b"concurrent-in-progress"
+    assert persisted_artifact.exists()
+    assert list(default_temp_dir.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("raised_error", "expected_status"),
+    [
+        (CanonicalAIExportError("incomplete layer"), 409),
+        (OSError(28, "No space left on device"), 409),
+        (LookupError("corpus not found"), 404),
+        (PermissionError("admin required"), 403),
+    ],
+)
+def test_download_canonical_ai_exception_cleans_only_request_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    raised_error: Exception,
+    expected_status: int,
+) -> None:
+    work_root = tmp_path / "hansard-export-work"
+    sibling_export = work_root / f"{CANONICAL_EXPORT_DIR_PREFIX}sibling"
+    sibling_export.mkdir(parents=True)
+    sibling_marker = sibling_export / "in_progress.tmp"
+    sibling_marker.write_bytes(b"keep-me")
+
+    settings = _test_settings(work_root)
+    created_dirs: list[Path] = []
+
+    async def _noop_csrf(
+        _request: Request, _principal: Principal, _settings: WebSettings
+    ) -> None:
+        return None
+
+    def _failing_export(
+        _settings: WebSettings,
+        _principal: Principal,
+        _corpus_id: str,
+        output_directory: Path,
+    ) -> CanonicalAIExport:
+        created_dirs.append(output_directory)
+        (output_directory / "partial.csv").write_bytes(b"partial")
+        raise raised_error
+
+    monkeypatch.setattr(export_routes, "enforce_csrf", _noop_csrf)
+    monkeypatch.setattr(
+        export_routes, "create_canonical_full_corpus_export", _failing_export
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            export_routes.download_canonical_ai(
+                _dummy_request(),
+                "00000000-0000-0000-0000-000000000001",
+                settings,
+                _admin_principal(),
+            )
+        )
+
+    assert exc_info.value.status_code == expected_status
+    assert len(created_dirs) == 1
+    assert not created_dirs[0].exists()
+    assert sibling_export.exists()
+    assert sibling_marker.read_bytes() == b"keep-me"
+
+
+def test_download_canonical_ai_fails_before_export_when_disk_space_is_low(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    work_root = tmp_path / "hansard-export-work"
+    settings = _test_settings(work_root)
+
+    async def _noop_csrf(
+        _request: Request, _principal: Principal, _settings: WebSettings
+    ) -> None:
+        return None
+
+    monkeypatch.setattr(export_routes, "enforce_csrf", _noop_csrf)
+    monkeypatch.setattr(
+        "hansard_annotator.web.research_exports.canonical_ai.shutil.disk_usage",
+        lambda _path: type(
+            "Usage", (), {"total": 100, "used": 90, "free": 64 * 1024 * 1024}
+        )(),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            export_routes.download_canonical_ai(
+                _dummy_request(),
+                "00000000-0000-0000-0000-000000000001",
+                settings,
+                _admin_principal(),
+            )
+        )
+
+    assert exc_info.value.status_code == 409
+    assert "insufficient free disk space" in str(exc_info.value.detail)
+    assert list(work_root.iterdir()) == []
+
+
+def test_cleanup_helper_refuses_paths_outside_work_root(tmp_path: Path) -> None:
+    work_root = tmp_path / "hansard-export-work"
+    work_root.mkdir()
+    outside = tmp_path / f"{CANONICAL_EXPORT_DIR_PREFIX}outside"
+    outside.mkdir()
+    wrong_prefix = work_root / "campaign-artifacts"
+    wrong_prefix.mkdir()
+
+    with pytest.raises(ValueError, match="refusing to remove"):
+        cleanup_canonical_export_work_dir(work_root, work_root)
+    with pytest.raises(ValueError, match="refusing to remove"):
+        cleanup_canonical_export_work_dir(outside, work_root)
+    with pytest.raises(ValueError, match="refusing to remove"):
+        cleanup_canonical_export_work_dir(wrong_prefix, work_root)
+
+    assert outside.exists()
+    assert wrong_prefix.exists()

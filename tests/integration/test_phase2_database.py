@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import dataclasses
 import hashlib
 import io
 import json
@@ -1911,7 +1912,11 @@ def test_provider_refusals_import_separately_and_exclude_same_configuration(
 def test_canonical_full_corpus_ai_export_combines_exact_configuration_runs(
     database_url: str, tmp_path: Path
 ) -> None:
-    settings = _web_settings(database_url)
+    export_work_root = tmp_path / "export-work"
+    settings = dataclasses.replace(
+        _web_settings(database_url),
+        export_work_root=export_work_root,
+    )
     import_validated_run(
         settings.database,
         _fixture_run(tmp_path, run_id="canonical-ai-export-fixture"),
@@ -2362,6 +2367,11 @@ def test_canonical_full_corpus_ai_export_combines_exact_configuration_runs(
             (first.directory / name).read_bytes()
         ).hexdigest()
 
+    sibling_export = export_work_root / "canonical-full-corpus-ai-sibling"
+    sibling_export.mkdir(parents=True)
+    sibling_marker = sibling_export / "in-progress.part"
+    sibling_marker.write_bytes(b"sibling")
+
     with TestClient(create_app(settings)) as client:
         client.cookies.set(SESSION_COOKIE, admin_token)
         exports_page = client.get("/exports")
@@ -2375,6 +2385,9 @@ def test_canonical_full_corpus_ai_export_combines_exact_configuration_runs(
         assert download.headers["content-type"] == "application/zip"
         with zipfile.ZipFile(io.BytesIO(download.content)) as archive:
             assert archive.read("canonical_full_corpus_ai.csv") == first.csv_path.read_bytes()
+
+    assert list(export_work_root.iterdir()) == [sibling_export]
+    assert sibling_marker.read_bytes() == b"sibling"
 
     with psycopg.connect(url) as connection:
         connection.execute(

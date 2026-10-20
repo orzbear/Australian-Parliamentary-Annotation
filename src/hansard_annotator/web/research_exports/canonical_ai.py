@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import shutil
 import zipfile
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -20,9 +21,10 @@ from psycopg.types.json import Jsonb
 
 from hansard_annotator.web.auth.models import Principal
 from hansard_annotator.web.campaigns.service import production_configuration
-from hansard_annotator.web.config import WebSettings
+from hansard_annotator.web.config import MINIMUM_EXPORT_MIN_FREE_BYTES, WebSettings
 
 EXPORT_VERSION = "canonical-full-corpus-ai-v1"
+CANONICAL_EXPORT_DIR_PREFIX = "canonical-full-corpus-ai-"
 OUTCOME_PREDICTION = "PREDICTION"
 OUTCOME_PROVIDER_REFUSAL = "PROVIDER_REFUSAL"
 OUTCOME_NO_USABLE_TEXT = "NO_USABLE_TEXT"
@@ -585,6 +587,38 @@ def _rows(
             yield dict(raw)
 
 
+def check_export_disk_space(path: Path, minimum_free_bytes: int) -> int:
+    """Ensure the export workspace filesystem has enough free disk space."""
+    if minimum_free_bytes < MINIMUM_EXPORT_MIN_FREE_BYTES:
+        raise CanonicalAIExportError(
+            "canonical export minimum free space threshold must be at least "
+            f"{MINIMUM_EXPORT_MIN_FREE_BYTES} bytes"
+        )
+    probe = path
+    while not probe.exists() and probe.parent != probe:
+        probe = probe.parent
+    usage = shutil.disk_usage(probe)
+    if usage.free < minimum_free_bytes:
+        raise CanonicalAIExportError(
+            f"insufficient free disk space in {probe} "
+            f"({usage.free} bytes available; {minimum_free_bytes} bytes required)"
+        )
+    return int(usage.free)
+
+
+def cleanup_canonical_export_work_dir(directory: Path, work_root: Path) -> None:
+    """Remove only one request's canonical export directory inside work_root."""
+    resolved_root = work_root.resolve()
+    resolved_dir = directory.resolve()
+    if (
+        resolved_dir == resolved_root
+        or resolved_dir.parent != resolved_root
+        or not resolved_dir.name.startswith(CANONICAL_EXPORT_DIR_PREFIX)
+    ):
+        raise ValueError("refusing to remove path outside canonical export work root")
+    shutil.rmtree(resolved_dir, ignore_errors=True)
+
+
 def create_canonical_full_corpus_export(
     settings: WebSettings,
     principal: Principal,
@@ -599,6 +633,7 @@ def create_canonical_full_corpus_export(
     if output_directory.exists() and any(output_directory.iterdir()):
         raise CanonicalAIExportError("canonical export directory is not empty")
     output_directory.mkdir(parents=True, exist_ok=True)
+    check_export_disk_space(output_directory, settings.export_min_free_bytes)
     csv_path = output_directory / "canonical_full_corpus_ai.csv"
     parquet_path = output_directory / "canonical_full_corpus_ai.parquet"
     manifest_path = output_directory / "manifest.json"

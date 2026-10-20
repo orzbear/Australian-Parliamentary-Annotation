@@ -17,9 +17,10 @@ COPY scripts/conference-codebook-pilot-01-ai-codebook-input-d1d13e895705/CODEBOO
 COPY alembic.ini ./alembic.ini
 
 RUN python -m pip install --no-cache-dir -r requirements.lock && \
-    mkdir -p /var/empty/hansard-processed /var/lib/hansard-campaign-artifacts && \
+    mkdir -p /var/empty/hansard-processed /var/lib/hansard-campaign-artifacts /var/lib/hansard-export-work && \
     chown -R hansard:hansard /app /var/empty/hansard-processed && \
-    chown hansard:hansard /var/lib/hansard-campaign-artifacts
+    chown hansard:hansard /var/lib/hansard-campaign-artifacts && \
+    chown hansard:hansard /var/lib/hansard-export-work
 
 USER 10001:10001
 

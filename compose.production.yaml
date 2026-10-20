@@ -10,6 +10,8 @@ x-app-environment: &app-environment
   HANSARD_DATABASE_URL: postgresql+psycopg://${HANSARD_APP_DB_USER}:${HANSARD_APP_DB_PASSWORD}@postgres:5432/${POSTGRES_DB}
   HANSARD_PROCESSED_DATA_ROOT: /var/empty/hansard-processed
   HANSARD_CAMPAIGN_ARTIFACT_ROOT: /var/lib/hansard-campaign-artifacts
+  HANSARD_EXPORT_WORK_ROOT: /var/lib/hansard-export-work
+  HANSARD_EXPORT_MIN_FREE_BYTES: ${HANSARD_EXPORT_MIN_FREE_BYTES:-2147483648}
   GEMINI_API_KEY: ${GEMINI_API_KEY:-}
   HANSARD_APP_ENV: production
   HANSARD_SESSION_SECRET: ${HANSARD_SESSION_SECRET}
@@ -72,6 +74,7 @@ services:
     read_only: true
     volumes:
       - hansard-campaign-artifacts:/var/lib/hansard-campaign-artifacts
+      - hansard-export-work:/var/lib/hansard-export-work
     tmpfs:
       - /tmp:size=64m,mode=1777
     cap_drop:
@@ -168,3 +171,4 @@ volumes:
   caddy-data:
   caddy-config:
   hansard-campaign-artifacts:
+  hansard-export-work:
