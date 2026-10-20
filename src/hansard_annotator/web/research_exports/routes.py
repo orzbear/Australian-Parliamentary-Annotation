@@ -2,16 +2,24 @@
 
 from __future__ import annotations
 
+import shutil
+import tempfile
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Annotated, cast
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
 from fastapi.templating import Jinja2Templates
+from starlette.background import BackgroundTask
 
 from hansard_annotator.web.auth.models import Principal
 from hansard_annotator.web.config import WebSettings
 from hansard_annotator.web.dependencies import enforce_csrf, get_settings, require_admin
+from hansard_annotator.web.research_exports.canonical_ai import (
+    CanonicalAIExportError,
+    create_canonical_full_corpus_export,
+)
 from hansard_annotator.web.research_exports.service import (
     ResearchDownload,
     ReviewArtifact,
@@ -69,6 +77,37 @@ async def download_predictions(
         return _download(prediction_export(settings, principal, run_id))
     except (LookupError, PermissionError, ValueError) as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
+
+
+@router.post("/canonical-ai/{corpus_id}.zip")
+async def download_canonical_ai(
+    request: Request,
+    corpus_id: str,
+    settings: Annotated[WebSettings, Depends(get_settings)],
+    principal: Annotated[Principal, Depends(require_admin)],
+) -> FileResponse:
+    await enforce_csrf(request, principal, settings)
+    directory = Path(tempfile.mkdtemp(prefix="canonical-full-corpus-ai-"))
+    try:
+        export = create_canonical_full_corpus_export(
+            settings, principal, corpus_id, directory
+        )
+    except PermissionError as error:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise HTTPException(status_code=403, detail=str(error)) from error
+    except LookupError as error:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except (CanonicalAIExportError, OSError, ValueError) as error:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return FileResponse(
+        export.zip_path,
+        media_type="application/zip",
+        filename=f"canonical-full-corpus-ai-{export.manifest['corpus']['slug']}.zip",
+        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+        background=BackgroundTask(shutil.rmtree, directory, ignore_errors=True),
+    )
 
 
 @router.post("/reviews/{run_id}")
