@@ -279,6 +279,7 @@ def build_campaign_effective_artifact(
         "planned": 0,
         "original_valid": 0,
         "structurally_repaired": 0,
+        "provider_refused": 0,
         "unresolved_invalid": 0,
         "provider_failed": 0,
         "missing": 0,
@@ -387,6 +388,8 @@ def build_campaign_effective_artifact(
                     counts["original_valid"] += 1
                 elif effective.get("status") == "provider_failure":
                     counts["provider_failed"] += 1
+                elif effective.get("status") == "provider_refusal":
+                    counts["provider_refused"] += 1
                 else:
                     counts["unresolved_invalid"] += 1
                 predictions.write(json.dumps(effective, ensure_ascii=False, sort_keys=True) + "\n")
@@ -410,7 +413,7 @@ def build_campaign_effective_artifact(
             )
     valid = counts["original_valid"] + counts["structurally_repaired"]
     complete = (
-        valid == counts["planned"]
+        valid + counts["provider_refused"] == counts["planned"]
         and not counts["unresolved_invalid"]
         and not counts["provider_failed"]
         and not counts["missing"]
@@ -425,13 +428,17 @@ def build_campaign_effective_artifact(
         "coverage": {
             "planned_requests": counts["planned"],
             "valid_structured_predictions": valid,
-            "invalid_structured_predictions": counts["unresolved_invalid"] + counts["provider_failed"],
+            "invalid_structured_predictions": counts["unresolved_invalid"],
             "successful_provider_responses": counts["original_valid"] + counts["structurally_repaired"] + counts["unresolved_invalid"],
             "failed_provider_responses": counts["provider_failed"],
             "collected_responses": counts["planned"] - counts["missing"],
             "missing_responses": counts["missing"],
             "duplicate_mappings": counts["duplicate"],
             "accounting_invariant_ok": complete,
+            "valid": counts["original_valid"],
+            "invalid": counts["unresolved_invalid"],
+            "failed": counts["provider_failed"],
+            "resolved_records": valid + counts["provider_refused"],
             **counts,
         },
         "tokens": tokens,

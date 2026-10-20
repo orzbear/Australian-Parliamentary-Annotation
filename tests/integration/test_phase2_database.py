@@ -23,6 +23,7 @@ from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 from sqlalchemy import inspect
 from sqlalchemy.exc import DBAPIError
 
@@ -42,6 +43,7 @@ from hansard_annotator.db.review_export import (
     export_review_sample,
 )
 from hansard_annotator.llm_eval.import_predictions import import_predictions
+from hansard_annotator.llm_eval.operations import canonical_hash
 from hansard_annotator.product.cli import main as product_cli
 from hansard_annotator.product.loaders import (
     load_annotation_schema,
@@ -66,11 +68,18 @@ from hansard_annotator.web.campaigns.phase4e import (
     plan_campaign_chunks,
     set_orchestration_paused,
 )
+from hansard_annotator.web.campaigns.recovery import (
+    artifact_sha256,
+)
 from hansard_annotator.web.campaigns.service import (
     create_campaign,
     deterministic_selection,
+    import_campaign,
     other_exclusion_reason,
     plan_campaign,
+    production_configuration,
+    resolve_campaign_provider_refusals,
+    validate_campaign,
 )
 from hansard_annotator.web.config import WebSettings
 from hansard_annotator.web.exports.service import (
@@ -83,6 +92,7 @@ from hansard_annotator.web.projects.service import (
     set_membership,
     transition_project,
 )
+from hansard_annotator.web.research_exports.service import provider_refusal_export
 from hansard_annotator.web.security import SESSION_COOKIE
 from hansard_annotator.web.tasks.schemas import SelectionCriteria
 from hansard_annotator.web.tasks.service import (
@@ -146,6 +156,7 @@ PHASE4D_RECOVERY_TABLES = {
     "ai_annotation_campaign_recovery_records",
 }
 PHASE4E_TABLES = {"ai_annotation_campaign_batches"}
+PHASE4E_ABSTENTION_TABLES = {"model_prediction_abstentions"}
 
 
 @pytest.fixture
@@ -159,7 +170,8 @@ def database_url(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     cleanup_url = TEST_URL.replace("postgresql+psycopg://", "postgresql://")
     with psycopg.connect(cleanup_url, autocommit=True) as connection:
         connection.execute(
-            "TRUNCATE ai_annotation_campaign_recovery_records,"
+            "TRUNCATE model_prediction_abstentions,"
+            "ai_annotation_campaign_recovery_records,"
             "ai_annotation_campaign_recoveries,ai_annotation_campaign_records,"
             "ai_annotation_campaign_batches,ai_annotation_campaigns,"
             "model_prediction_reviews,model_predictions,model_prediction_runs"
@@ -1036,6 +1048,15 @@ def test_phase4d_migration_constraints_immutability_linkage_and_downgrade_guard(
     command.upgrade(config, "20261018_09")
     inspector = inspect(create_database_engine(settings))
     assert set(inspector.get_table_names()) >= PHASE4E_TABLES
+    assert not (PHASE4E_ABSTENTION_TABLES & set(inspector.get_table_names()))
+    command.upgrade(config, "20261020_10")
+    inspector = inspect(create_database_engine(settings))
+    assert set(inspector.get_table_names()) >= PHASE4E_ABSTENTION_TABLES
+    abstention_fks = inspector.get_foreign_keys("model_prediction_abstentions")
+    assert {fk["referred_table"] for fk in abstention_fks} == {
+        "model_prediction_runs",
+        "speaker_turns",
+    }
 
     import_validated_run(settings, _fixture_run(tmp_path, run_id="phase4d-db-fixture"))
     password = "phase4d database test password"
@@ -1227,7 +1248,9 @@ def test_phase4e_chunk_persistence_authorization_and_downgrade_guard(
     admin, _ = authenticate(settings, "phase4e-planner", password)
     url = database_url.replace("postgresql+psycopg://", "postgresql://")
     with psycopg.connect(url) as connection:
-        corpus_id = int(connection.execute("SELECT id FROM corpora LIMIT 1").fetchone()[0])
+        corpus = connection.execute("SELECT id FROM corpora LIMIT 1").fetchone()
+        assert corpus is not None
+        corpus_id = int(corpus[0])
     campaign = create_campaign(settings, admin, name="Phase 4E DB", corpus_id=corpus_id)
     planned = plan_campaign(
         settings,
@@ -1646,6 +1669,232 @@ def test_phase4d_planning_matches_historical_selection_and_rolls_back_atomically
             (interrupted["id"],),
         ).fetchone()
     assert state == ("DRAFT", 1)
+
+
+def test_provider_refusals_import_separately_and_exclude_same_configuration(
+    database_url: str, tmp_path: Path
+) -> None:
+    settings = _web_settings(database_url)
+    import_validated_run(
+        settings.database,
+        _fixture_run(tmp_path, run_id="phase4e-provider-refusal-fixture"),
+    )
+    password = "phase4e provider refusal test password"
+    create_user(
+        settings,
+        "phase4e-refusal-tester",
+        "Phase 4E Refusal Tester",
+        password,
+        admin=True,
+        must_change_password=False,
+    )
+    admin, _ = authenticate(settings, "phase4e-refusal-tester", password)
+    url = database_url.replace("postgresql+psycopg://", "postgresql://")
+    with psycopg.connect(url, row_factory=dict_row) as connection:
+        turns = connection.execute(
+            "SELECT id,turn_key FROM speaker_turns ORDER BY id LIMIT 2"
+        ).fetchall()
+        corpus = connection.execute("SELECT id FROM corpora LIMIT 1").fetchone()
+        assert corpus is not None
+        corpus_id = int(corpus["id"])
+    assert len(turns) == 2
+    record_ids = [f"turn:{turn['turn_key']}" for turn in turns]
+    configuration = production_configuration()
+    response = {
+        "promptFeedback": {"blockReason": "PROHIBITED_CONTENT"},
+        "modelVersion": configuration["configured_model"],
+    }
+    rows = [
+        {
+            "record_id": record_ids[0],
+            "request_index": 0,
+            "status": "success",
+            "prediction": {
+                "is_non_policy": True,
+                "primary_australian_domain": None,
+                "secondary_australian_domains": [],
+                "reasoning": "Non-policy.",
+            },
+            "usage": {},
+        },
+        {
+            "record_id": record_ids[1],
+            "request_index": 1,
+            "status": "invalid",
+            "prediction": None,
+            "validation_error": "prediction must be an object",
+            "provider_response": response,
+            "usage": {},
+        },
+    ]
+    source = tmp_path / "provider-refusal-source"
+    source.mkdir()
+    (source / "predictions.jsonl").write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    provenance = {
+        "provider": configuration["provider"],
+        "model": configuration["configured_model"],
+        "prompt_version": configuration["prompt_version"],
+        "assembled_prompt_sha256": configuration["prompt_sha256"],
+        "canonical_schema_sha256": configuration["canonical_schema_sha256"],
+        "prediction_contract_sha256": configuration["prediction_contract_sha256"],
+        "provider_schema_sha256": configuration["provider_schema_sha256"],
+        **configuration["generation_config"],
+        "execution_mode": configuration["execution_mode"],
+        "batch_id": "phase4e:provider-refusal-integration",
+        "record_ids_sha256": canonical_hash(record_ids),
+    }
+    summary = {
+        "provenance": provenance,
+        "coverage": {
+            "planned_requests": 2,
+            "collected_responses": 2,
+            "missing_responses": 0,
+            "duplicate_mappings": 0,
+            "successful_provider_responses": 2,
+            "failed_provider_responses": 0,
+            "valid_structured_predictions": 1,
+            "invalid_structured_predictions": 1,
+            "accounting_invariant_ok": True,
+        },
+        "tokens": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_tokens": 0,
+        },
+        "cost": {
+            "token_processing_cost_usd": 0,
+            "explicit_cache_storage_cost_usd": 0,
+            "total_pilot_cost_usd": 0,
+        },
+        "batch_status": {"model": configuration["configured_model"]},
+    }
+    (source / "operational_summary.json").write_text(
+        json.dumps(summary), encoding="utf-8"
+    )
+    source_hash = artifact_sha256(source)
+    lifecycle = create_campaign(
+        settings, admin, name="Provider refusal lifecycle", corpus_id=corpus_id
+    )
+    with psycopg.connect(url) as connection:
+        for index, (turn, record_id) in enumerate(zip(turns, record_ids, strict=True)):
+            connection.execute(
+                """
+                INSERT INTO ai_annotation_campaign_records
+                  (campaign_id,speaker_turn_id,record_id,selection_order,record_sha256)
+                VALUES (%s,%s,%s,%s,%s)
+                """,
+                (lifecycle["id"], turn["id"], record_id, index, canonical_hash(rows[index])),
+            )
+        connection.execute(
+            """
+            UPDATE ai_annotation_campaigns SET status='COLLECTED',planned_count=2,
+              record_set_sha256=%s,artifact_reference=%s,artifact_sha256=%s,
+              valid_count=1,invalid_count=1,orchestration_mode='CHUNKED',
+              orchestration_status='RECOVERY_REQUIRED',operational_metadata=%s
+            WHERE id=%s
+            """,
+            (
+                canonical_hash(record_ids),
+                str(source),
+                source_hash,
+                Jsonb({"coverage": summary["coverage"]}),
+                lifecycle["id"],
+            ),
+        )
+    resolved = resolve_campaign_provider_refusals(
+        settings, admin, str(lifecycle["public_id"])
+    )
+    assert resolved["valid_count"] == 1
+    assert resolved["invalid_count"] == 0
+    assert resolved["orchestration_status"] == "COMPLETE"
+    assert validate_campaign(
+        settings, admin, str(lifecycle["public_id"])
+    )["status"] == "VALIDATED"
+    imported = import_campaign(settings, admin, str(lifecycle["public_id"]))
+    assert imported["status"] == "IMPORTED"
+
+    with psycopg.connect(url) as connection:
+        run = connection.execute(
+            "SELECT id,public_id FROM model_prediction_runs WHERE provider_job_id=%s",
+            ("phase4e:provider-refusal-integration",),
+        ).fetchone()
+        assert run is not None
+        run_id = run[0]
+        assert connection.execute(
+            "SELECT count(*) FROM model_predictions WHERE run_id=%s", (run_id,)
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT count(*) FROM model_prediction_abstentions WHERE run_id=%s",
+            (run_id,),
+        ).fetchone()[0] == 1
+        with pytest.raises(psycopg.errors.ObjectNotInPrerequisiteState):
+            connection.execute(
+                "UPDATE model_prediction_abstentions SET resolution_reason='OTHER' "
+                "WHERE run_id=%s",
+                (run_id,),
+            )
+        connection.rollback()
+
+    refusal_csv = provider_refusal_export(settings, admin, str(run[1])).content.decode(
+        "utf-8"
+    )
+    exported = list(csv.DictReader(io.StringIO(refusal_csv)))
+    assert len(exported) == 1
+    assert exported[0]["record_id"] == record_ids[1]
+    refusal_provenance = json.loads(exported[0]["refusal_provenance"])
+    assert refusal_provenance["resolution"] == "PROVIDER_REFUSAL"
+    assert refusal_provenance["reason"] == "PROHIBITED_CONTENT"
+    assert len(refusal_provenance["attempts"]) == 1
+    assert refusal_provenance["attempts"][0]["provider_response"] == response
+
+    campaign = create_campaign(
+        settings, admin, name="Refusal exclusion", corpus_id=corpus_id
+    )
+    planned = plan_campaign(
+        settings,
+        admin,
+        str(campaign["public_id"]),
+        limit=200_000,
+        seed="provider-refusal-exclusion",
+        exclude_human_annotated=False,
+    ).campaign
+    assert int(planned["excluded_existing_prediction_count"]) == 2
+    with psycopg.connect(url) as connection:
+        selected = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT record_id FROM ai_annotation_campaign_records WHERE campaign_id=%s",
+                (campaign["id"],),
+            ).fetchall()
+        }
+    assert not (set(record_ids) & selected)
+
+    override = create_campaign(
+        settings, admin, name="Explicit refusal retry", corpus_id=corpus_id
+    )
+    plan_campaign(
+        settings,
+        admin,
+        str(override["public_id"]),
+        limit=200_000,
+        seed="provider-refusal-override",
+        exclude_human_annotated=False,
+        retry_provider_refusals=True,
+    )
+    with psycopg.connect(url) as connection:
+        override_selected = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT record_id FROM ai_annotation_campaign_records WHERE campaign_id=%s",
+                (override["id"],),
+            ).fetchall()
+        }
+    assert record_ids[0] not in override_selected
+    assert record_ids[1] in override_selected
 
 
 def test_phase4c_prediction_runs_allow_same_turn_across_immutable_runs(

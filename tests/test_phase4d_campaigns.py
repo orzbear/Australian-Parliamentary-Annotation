@@ -547,7 +547,10 @@ def test_navigation_and_templates_express_phase4d_information_architecture() -> 
     assert "Already human annotated (exclusive)" in campaigns
     assert "Other exclusions breakdown" in campaigns
     assert "Legacy selection rule" in campaigns
-    assert "same-configuration predictions take precedence" in campaigns
+    assert (
+        "same-configuration predictions or terminal provider refusals take precedence"
+        in campaigns
+    )
     new_campaign = (
         ROOT / "src/hansard_annotator/web/templates/campaigns/new.html"
     ).read_text(encoding="utf-8")

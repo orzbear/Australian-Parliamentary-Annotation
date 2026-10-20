@@ -57,10 +57,14 @@ from hansard_annotator.llm_eval.providers import _http_json
 from hansard_annotator.web.auth.models import Principal
 from hansard_annotator.web.campaigns.recovery import (
     RecoveryArtifactError,
+    artifact_sha256,
     build_effective_artifact,
     build_effective_artifact_streaming,
+    build_provider_refusal_artifact,
     build_structurally_repaired_artifact,
     iter_jsonl,
+    provider_refusal_count,
+    provider_refusal_directory,
     read_jsonl,
     structural_repair_count,
     structural_repair_directory,
@@ -411,12 +415,13 @@ def _planning_breakdown(
     campaign: dict[str, Any],
     *,
     exclude_human_annotated: bool,
+    retry_provider_refusals: bool = False,
 ) -> dict[str, Any]:
     row = connection.execute(
         """
         WITH base AS MATERIALIZED (
           SELECT
-            EXISTS (
+            (EXISTS (
               SELECT 1 FROM model_predictions prediction
               JOIN model_prediction_runs run ON run.id=prediction.run_id
               WHERE prediction.speaker_turn_id=turn.id
@@ -427,7 +432,18 @@ def _planning_breakdown(
                 AND run.provider_schema_sha256=%s
                 AND run.generation_config @> %s
                 AND run.execution_mode=%s
-            ) AS already_predicted,
+            ) OR (NOT %s AND EXISTS (
+              SELECT 1 FROM model_prediction_abstentions abstention
+              JOIN model_prediction_runs run ON run.id=abstention.run_id
+              WHERE abstention.speaker_turn_id=turn.id
+                AND run.provider=%s AND run.configured_model=%s
+                AND run.prompt_version=%s AND run.prompt_sha256=%s
+                AND run.canonical_schema_sha256=%s
+                AND run.prediction_contract_sha256=%s
+                AND run.provider_schema_sha256=%s
+                AND run.generation_config @> %s
+                AND run.execution_mode=%s
+            ))) AS already_predicted,
             EXISTS (
               SELECT 1 FROM tasks task
               JOIN assignments assignment ON assignment.task_id=task.id
@@ -475,6 +491,8 @@ def _planning_breakdown(
         """,
         (
             *_configuration_query_parameters(campaign),
+            retry_provider_refusals,
+            *_configuration_query_parameters(campaign),
             campaign["corpus_id"],
             exclude_human_annotated,
             exclude_human_annotated,
@@ -515,6 +533,18 @@ def _selection_query() -> str:
               AND run.generation_config @> %s
               AND run.execution_mode=%s
           )
+          AND (%s OR NOT EXISTS (
+            SELECT 1 FROM model_prediction_abstentions abstention
+            JOIN model_prediction_runs run ON run.id=abstention.run_id
+            WHERE abstention.speaker_turn_id=turn.id
+              AND run.provider=%s AND run.configured_model=%s
+              AND run.prompt_version=%s AND run.prompt_sha256=%s
+              AND run.canonical_schema_sha256=%s
+              AND run.prediction_contract_sha256=%s
+              AND run.provider_schema_sha256=%s
+              AND run.generation_config @> %s
+              AND run.execution_mode=%s
+          ))
           AND (NOT %s OR NOT EXISTS (
             SELECT 1 FROM tasks task
             JOIN assignments assignment ON assignment.task_id=task.id
@@ -540,11 +570,14 @@ def _selection_query_parameters(
     campaign: dict[str, Any],
     *,
     exclude_human_annotated: bool,
+    retry_provider_refusals: bool = False,
     seed: str,
     limit: int,
 ) -> tuple[object, ...]:
     return (
         campaign["corpus_id"],
+        *_configuration_query_parameters(campaign),
+        retry_provider_refusals,
         *_configuration_query_parameters(campaign),
         exclude_human_annotated,
         seed,
@@ -768,7 +801,7 @@ def _legacy_other_exclusion_breakdown(
         """
         WITH base AS (
           SELECT turn.*,
-            EXISTS (
+            (EXISTS (
               SELECT 1 FROM model_predictions prediction
               JOIN model_prediction_runs run ON run.id=prediction.run_id
               WHERE prediction.speaker_turn_id=turn.id
@@ -778,7 +811,17 @@ def _legacy_other_exclusion_breakdown(
                 AND run.prediction_contract_sha256=%s
                 AND run.provider_schema_sha256=%s
                 AND run.generation_config @> %s AND run.execution_mode=%s
-            ) AS already_predicted,
+            ) OR EXISTS (
+              SELECT 1 FROM model_prediction_abstentions abstention
+              JOIN model_prediction_runs run ON run.id=abstention.run_id
+              WHERE abstention.speaker_turn_id=turn.id
+                AND run.provider=%s AND run.configured_model=%s
+                AND run.prompt_version=%s AND run.prompt_sha256=%s
+                AND run.canonical_schema_sha256=%s
+                AND run.prediction_contract_sha256=%s
+                AND run.provider_schema_sha256=%s
+                AND run.generation_config @> %s AND run.execution_mode=%s
+            )) AS already_predicted,
             EXISTS (
               SELECT 1 FROM tasks task
               JOIN assignments assignment ON assignment.task_id=task.id
@@ -830,6 +873,7 @@ def _legacy_other_exclusion_breakdown(
             campaign["provider_schema_sha256"],
             Jsonb(campaign["generation_config"]),
             campaign["execution_mode"],
+            *_configuration_query_parameters(campaign),
             campaign["corpus_id"],
             exclude_human,
         ),
@@ -970,6 +1014,8 @@ def get_campaign(
         result["chunk_pages"] = max(1, math.ceil(chunk_total / 20))
         result["structural_repair_available_count"] = 0
         result["structural_repair_applied_count"] = 0
+        result["provider_refusal_available_count"] = 0
+        result["provider_refusal_applied_count"] = 0
         if result.get("artifact_reference"):
             source_directory = _base_effective_artifact_directory(result, recoveries)
             repaired_directory = structural_repair_directory(source_directory)
@@ -988,6 +1034,25 @@ def get_campaign(
                 result["structural_repair_available_count"] = structural_repair_count(
                     iter_jsonl(source_directory / "predictions.jsonl"),
                     _production_domain_codes(),
+                )
+            current_directory = (
+                repaired_directory if repaired_directory.exists() else source_directory
+            )
+            refusal_directory = provider_refusal_directory(current_directory)
+            if refusal_directory.exists():
+                refusal_summary = json.loads(
+                    (refusal_directory / "operational_summary.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                refusal_metadata = refusal_summary.get("provider_refusals", {})
+                if isinstance(refusal_metadata, dict):
+                    result["provider_refusal_applied_count"] = int(
+                        refusal_metadata.get("count") or 0
+                    )
+            elif result["status"] == "COLLECTED" and int(result["invalid_count"]) > 0:
+                result["provider_refusal_available_count"] = provider_refusal_count(
+                    iter_jsonl(current_directory / "predictions.jsonl")
                 )
         original_metadata = cast(
             dict[str, Any], result.get("operational_metadata") or {}
@@ -1015,6 +1080,7 @@ def plan_campaign(
     limit: int,
     seed: str,
     exclude_human_annotated: bool,
+    retry_provider_refusals: bool = False,
     _connection: psycopg.Connection[dict[str, Any]] | None = None,
 ) -> PlanResult:
     _require_admin(principal)
@@ -1040,6 +1106,7 @@ def plan_campaign(
             connection,
             dict(campaign),
             exclude_human_annotated=exclude_human_annotated,
+            retry_provider_refusals=retry_provider_refusals,
         )
         record_set_hasher = _RecordSetHasher()
         selected_count = 0
@@ -1053,6 +1120,7 @@ def plan_campaign(
                 _selection_query_parameters(
                     dict(campaign),
                     exclude_human_annotated=exclude_human_annotated,
+                    retry_provider_refusals=retry_provider_refusals,
                     seed=seed,
                     limit=limit,
                 ),
@@ -1100,6 +1168,7 @@ def plan_campaign(
         selection = {
             "eligibility_rule": AI_ELIGIBILITY_RULE,
             "exclude_human_annotated": exclude_human_annotated,
+            "retry_provider_refusals": retry_provider_refusals,
             "human_annotated_count": breakdown["human_annotated_count"],
             "excluded_human_annotated_count": breakdown[
                 "excluded_human_annotated_count"
@@ -1499,7 +1568,9 @@ def _current_effective_artifact_directory(
 ) -> Path:
     source = _base_effective_artifact_directory(campaign, recoveries)
     repaired = structural_repair_directory(source)
-    return repaired if repaired.exists() else source
+    source = repaired if repaired.exists() else source
+    refused = provider_refusal_directory(source)
+    return refused if refused.exists() else source
 
 
 def collect_campaign(
@@ -2026,6 +2097,104 @@ def repair_campaign_results(
         return dict(updated)
 
 
+def resolve_campaign_provider_refusals(
+    settings: WebSettings, principal: Principal, public_id: str
+) -> dict[str, Any]:
+    """Create an append-only terminal abstention artifact without a provider call."""
+    _require_admin(principal)
+    with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
+        row = connection.execute(
+            "SELECT * FROM ai_annotation_campaigns WHERE public_id::text=%s FOR UPDATE",
+            (public_id,),
+        ).fetchone()
+        if row is None:
+            raise LookupError("AI annotation campaign not found")
+        campaign = dict(row)
+        if campaign["status"] != "COLLECTED" or campaign.get("model_prediction_run_id"):
+            raise CampaignError("campaign is not eligible for provider-refusal resolution")
+        active = connection.execute(
+            """
+            SELECT id FROM ai_annotation_campaign_recoveries
+            WHERE campaign_id=%s AND status IN
+              ('PREPARING','SUBMITTED','RUNNING','PROVIDER_COMPLETED')
+            LIMIT 1
+            """,
+            (campaign["id"],),
+        ).fetchone()
+        if active is not None:
+            raise CampaignError("provider-refusal resolution is blocked by an active recovery job")
+        recoveries = _collected_recoveries(connection, int(campaign["id"]))
+        source_directory = _current_effective_artifact_directory(campaign, recoveries)
+        source_summary = json.loads(
+            (source_directory / "operational_summary.json").read_text(encoding="utf-8")
+        )
+        if isinstance(source_summary, dict) and source_summary.get("provider_refusals"):
+            return campaign
+        output_directory = provider_refusal_directory(source_directory)
+        original_directory = Path(str(campaign["artifact_reference"]))
+        attempt_sources = [
+            {
+                "source_kind": "original_campaign",
+                "artifact_reference": str(original_directory),
+                "artifact_sha256": artifact_sha256(original_directory),
+                "provider_job_id": campaign.get("provider_job_id")
+                or f"phase4e:{public_id}",
+            },
+            *[
+                {
+                    "source_kind": "targeted_recovery",
+                    "recovery_attempt_number": int(recovery["attempt_number"]),
+                    "provider_job_id": recovery.get("provider_job_id"),
+                    "artifact_reference": recovery.get("artifact_reference"),
+                    "artifact_sha256": recovery.get("artifact_sha256"),
+                }
+                for recovery in recoveries
+            ],
+        ]
+        summary, row_count, _artifact_hash = build_provider_refusal_artifact(
+            source_directory, output_directory, attempt_sources
+        )
+        coverage = summary.get("coverage")
+        refusal_metadata = summary.get("provider_refusals")
+        if not isinstance(coverage, dict) or not isinstance(refusal_metadata, dict):
+            raise CampaignError("provider-refusal artifact has incomplete metadata")
+        unresolved = sum(
+            int(coverage.get(key) or 0)
+            for key in (
+                "invalid_structured_predictions",
+                "failed_provider_responses",
+                "missing_responses",
+                "duplicate_mappings",
+            )
+        )
+        orchestration_status = (
+            "COMPLETE" if coverage.get("accounting_invariant_ok") else "RECOVERY_REQUIRED"
+        )
+        updated = connection.execute(
+            """
+            UPDATE ai_annotation_campaigns SET valid_count=%s,invalid_count=%s,
+              orchestration_status=%s,operational_metadata=operational_metadata || %s
+            WHERE id=%s RETURNING *
+            """,
+            (
+                int(coverage.get("valid_structured_predictions") or 0),
+                unresolved,
+                orchestration_status,
+                Jsonb(
+                    {
+                        "coverage": coverage,
+                        "provider_refusals": refusal_metadata,
+                        "effective_artifact_reference": str(output_directory),
+                    }
+                ),
+                campaign["id"],
+            ),
+        ).fetchone()
+        assert row_count == int(campaign["planned_count"])
+        assert updated is not None
+        return dict(updated)
+
+
 def recover_recovery_submission(
     settings: WebSettings,
     principal: Principal,
@@ -2285,17 +2454,29 @@ def validate_campaign(
             summary, rows, _artifact_hash = load_prediction_artifact(directory)
             row_count = len(rows)
         coverage = summary["coverage"]
-        if row_count != int(campaign["planned_count"]):
+        valid_count = int(coverage.get("valid_structured_predictions") or 0)
+        refusal_count = int(coverage.get("provider_refused") or 0)
+        if row_count != valid_count or valid_count + refusal_count != int(
+            campaign["planned_count"]
+        ):
             raise CampaignError("validated result coverage does not equal planned records")
-        if coverage.get("missing_responses") or coverage.get("duplicate_mappings"):
-            raise CampaignError("missing or duplicate provider mappings block import")
+        if any(
+            int(coverage.get(key) or 0)
+            for key in (
+                "invalid_structured_predictions",
+                "failed_provider_responses",
+                "missing_responses",
+                "duplicate_mappings",
+            )
+        ):
+            raise CampaignError("unresolved provider results or mappings block import")
         updated = connection.execute(
             """
             UPDATE ai_annotation_campaigns SET status='VALIDATED',validated_at=now(),
               valid_count=%s,invalid_count=%s
             WHERE id=%s RETURNING *
             """,
-            (row_count, coverage["invalid_structured_predictions"], campaign["id"]),
+            (valid_count, 0, campaign["id"]),
         ).fetchone()
         assert updated is not None
         return dict(updated)

@@ -14,6 +14,9 @@ from hansard_annotator.llm_eval.validation import InvalidPrediction, validate_pr
 STRUCTURAL_REPAIR_RULE = "remove_primary_from_secondary_v1"
 STRUCTURAL_REPAIR_VERSION = 1
 STRUCTURAL_REPAIR_DIRECTORY = f"structural-repair-{STRUCTURAL_REPAIR_RULE}"
+PROVIDER_REFUSAL_RULE = "prohibited_content_no_candidate_v1"
+PROVIDER_REFUSAL_VERSION = 1
+PROVIDER_REFUSAL_DIRECTORY = f"provider-refusal-{PROVIDER_REFUSAL_RULE}"
 
 
 class RecoveryArtifactError(ValueError):
@@ -106,6 +109,45 @@ def artifact_sha256(directory: Path) -> str:
 def structural_repair_directory(source_directory: Path) -> Path:
     """Return the deterministic append-only repair location for an effective artifact."""
     return source_directory.parent / f"{source_directory.name}-{STRUCTURAL_REPAIR_DIRECTORY}"
+
+
+def provider_refusal_directory(source_directory: Path) -> Path:
+    """Return the append-only location for terminal provider-refusal resolutions."""
+    return source_directory.parent / f"{source_directory.name}-{PROVIDER_REFUSAL_DIRECTORY}"
+
+
+def _provider_text(row: dict[str, Any]) -> str | None:
+    response = row.get("provider_response")
+    candidates = response.get("candidates") if isinstance(response, dict) else None
+    if not isinstance(candidates, list):
+        return None
+    for candidate in candidates:
+        content = candidate.get("content") if isinstance(candidate, dict) else None
+        parts = content.get("parts") if isinstance(content, dict) else None
+        if not isinstance(parts, list):
+            continue
+        for part in parts:
+            text = part.get("text") if isinstance(part, dict) else None
+            if isinstance(text, str) and text.strip():
+                return text
+    return None
+
+
+def is_prohibited_content_refusal(row: dict[str, Any]) -> bool:
+    """Recognize only the confirmed Gemini abstention shape."""
+    if row.get("status") == "success" or row.get("prediction") is not None:
+        return False
+    response = row.get("provider_response")
+    feedback = response.get("promptFeedback") if isinstance(response, dict) else None
+    return (
+        isinstance(feedback, dict)
+        and feedback.get("blockReason") == "PROHIBITED_CONTENT"
+        and _provider_text(row) is None
+    )
+
+
+def provider_refusal_count(rows: Iterable[dict[str, Any]]) -> int:
+    return sum(is_prohibited_content_refusal(row) for row in rows)
 
 
 def _provider_prediction(row: dict[str, Any]) -> object:
@@ -270,6 +312,208 @@ def build_structurally_repaired_artifact(
     return summary, rows, artifact_sha256(output_directory)
 
 
+def build_provider_refusal_artifact(
+    source_directory: Path,
+    output_directory: Path,
+    attempt_sources: list[dict[str, Any]],
+) -> tuple[dict[str, Any], int, str]:
+    """Resolve confirmed refusals while retaining only refusal evidence in memory."""
+    if output_directory.exists():
+        raise RecoveryArtifactError("provider-refusal artifact already exists")
+    summary = json.loads(
+        (source_directory / "operational_summary.json").read_text(encoding="utf-8")
+    )
+    if not isinstance(summary, dict):
+        raise RecoveryArtifactError("source operational summary is not an object")
+    candidate_ids = {
+        str(row["record_id"])
+        for row in iter_jsonl(source_directory / "predictions.jsonl")
+        if isinstance(row.get("record_id"), str)
+        and is_prohibited_content_refusal(row)
+    }
+    if not candidate_ids:
+        raise RecoveryArtifactError("no confirmed provider refusal applies")
+    evidence: dict[str, list[dict[str, Any]]] = {}
+    for source in attempt_sources:
+        reference = source.get("artifact_reference")
+        if not isinstance(reference, str):
+            raise RecoveryArtifactError("refusal evidence has no artifact reference")
+        directory = Path(reference)
+        source_hash = source.get("artifact_sha256") or artifact_sha256(directory)
+        for row in iter_jsonl(directory / "predictions.jsonl"):
+            record_id = row.get("record_id")
+            if not isinstance(record_id, str):
+                raise RecoveryArtifactError("refusal evidence has an invalid record ID")
+            if record_id not in candidate_ids:
+                continue
+            evidence.setdefault(record_id, []).append(
+                {
+                    "source_kind": source.get("source_kind"),
+                    "recovery_attempt_number": source.get("recovery_attempt_number"),
+                    "provider_job_id": source.get("provider_job_id"),
+                    "artifact_reference": reference,
+                    "artifact_sha256": source_hash,
+                    "request_index": row.get("request_index"),
+                    "response_index": row.get("response_index"),
+                    "chunk_number": row.get("chunk_number"),
+                    "chunk_request_index": row.get("chunk_request_index"),
+                    "status": row.get("status"),
+                    "validation_error": row.get("validation_error"),
+                    "provider_error": row.get("provider_error"),
+                    "returned_model": row.get("returned_model"),
+                    "usage": copy.deepcopy(row.get("usage")),
+                    "provider_response": copy.deepcopy(row.get("provider_response")),
+                    "qualifies": is_prohibited_content_refusal(row),
+                }
+            )
+
+    refusal_exports: list[dict[str, Any]] = []
+    provenance = copy.deepcopy(summary.get("provenance", {}))
+    source_hash = artifact_sha256(source_directory)
+    qualifying_ids = {
+        record_id
+        for record_id in candidate_ids
+        if evidence.get(record_id)
+        and all(
+            attempt.get("qualifies") is True for attempt in evidence[record_id]
+        )
+    }
+    if not qualifying_ids:
+        raise RecoveryArtifactError(
+            "not every observed attempt confirms the provider refusal"
+        )
+    output_directory.mkdir(parents=True)
+    valid = repaired = refused = failed = missing_rows = invalid = row_count = 0
+    with (output_directory / "predictions.jsonl").open(
+        "w", encoding="utf-8", newline="\n"
+    ) as target:
+        for row in iter_jsonl(source_directory / "predictions.jsonl"):
+            record_id = str(row.get("record_id"))
+            attempts = evidence.get(record_id, [])
+            if (
+                record_id in qualifying_ids
+                and attempts
+            ):
+                refusal_exports.append(
+                    {
+                        "record_id": record_id,
+                        "resolution": "PROVIDER_REFUSAL",
+                        "reason": "PROHIBITED_CONTENT",
+                        "rule_id": PROVIDER_REFUSAL_RULE,
+                        "rule_version": PROVIDER_REFUSAL_VERSION,
+                        "source_artifact_sha256": source_hash,
+                        "configuration_provenance": provenance,
+                        "attempts": [
+                            {
+                                key: value
+                                for key, value in attempt.items()
+                                if key != "qualifies"
+                            }
+                            for attempt in attempts
+                        ],
+                    }
+                )
+                row = copy.deepcopy(row)
+                row.update(
+                    status="provider_refusal",
+                    prediction=None,
+                    validation_error=None,
+                    effective_source="provider_refusal_resolution",
+                    terminal_resolution={
+                        "type": "PROVIDER_REFUSAL",
+                        "reason": "PROHIBITED_CONTENT",
+                        "rule_id": PROVIDER_REFUSAL_RULE,
+                        "rule_version": PROVIDER_REFUSAL_VERSION,
+                    },
+                )
+            status = row.get("status")
+            valid += status == "success"
+            repaired += row.get("effective_source") == "structural_repair"
+            refused += status == "provider_refusal"
+            failed += status == "provider_failure"
+            missing_rows += status == "missing"
+            invalid += status not in {
+                "success",
+                "provider_refusal",
+                "provider_failure",
+                "missing",
+            }
+            target.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+            row_count += 1
+    coverage = summary.setdefault("coverage", {})
+    planned = int(coverage.get("planned_requests") or row_count)
+    missing = max(missing_rows, int(coverage.get("missing_responses") or 0))
+    duplicate = int(coverage.get("duplicate_mappings") or 0)
+    resolved = valid + refused
+    coverage.update(
+        {
+            "valid_structured_predictions": valid,
+            "structurally_repaired": repaired,
+            "provider_refused": refused,
+            "invalid_structured_predictions": invalid,
+            "valid": valid - repaired,
+            "invalid": invalid,
+            "failed": failed,
+            "missing": missing,
+            "duplicate": duplicate,
+            "failed_provider_responses": failed,
+            "provider_failures_collected": failed,
+            "missing_responses": missing,
+            "duplicate_mappings": duplicate,
+            "resolved_records": resolved,
+            "accounting_invariant_ok": (
+                planned == row_count == resolved
+                and invalid == failed == missing == duplicate == 0
+            ),
+        }
+    )
+    refusal_text = "".join(
+        json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n"
+        for value in refusal_exports
+    )
+    refusal_sha256 = hashlib.sha256(refusal_text.encode("utf-8")).hexdigest()
+    refusal_ids = [str(value["record_id"]) for value in refusal_exports]
+    summary["provider_refusals"] = {
+        "append_only": True,
+        "resolution": "PROVIDER_REFUSAL",
+        "reason": "PROHIBITED_CONTENT",
+        "rule_id": PROVIDER_REFUSAL_RULE,
+        "rule_version": PROVIDER_REFUSAL_VERSION,
+        "count": refused,
+        "record_ids": refusal_ids,
+        "record_ids_sha256": hashlib.sha256(
+            json.dumps(refusal_ids, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+        "lineage_file": "provider_refusals.jsonl",
+        "lineage_sha256": refusal_sha256,
+        "source_artifact_sha256": source_hash,
+    }
+    (output_directory / "provider_refusals.jsonl").write_text(
+        refusal_text, encoding="utf-8", newline="\n"
+    )
+    (output_directory / "operational_summary.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    refusal_lines = "\n".join(f"- `{record_id}`" for record_id in refusal_ids)
+    (output_directory / "summary.md").write_text(
+        "# Phase 4E effective campaign summary\n\n"
+        f"- Valid predictions: {valid}\n"
+        f"- Structurally repaired predictions: {repaired}\n"
+        f"- Provider refusals: {refused}\n"
+        f"- Unresolved invalid: {invalid}\n"
+        f"- Provider failures: {failed}\n"
+        f"- Missing: {missing}\n"
+        f"- Duplicate mappings: {duplicate}\n\n"
+        "## Provider-refusal record IDs\n\n"
+        f"{refusal_lines}\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    return summary, row_count, artifact_sha256(output_directory)
+
+
 def _sum_metric(
     original: dict[str, Any], recoveries: Iterable[dict[str, Any]], key: str
 ) -> float:
@@ -296,9 +540,10 @@ def build_effective_artifact(
         raise RecoveryArtifactError("original operational summary is not an object")
     rows = effective_results(original_directory, collected_recoveries)
     valid = sum(row.get("status") == "success" for row in rows)
-    invalid = len(rows) - valid
+    refused = sum(row.get("status") == "provider_refusal" for row in rows)
     provider_failures = sum(row.get("status") == "provider_failure" for row in rows)
     missing = sum(row.get("status") == "missing" for row in rows)
+    invalid = len(rows) - valid - refused - provider_failures - missing
     summary = copy.deepcopy(original_summary)
     coverage = summary.setdefault("coverage", {})
     planned = int(coverage.get("planned_requests") or len(rows))
@@ -312,7 +557,17 @@ def build_effective_artifact(
             "failed_provider_responses": provider_failures,
             "valid_structured_predictions": valid,
             "invalid_structured_predictions": invalid,
+            "provider_refused": refused,
             "provider_failures_collected": provider_failures,
+            "valid": valid
+            - sum(row.get("effective_source") == "structural_repair" for row in rows),
+            "structurally_repaired": sum(
+                row.get("effective_source") == "structural_repair" for row in rows
+            ),
+            "invalid": invalid,
+            "failed": provider_failures,
+            "missing": missing,
+            "duplicate": 0,
             "accounting_invariant_ok": planned == len(rows) and missing == 0,
         }
     )
@@ -416,7 +671,9 @@ def build_effective_artifact_streaming(
     row_count = 0
     valid = 0
     provider_failures = 0
+    refused = 0
     missing = 0
+    invalid = 0
     seen_replacements: set[str] = set()
     with output_path.open("w", encoding="utf-8", newline="\n") as target:
         for original in iter_jsonl(original_directory / "predictions.jsonl"):
@@ -429,8 +686,15 @@ def build_effective_artifact_streaming(
                 row["request_index"] = original.get("request_index", row_count)
             status = row.get("status")
             valid += status == "success"
+            refused += status == "provider_refusal"
             provider_failures += status == "provider_failure"
             missing += status == "missing"
+            invalid += status not in {
+                "success",
+                "provider_refusal",
+                "provider_failure",
+                "missing",
+            }
             target.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
             row_count += 1
     outside = set(replacements) - seen_replacements
@@ -440,7 +704,6 @@ def build_effective_artifact_streaming(
     summary = copy.deepcopy(original_summary)
     coverage = summary.setdefault("coverage", {})
     planned = int(coverage.get("planned_requests") or row_count)
-    invalid = row_count - valid
     coverage.update(
         {
             "provider_request_count": planned,
@@ -451,7 +714,14 @@ def build_effective_artifact_streaming(
             "failed_provider_responses": provider_failures,
             "valid_structured_predictions": valid,
             "invalid_structured_predictions": invalid,
+            "provider_refused": refused,
             "provider_failures_collected": provider_failures,
+            "valid": valid,
+            "structurally_repaired": 0,
+            "invalid": invalid,
+            "failed": provider_failures,
+            "missing": missing,
+            "duplicate": 0,
             "accounting_invariant_ok": planned == row_count and missing == 0,
         }
     )

@@ -493,6 +493,32 @@ def test_migration_preserves_legacy_and_freezes_child_provenance() -> None:
     assert "campaign child Batch provenance is immutable" in migration
     assert "full-production authorization is immutable" in migration
     assert "Phase 4E downgrade refused" in migration
+
+
+def test_provider_abstention_migration_is_separate_and_append_only() -> None:
+    migration = Path(
+        "migrations/versions/20261020_10_provider_abstentions.py"
+    ).read_text(encoding="utf-8")
+    assert 'down_revision = "20261018_09"' in migration
+    assert "CREATE TABLE model_prediction_abstentions" in migration
+    assert "resolution_type='PROVIDER_REFUSAL'" in migration
+    assert "resolution_reason='PROHIBITED_CONTENT'" in migration
+    assert "trg_model_prediction_abstentions_append_only" in migration
+    assert "downgrade refused" in migration
+
+
+def test_same_configuration_selection_treats_abstentions_as_terminal() -> None:
+    service = Path(
+        "src/hansard_annotator/web/campaigns/service.py"
+    ).read_text(encoding="utf-8")
+    assert service.count("FROM model_prediction_abstentions abstention") >= 3
+    assert "abstention.speaker_turn_id=turn.id" in service
+    assert "retry_provider_refusals" in service
+    detail = Path(
+        "src/hansard_annotator/web/templates/campaigns/detail.html"
+    ).read_text(encoding="utf-8")
+    assert 'name="retry_provider_refusals"' in detail
+    assert "Off by default" in detail
     assert CHUNK_PLANNER_VERSION == "phase4e-full-input-v1"
 
 

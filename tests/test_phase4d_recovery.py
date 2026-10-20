@@ -5,7 +5,10 @@ from pathlib import Path
 
 import pytest
 
-from hansard_annotator.llm_eval.import_predictions import load_prediction_artifact
+from hansard_annotator.llm_eval.import_predictions import (
+    iter_provider_refusal_artifact,
+    load_prediction_artifact,
+)
 from hansard_annotator.llm_eval.operations import (
     APPROVED_PRODUCTION_MODEL,
     FROZEN_CANONICAL_SCHEMA_SHA256,
@@ -18,8 +21,11 @@ from hansard_annotator.web.campaigns.recovery import (
     STRUCTURAL_REPAIR_RULE,
     apply_structural_repairs,
     build_effective_artifact,
+    build_provider_refusal_artifact,
     build_structurally_repaired_artifact,
     effective_results,
+    is_prohibited_content_refusal,
+    provider_refusal_directory,
     structural_repair_directory,
     unresolved_results,
 )
@@ -48,6 +54,14 @@ def _repairable_prediction() -> dict[str, object]:
         "primary_australian_domain": "AU07",
         "secondary_australian_domains": ["AU08", "AU07"],
         "reasoning": "The policy concerns AU07 with a secondary AU08 dimension.",
+    }
+
+
+def _refusal_response() -> dict[str, object]:
+    return {
+        "promptFeedback": {"blockReason": "PROHIBITED_CONTENT"},
+        "usageMetadata": {"promptTokenCount": 12, "totalTokenCount": 12},
+        "modelVersion": APPROVED_PRODUCTION_MODEL,
     }
 
 
@@ -340,6 +354,178 @@ def test_structural_repair_does_not_broaden_permitted_changes() -> None:
     rows, lineage = apply_structural_repairs([row], DOMAIN_CODES)
     assert rows == [before]
     assert lineage == []
+
+
+def test_prohibited_content_is_terminal_abstention_with_immutable_lineage(
+    tmp_path: Path,
+) -> None:
+    provenance = {
+        "provider": "gemini",
+        "model": APPROVED_PRODUCTION_MODEL,
+        "prompt_version": FROZEN_PROMPT_VERSION,
+        "assembled_prompt_sha256": FROZEN_PROMPT_SHA256,
+        "canonical_schema_sha256": FROZEN_CANONICAL_SCHEMA_SHA256,
+        "execution_mode": "batch",
+        "thinking_level": "minimal",
+        "batch_id": "phase4e:refusal-test",
+        "record_ids_sha256": canonical_hash(["turn:valid", "turn:refused"]),
+    }
+    valid = {
+        "record_id": "turn:valid",
+        "request_index": 0,
+        "status": "success",
+        "prediction": {
+            "is_non_policy": True,
+            "primary_australian_domain": None,
+            "secondary_australian_domains": [],
+            "reasoning": "Non-policy.",
+        },
+    }
+    refused = {
+        "record_id": "turn:refused",
+        "request_index": 1,
+        "status": "invalid",
+        "prediction": None,
+        "validation_error": "prediction must be an object",
+        "provider_response": _refusal_response(),
+    }
+    original = tmp_path / "original"
+    original.mkdir()
+    _write_jsonl(original / "predictions.jsonl", [valid, refused])
+    summary = {
+        "provenance": provenance,
+        "coverage": {
+            "planned_requests": 2,
+            "collected_responses": 2,
+            "missing_responses": 0,
+            "duplicate_mappings": 0,
+            "successful_provider_responses": 2,
+            "failed_provider_responses": 0,
+            "valid_structured_predictions": 1,
+            "invalid_structured_predictions": 1,
+            "accounting_invariant_ok": True,
+        },
+        "tokens": {},
+        "cost": {"total_pilot_cost_usd": 0},
+        "batch_status": {"model": APPROVED_PRODUCTION_MODEL},
+    }
+    (original / "operational_summary.json").write_text(
+        json.dumps(summary, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    attempt_sources: list[dict[str, object]] = [
+        {
+            "source_kind": "original",
+            "provider_job_id": "batches/original",
+            "artifact_reference": str(original),
+        }
+    ]
+    source_snapshots = {
+        path: path.read_bytes() for path in original.rglob("*") if path.is_file()
+    }
+    for attempt in (1, 2):
+        directory = tmp_path / f"attempt-{attempt:03d}"
+        directory.mkdir()
+        retry_row = {**refused, "request_index": 0, "response_index": 0}
+        _write_jsonl(directory / "predictions.jsonl", [retry_row])
+        retry_summary = {
+            **summary,
+            "coverage": {
+                **summary["coverage"],
+                "planned_requests": 1,
+                "collected_responses": 1,
+                "valid_structured_predictions": 0,
+                "invalid_structured_predictions": 1,
+            },
+        }
+        (directory / "operational_summary.json").write_text(
+            json.dumps(retry_summary, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        attempt_sources.append(
+            {
+                "source_kind": "targeted_recovery",
+                "recovery_attempt_number": attempt,
+                "provider_job_id": f"batches/recovery-{attempt}",
+                "artifact_reference": str(directory),
+            }
+        )
+        source_snapshots.update(
+            {path: path.read_bytes() for path in directory.rglob("*") if path.is_file()}
+        )
+
+    output = provider_refusal_directory(original)
+    resolved_summary, row_count, _digest = build_provider_refusal_artifact(
+        original, output, attempt_sources
+    )
+
+    assert is_prohibited_content_refusal(refused)
+    assert row_count == 2
+    rows = [
+        json.loads(line)
+        for line in (output / "predictions.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert rows[1]["status"] == "provider_refusal"
+    assert rows[1]["prediction"] is None
+    assert resolved_summary["coverage"] == {
+        **resolved_summary["coverage"],
+        "valid_structured_predictions": 1,
+        "structurally_repaired": 0,
+        "provider_refused": 1,
+        "invalid_structured_predictions": 0,
+        "failed_provider_responses": 0,
+        "missing_responses": 0,
+        "duplicate_mappings": 0,
+        "resolved_records": 2,
+        "accounting_invariant_ok": True,
+    }
+    loaded_summary, loaded_rows, _loaded_hash = load_prediction_artifact(output)
+    assert loaded_summary["coverage"]["provider_refused"] == 1
+    assert [row["record_id"] for row in loaded_rows] == ["turn:valid"]
+    refusal_exports = list(iter_provider_refusal_artifact(output))
+    assert [row["record_id"] for row in refusal_exports] == ["turn:refused"]
+    assert refusal_exports[0]["configuration_provenance"] == provenance
+    assert len(refusal_exports[0]["attempts"]) == 3
+    assert all(
+        attempt["provider_response"] == _refusal_response()
+        for attempt in refusal_exports[0]["attempts"]
+    )
+    assert "`turn:refused`" in (output / "summary.md").read_text(encoding="utf-8")
+    assert {
+        path: path.read_bytes() for path in source_snapshots
+    } == source_snapshots
+
+
+def test_other_invalid_output_is_not_resolved_as_provider_refusal(tmp_path: Path) -> None:
+    source = tmp_path / "malformed"
+    source.mkdir()
+    row = {
+        "record_id": "turn:malformed",
+        "request_index": 0,
+        "status": "invalid",
+        "prediction": None,
+        "provider_response": {
+            "promptFeedback": {"blockReason": "PROHIBITED_CONTENT"},
+            "candidates": [{"content": {"parts": [{"text": "not-json"}]}}],
+        },
+    }
+    _write_jsonl(source / "predictions.jsonl", [row])
+    (source / "operational_summary.json").write_text(
+        json.dumps(
+            {
+                "provenance": {},
+                "coverage": {"planned_requests": 1},
+                "tokens": {},
+                "cost": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert not is_prohibited_content_refusal(row)
+    with pytest.raises(ValueError, match="no confirmed provider refusal"):
+        build_provider_refusal_artifact(
+            source,
+            tmp_path / "unresolved",
+            [{"source_kind": "original", "artifact_reference": str(source)}],
+        )
 
 
 def test_recovery_migration_enforces_active_set_idempotency_and_lineage() -> None:
