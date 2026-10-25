@@ -64,3 +64,6 @@ test-results/
 Thumbs.db
 .pytest-temp-run/
 phase4b-validation-100.tar.gz
+
+/.hostility-sample-test-tmp/
+/.policy-frame-test-tmp/

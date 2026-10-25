@@ -1,0 +1,14 @@
+slug: hostility_presence
+name: Hostility presence
+description: Whether a speaker expresses targeted adversarial negative affect.
+taxonomy_type: hostility_scale
+jurisdiction: AU
+language_code: en
+owner_scope: project
+version: 0.1.0
+status: draft
+version_description: Initial targeted-hostility decision scale.
+labels:
+  - {code: "NO", label: "No", short_definition: No endorsed targeted hostility is present., display_order: 1, is_active: true, is_analytical: true, is_fallback: false, requires_review: false}
+  - {code: "YES", label: "Yes", short_definition: Endorsed targeted hostility is present., display_order: 2, is_active: true, is_analytical: true, is_fallback: false, requires_review: false}
+  - {code: UNSURE, label: Unsure, short_definition: The evidence is genuinely ambiguous or borderline., display_order: 3, is_active: true, is_analytical: true, is_fallback: false, requires_review: true}

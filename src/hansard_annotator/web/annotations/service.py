@@ -94,9 +94,11 @@ def save_annotation(
         assignment = connection.execute(
             """
             SELECT a.id,a.public_id,a.status,t.id AS task_id,t.project_id,
-                   p.annotation_schema_version_id,p.status AS project_status
+                   p.annotation_schema_version_id,p.status AS project_status,
+                   st.text_clean
             FROM assignments a JOIN tasks t ON t.id=a.task_id
             JOIN projects p ON p.id=t.project_id
+            JOIN speaker_turns st ON st.id=t.speaker_turn_id
             WHERE a.id=%s AND a.user_id=%s
             FOR UPDATE OF a,t
             """,
@@ -118,7 +120,11 @@ def save_annotation(
             for taxonomy_id, taxonomy_labels in labels.items()
         }
         outcome = validate_annotation(
-            payload, fields, taxonomy_codes, submitting=submitting
+            payload,
+            fields,
+            taxonomy_codes,
+            submitting=submitting,
+            authoritative_text=str(assignment["text_clean"]),
         )
         if not outcome.valid:
             raise AnnotationValidationError(outcome)

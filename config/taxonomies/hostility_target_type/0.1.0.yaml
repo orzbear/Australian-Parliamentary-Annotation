@@ -1,0 +1,21 @@
+slug: hostility_target_type
+name: Hostility target type
+description: Type of identifiable target toward which hostility is directed.
+taxonomy_type: target_type
+jurisdiction: AU
+language_code: en
+owner_scope: project
+version: 0.1.0
+status: draft
+version_description: Initial hostility target categories.
+labels:
+  - {code: INDIVIDUAL_POLITICIAN, label: Individual politician, short_definition: A named or identifiable politician., display_order: 1, is_active: true, is_analytical: true, is_fallback: false, requires_review: false}
+  - {code: POLITICAL_PARTY, label: Political party, short_definition: A political party or its members collectively., display_order: 2, is_active: true, is_analytical: true, is_fallback: false, requires_review: false}
+  - {code: GOVERNMENT, label: Government, short_definition: The government or governing bloc., display_order: 3, is_active: true, is_analytical: true, is_fallback: false, requires_review: false}
+  - {code: OPPOSITION, label: Opposition, short_definition: The opposition or opposition bloc., display_order: 4, is_active: true, is_analytical: true, is_fallback: false, requires_review: false}
+  - {code: POLITICAL_INSTITUTION, label: Political institution, short_definition: A parliament or other political institution., display_order: 5, is_active: true, is_analytical: true, is_fallback: false, requires_review: false}
+  - {code: POLICY_OR_PROGRAM, label: Policy or program, short_definition: "A policy, bill, program, or administrative measure.", display_order: 6, is_active: true, is_analytical: true, is_fallback: false, requires_review: false}
+  - {code: SOCIAL_GROUP, label: Social group, short_definition: "A social, demographic, or community group.", display_order: 7, is_active: true, is_analytical: true, is_fallback: false, requires_review: false}
+  - {code: EXTERNAL_STATE_OR_ACTOR, label: External state or actor, short_definition: "A foreign state, organisation, or other external actor.", display_order: 8, is_active: true, is_analytical: true, is_fallback: false, requires_review: false}
+  - {code: IDEOLOGY_OR_MOVEMENT, label: Ideology or movement, short_definition: "An ideology, political movement, or cause.", display_order: 9, is_active: true, is_analytical: true, is_fallback: false, requires_review: false}
+  - {code: OTHER, label: Other, short_definition: Another identifiable target type., display_order: 10, is_active: true, is_analytical: false, is_fallback: true, requires_review: true}

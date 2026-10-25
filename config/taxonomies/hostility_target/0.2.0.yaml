@@ -1,0 +1,43 @@
+slug: hostility_target
+name: Hostility target relationship
+description: Relationship between a hostility target and the speaker's partisan position.
+taxonomy_type: target_type
+jurisdiction: AU
+language_code: en
+owner_scope: project
+version: 0.2.0
+status: draft
+version_description: Simplified target relationship for partisan-hostility coding.
+labels:
+  - code: OPPOSING_PARTISAN_TARGET
+    label: Opposing partisan target
+    short_definition: The speaker's opposing party, MP, government/opposition side, or clearly opposing partisan bloc.
+    display_order: 1
+    is_active: true
+    is_analytical: true
+    is_fallback: false
+    requires_review: false
+  - code: OTHER_POLITICAL_TARGET
+    label: Other political target
+    short_definition: A political actor not clearly established as the speaker's partisan out-group.
+    display_order: 2
+    is_active: true
+    is_analytical: true
+    is_fallback: false
+    requires_review: false
+  - code: NON_POLITICAL_TARGET
+    label: Non-political target
+    short_definition: A non-partisan or non-political actor, group, institution, ideology, policy, or program.
+    display_order: 3
+    is_active: true
+    is_analytical: true
+    is_fallback: false
+    requires_review: false
+  - code: UNSURE
+    label: Unsure
+    short_definition: The target relationship cannot be determined reliably from the available context.
+    display_order: 4
+    is_active: true
+    is_analytical: true
+    is_fallback: false
+    requires_review: true

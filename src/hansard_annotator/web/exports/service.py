@@ -103,17 +103,33 @@ def _jsonl(records: list[dict[str, object]]) -> bytes:
     return text.encode("utf-8")
 
 
+def _derived_annotation_values(values: dict[str, object]) -> dict[str, object]:
+    if "hostility_present" not in values:
+        return {}
+    return {
+        "partisan_hostility": values.get("hostility_present") == "YES"
+        and values.get("target") == "OPPOSING_PARTISAN_TARGET"
+    }
+
+
 def _csv(records: list[dict[str, object]]) -> bytes:
     output = io.StringIO(newline="")
-    writer = csv.DictWriter(output, fieldnames=CSV_COLUMNS, lineterminator="\r\n")
+    include_partisan_hostility = any(
+        "partisan_hostility" in derived
+        for record in records
+        if isinstance((derived := record.get("derived_values")), dict)
+    )
+    columns = list(CSV_COLUMNS)
+    if include_partisan_hostility:
+        columns.append("partisan_hostility")
+    writer = csv.DictWriter(output, fieldnames=columns, lineterminator="\r\n")
     writer.writeheader()
     for record in records:
         speech = record["speech"]
         annotation = record["human_annotation"]
         assert isinstance(speech, dict)
         assert isinstance(annotation, dict)
-        writer.writerow(
-            {
+        row = {
                 "record_id": record["record_id"],
                 "turn_key": speech["turn_key"],
                 "speech_date": speech["date"],
@@ -133,7 +149,12 @@ def _csv(records: list[dict[str, object]]) -> bytes:
                     annotation["readable_fields"]
                 ),
             }
-        )
+        derived = record.get("derived_values")
+        if include_partisan_hostility and isinstance(derived, dict):
+            row["partisan_hostility"] = _plain_csv_value(
+                derived.get("partisan_hostility")
+            )
+        writer.writerow(row)
     return output.getvalue().encode("utf-8-sig")
 
 
@@ -180,6 +201,8 @@ def _simple_csv(
         annotation_columns.append(field_key)
         if field["taxonomy_version_id"] is not None:
             annotation_columns.append(f"{field_key}_label")
+    if any(str(field["field_key"]) == "hostility_present" for field in fields):
+        annotation_columns.append("partisan_hostility")
     provenance_columns = [
         "annotation_status",
         "annotation_revision",
@@ -230,6 +253,11 @@ def _simple_csv(
                 row[f"{field_key}_label"] = _label_csv_value(
                     readable.get(field_key)
                 )
+        derived = record.get("derived_values")
+        if "hostility_present" in values and isinstance(derived, dict):
+            row["partisan_hostility"] = _plain_csv_value(
+                derived.get("partisan_hostility")
+            )
         writer.writerow(row)
     return output.getvalue().encode("utf-8-sig")
 
@@ -447,6 +475,7 @@ def build_annotation_export(
                             values, fields, taxonomy_labels
                         ),
                     },
+                    "derived_values": _derived_annotation_values(values),
                     "sample": {"batch_name": row["batch_name"]},
                 }
             )

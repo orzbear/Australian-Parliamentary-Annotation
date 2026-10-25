@@ -14,6 +14,7 @@ SUPPORTED_TYPES = {
     "uncertainty",
     "short_text",
     "long_text",
+    "evidence_span",
 }
 
 
@@ -35,6 +36,7 @@ def validate_annotation(
     taxonomy_codes: dict[int, set[str]],
     *,
     submitting: bool,
+    authoritative_text: str | None = None,
 ) -> ValidationOutcome:
     definitions = {str(field["field_key"]): field for field in fields}
     unknown = sorted(set(payload) - set(definitions))
@@ -56,15 +58,17 @@ def validate_annotation(
                 continue
             value = raw.strip() if isinstance(raw, str) else None
             values[key] = value or None
-        elif field_type == "multiple_taxonomy":
+        elif field_type in {"multiple_taxonomy", "evidence_span"}:
             if raw is None:
                 values[key] = []
-            elif not isinstance(raw, list) or not all(
+            elif not isinstance(raw, list):
+                errors.setdefault(key, []).append("Must be a list")
+            elif field_type == "multiple_taxonomy" and not all(
                 isinstance(item, str) for item in raw
             ):
                 errors.setdefault(key, []).append("Must be a list of choices")
             else:
-                values[key] = [item for item in raw if item]
+                values[key] = [item for item in raw if item is not None]
         else:
             if raw is not None and not isinstance(raw, bool):
                 errors.setdefault(key, []).append("Must be true or false")
@@ -102,15 +106,24 @@ def validate_annotation(
                 errors.setdefault(key, []).append(
                     f"Select at least {minimum} choices"
                 )
-            if validation_rules.get("unique_items") and len(set(rule_value)) != len(rule_value):
+            is_taxonomy_list = field.get("field_type") == "multiple_taxonomy"
+            if (
+                is_taxonomy_list
+                and validation_rules.get("unique_items")
+                and len(set(rule_value)) != len(rule_value)
+            ):
                 errors.setdefault(key, []).append("Choices must be unique")
             excluded = set(validation_rules.get("excluded_codes", []))
-            if excluded.intersection(rule_value):
+            if is_taxonomy_list and excluded.intersection(rule_value):
                 errors.setdefault(key, []).append("Contains an excluded choice")
             other_key = validation_rules.get("different_from_field")
-            if other_key and values.get(str(other_key)) in rule_value:
+            if is_taxonomy_list and other_key and values.get(str(other_key)) in rule_value:
                 errors.setdefault(key, []).append(
                     "Must not repeat the primary choice"
+                )
+            if field.get("field_type") == "evidence_span":
+                _validate_evidence_spans(
+                    key, rule_value, authoritative_text, errors
                 )
         null_unless = requirement_rules.get("null_unless")
         if null_unless and not _condition_matches(null_unless, values) and _present(rule_value):
@@ -198,6 +211,44 @@ def validate_annotation(
 
 def _present(value: object) -> bool:
     return value not in (None, "", [])
+
+
+def _validate_evidence_spans(
+    key: str,
+    spans: list[object],
+    authoritative_text: str | None,
+    errors: dict[str, list[str]],
+) -> None:
+    previous_end = -1
+    for span in spans:
+        if not isinstance(span, dict) or set(span) != {
+            "start_offset",
+            "end_offset",
+            "text",
+        }:
+            errors.setdefault(key, []).append("Contains a malformed evidence span")
+            continue
+        start = span.get("start_offset")
+        end = span.get("end_offset")
+        text = span.get("text")
+        if (
+            not isinstance(start, int)
+            or isinstance(start, bool)
+            or not isinstance(end, int)
+            or isinstance(end, bool)
+            or not isinstance(text, str)
+            or start < 0
+            or end <= start
+        ):
+            errors.setdefault(key, []).append("Contains invalid evidence offsets")
+            continue
+        if start < previous_end:
+            errors.setdefault(key, []).append("Evidence spans must not overlap")
+        previous_end = end
+        if authoritative_text is None or end > len(authoritative_text):
+            errors.setdefault(key, []).append("Evidence is outside the speech text")
+        elif authoritative_text[start:end] != text:
+            errors.setdefault(key, []).append("Evidence text does not match the speech")
 
 
 def _condition_matches(condition: object, values: dict[str, object]) -> bool:

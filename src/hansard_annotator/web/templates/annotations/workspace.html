@@ -25,7 +25,8 @@
         <span>question time: {{ assignment.is_question_time if assignment.is_question_time is not none else 'unknown' }}</span>
       </div>
     </div>
-    <div class="speech-text">{{ assignment.text_clean }}</div>
+    <div class="mt-3 flex justify-end"><button class="btn btn-quiet" type="button" data-copy-speech>Copy full speech</button><span class="ml-2 self-center text-sm text-muted" data-copy-feedback aria-live="polite"></span></div>
+    <div class="speech-text" data-speech-text>{{ assignment.text_clean }}</div>
     <details class="provenance">
       <summary>Source and technical provenance</summary>
       <dl class="metadata mt-3">
@@ -47,7 +48,7 @@
       <div class="annotation-fields">
       {% for field in fields %}
         {% set current = values.get(field.field_key) %}
-        <fieldset class="field-wrap {% if errors.get(field.field_key) %}field-error{% endif %}" data-field="{{ field.field_key }}">
+        <fieldset class="field-wrap {% if errors.get(field.field_key) %}field-error{% endif %}" data-field="{{ field.field_key }}"{% if field.visibility_rules.get('allowed_when') %} data-visible-when='{{ field.visibility_rules.get("allowed_when") | tojson }}'{% endif %}>
           <legend>{{ field.label }}{% if field.required %}<span aria-hidden="true"> *</span>{% endif %}</legend>
           <p class="help">{{ field.help_text }}</p>
           {% if field.field_type == 'single_taxonomy' %}
@@ -76,6 +77,11 @@
             <input name="{{ field.field_key }}" value="{{ current or '' }}" maxlength="500">
           {% elif field.field_type == 'long_text' %}
             <textarea name="{{ field.field_key }}" rows="4" maxlength="5000">{{ current or '' }}</textarea>
+          {% elif field.field_type == 'evidence_span' %}
+            <input type="hidden" name="{{ field.field_key }}" value='{{ (current or []) | tojson }}' data-evidence-input>
+            <button class="btn btn-secondary mt-3" type="button" data-add-evidence>Add selected text as evidence</button>
+            <p class="help mt-2" data-evidence-feedback aria-live="polite">Select text in the speech, then add it as evidence.</p>
+            <ol class="mt-3 space-y-2" data-evidence-list></ol>
           {% else %}<div class="alert alert-error">Unsupported field type: {{ field.field_type }}</div>{% endif %}
           {% for message in errors.get(field.field_key, []) %}<p class="error-text">{{ message }}</p>{% endfor %}
         </fieldset>

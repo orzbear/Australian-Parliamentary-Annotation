@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Annotated, Any, cast
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
@@ -158,7 +159,14 @@ async def _annotation_payload(
     for field in fields:
         key = str(field["field_key"])
         field_type = str(field["field_type"])
-        if field_type == "multiple_taxonomy":
+        if field_type == "evidence_span":
+            raw = form.get(key)
+            try:
+                decoded = json.loads(str(raw or "[]"))
+            except json.JSONDecodeError:
+                decoded = None
+            payload[key] = decoded
+        elif field_type == "multiple_taxonomy":
             payload[key] = [str(item) for item in form.getlist(key)]
         elif field_type in {"boolean", "uncertainty"}:
             raw_values = [str(item).lower() for item in form.getlist(key)]
@@ -188,7 +196,14 @@ async def _payload_for_fields(request: Request, fields: list[dict[str, Any]]) ->
     for field in fields:
         key = str(field["field_key"])
         field_type = str(field["field_type"])
-        if field_type == "multiple_taxonomy":
+        if field_type == "evidence_span":
+            raw = form.get(key)
+            try:
+                decoded = json.loads(str(raw or "[]"))
+            except json.JSONDecodeError:
+                decoded = None
+            payload[key] = decoded
+        elif field_type == "multiple_taxonomy":
             payload[key] = [str(item) for item in form.getlist(key)]
         elif field_type in {"boolean", "uncertainty"}:
             raw_values = [str(item).lower() for item in form.getlist(key)]

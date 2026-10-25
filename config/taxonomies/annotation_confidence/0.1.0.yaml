@@ -1,0 +1,14 @@
+slug: annotation_confidence
+name: Annotation confidence
+description: Coder confidence in an annotation decision.
+taxonomy_type: hostility_scale
+jurisdiction: AU
+language_code: en
+owner_scope: project
+version: 0.1.0
+status: draft
+version_description: Initial three-level confidence scale.
+labels:
+  - {code: HIGH, label: High, short_definition: Clear decision with little material ambiguity., display_order: 1, is_active: true, is_analytical: true, is_fallback: false, requires_review: false}
+  - {code: MEDIUM, label: Medium, short_definition: Reasonable decision with some ambiguity., display_order: 2, is_active: true, is_analytical: true, is_fallback: false, requires_review: false}
+  - {code: LOW, label: Low, short_definition: Difficult decision with substantial ambiguity., display_order: 3, is_active: true, is_analytical: true, is_fallback: false, requires_review: true}

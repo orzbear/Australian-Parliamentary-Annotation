@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -309,8 +310,11 @@ def test_correction_controls_are_opt_in_and_secondary_actions_precede_accept() -
     base = (ROOT / "src/hansard_annotator/web/templates/base.html").read_text(
         encoding="utf-8"
     )
-    assert "app.css?v=20261015-campaign-ux-2" in base
-    assert "app.js?v=20261015-campaign-ux-2" in base
+    asset_versions = re.findall(r"(?:app\.css|app\.js)\?v=([^\"']+)", base)
+    assert asset_versions == [
+        "20261024-hostility-evidence-2",
+        "20261024-hostility-evidence-2",
+    ]
 
 
 def test_ai_review_run_cards_are_human_readable_and_keep_technical_identity() -> None:
