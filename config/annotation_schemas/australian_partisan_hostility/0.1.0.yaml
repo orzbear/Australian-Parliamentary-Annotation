@@ -1,0 +1,94 @@
+slug: australian_partisan_hostility
+name: Australian Targeted Partisan Hostility
+description: Human coding of targeted hostility and whether its target is a partisan out-group.
+schema_type: content_coding
+version: 0.1.0
+status: draft
+version_description: Initial targeted partisan hostility human-annotation schema.
+fields:
+  - field_key: hostility_present
+    label: Hostility present
+    help_text: Does the speaker endorse targeted negative affect, blame, accusation, ridicule, condemnation, contempt, delegitimizing criticism, or other clearly adversarial rhetoric toward an identifiable target? Exclude ordinary policy disagreement, negative outcomes without a target, untargeted emotion, and unendorsed quoted or reported hostility.
+    field_type: single_taxonomy
+    display_order: 1
+    required: true
+    taxonomy: {slug: hostility_presence, version: 0.1.0}
+  - field_key: target_type
+    label: Target type
+    help_text: Choose the type of identifiable target.
+    field_type: single_taxonomy
+    display_order: 2
+    required: false
+    taxonomy: {slug: hostility_target_type, version: 0.1.0}
+    visibility_rules: {allowed_when: {field_not_equals: {field: hostility_present, value: "NO"}}}
+    requirement_rules:
+      required_when: {field_equals: {field: hostility_present, value: "YES"}}
+      null_unless: {field_not_equals: {field: hostility_present, value: "NO"}}
+  - field_key: target_text
+    label: Target text
+    help_text: Briefly identify the person, party, bloc, institution, policy, group, or actor targeted.
+    field_type: short_text
+    display_order: 3
+    required: false
+    visibility_rules: {allowed_when: {field_not_equals: {field: hostility_present, value: "NO"}}}
+    requirement_rules:
+      required_when: {field_equals: {field: hostility_present, value: "YES"}}
+      null_unless: {field_not_equals: {field: hostility_present, value: "NO"}}
+  - field_key: partisan_target
+    label: Partisan target
+    help_text: Is the hostility directed toward an opposing party, opposing-party politician, government bloc, opposition bloc, or other partisan political out-group? Do not count a policy alone, external actor, social group, non-partisan agency, or the speaker's own party without out-group framing.
+    field_type: single_taxonomy
+    display_order: 4
+    required: false
+    taxonomy: {slug: hostility_presence, version: 0.1.0}
+    visibility_rules: {allowed_when: {field_not_equals: {field: hostility_present, value: "NO"}}}
+    requirement_rules:
+      required_when: {field_equals: {field: hostility_present, value: "YES"}}
+      null_unless: {field_not_equals: {field: hostility_present, value: "NO"}}
+  - field_key: hostility_type
+    label: Hostility type
+    help_text: Optionally select one or more supporting descriptions of the hostility.
+    field_type: multiple_taxonomy
+    display_order: 5
+    required: false
+    taxonomy: {slug: hostility_type, version: 0.1.0}
+    minimum_items: 0
+    maximum_items: 8
+    validation_rules: {unique_items: true}
+    visibility_rules: {allowed_when: {field_not_equals: {field: hostility_present, value: "NO"}}}
+    requirement_rules: {null_unless: {field_not_equals: {field: hostility_present, value: "NO"}}}
+  - field_key: confidence
+    label: Confidence
+    help_text: How confident are you in the hostility decision?
+    field_type: single_taxonomy
+    display_order: 6
+    required: true
+    taxonomy: {slug: annotation_confidence, version: 0.1.0}
+  - field_key: boundary_case
+    label: Boundary case
+    help_text: Mark decisions that expose a useful boundary in the codebook.
+    field_type: boolean
+    display_order: 7
+    required: true
+    validation_rules: {default: false}
+    ui_hints: {control: checkbox, checked_label: This is a boundary case}
+  - field_key: boundary_case_note
+    label: Boundary-case note
+    help_text: Explain why this case sits near a coding boundary.
+    field_type: long_text
+    display_order: 8
+    required: false
+    visibility_rules: {allowed_when: {field_equals: {field: boundary_case, value: true}}}
+    requirement_rules:
+      required_when: {field_equals: {field: boundary_case, value: true}}
+      null_unless: {field_equals: {field: boundary_case, value: true}}
+  - field_key: evidence_span
+    label: Evidence span
+    help_text: Copy the exact phrase or sentence that supports the hostility judgment.
+    field_type: evidence_span
+    display_order: 9
+    required: false
+    visibility_rules: {allowed_when: {field_not_equals: {field: hostility_present, value: "NO"}}}
+    requirement_rules:
+      required_when: {field_not_equals: {field: hostility_present, value: "NO"}}
+      null_unless: {field_not_equals: {field: hostility_present, value: "NO"}}

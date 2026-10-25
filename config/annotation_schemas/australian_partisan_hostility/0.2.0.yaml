@@ -1,0 +1,37 @@
+slug: australian_partisan_hostility
+name: Australian Targeted Partisan Hostility
+description: Human coding of targeted hostility and whether its target is a partisan out-group.
+schema_type: content_coding
+version: 0.2.0
+status: draft
+version_description: Simplified hostility decision, target relationship, and canonical-text evidence spans.
+fields:
+  - field_key: hostility_present
+    label: Hostility present
+    help_text: YES for targeted negative affect, blame, accusation, ridicule, contempt, condemnation, competence or integrity attack, delegitimizing criticism, or clearly adversarial negative rhetoric toward an identifiable target. Exclude ordinary policy disagreement, negative consequences without an attacked actor, untargeted emotion, unendorsed quotations, and neutral or procedural disagreement.
+    field_type: single_taxonomy
+    display_order: 1
+    required: true
+    taxonomy: {slug: hostility_presence, version: 0.1.0}
+  - field_key: target
+    label: Target relationship
+    help_text: Classify the target's relationship to the speaker's partisan position.
+    field_type: single_taxonomy
+    display_order: 2
+    required: false
+    taxonomy: {slug: hostility_target, version: 0.2.0}
+    visibility_rules: {allowed_when: {field_not_equals: {field: hostility_present, value: "NO"}}}
+    requirement_rules:
+      required_when: {field_not_equals: {field: hostility_present, value: "NO"}}
+      null_unless: {field_not_equals: {field: hostility_present, value: "NO"}}
+  - field_key: evidence_span
+    label: Evidence
+    help_text: Select one or more exact passages in the speech that support the hostility decision or explain the uncertainty.
+    field_type: evidence_span
+    display_order: 3
+    required: false
+    visibility_rules: {allowed_when: {field_not_equals: {field: hostility_present, value: "NO"}}}
+    requirement_rules:
+      required_when: {field_not_equals: {field: hostility_present, value: "NO"}}
+      null_unless: {field_not_equals: {field: hostility_present, value: "NO"}}
+    ui_hints: {offset_convention: python_unicode_code_points_half_open}

@@ -9,6 +9,7 @@ import os
 import secrets
 import string
 import sys
+from pathlib import Path
 from typing import Any
 
 import psycopg
@@ -23,6 +24,10 @@ from hansard_annotator.web.auth.service import (
 )
 from hansard_annotator.web.config import WebSettings
 from hansard_annotator.web.projects.service import create_project, transition_project
+from hansard_annotator.web.tasks.frozen_samples import (
+    create_batch_from_frozen_sample,
+    load_frozen_sample,
+)
 from hansard_annotator.web.tasks.schemas import SelectionCriteria
 from hansard_annotator.web.tasks.service import generate_batch
 
@@ -56,6 +61,12 @@ def parser() -> argparse.ArgumentParser:
     prototype.add_argument("--admin-username", required=True)
     prototype.add_argument("--task-count", type=int, default=50)
     prototype.add_argument("--seed", type=int, default=20260810)
+    frozen = commands.add_parser("create-batch-from-frozen-sample")
+    frozen.add_argument("--admin-username", required=True)
+    frozen.add_argument("--project-slug", required=True)
+    frozen.add_argument("--sample-id", required=True)
+    frozen.add_argument("--sample-file", type=Path, required=True)
+    frozen.add_argument("--batch-name")
     return result
 
 
@@ -92,9 +103,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         settings = WebSettings.from_environment()
         if arguments.command == "create-user":
-            password, generated = _password(
-                arguments, settings.minimum_password_length
-            )
+            password, generated = _password(arguments, settings.minimum_password_length)
             user = create_user(
                 settings,
                 arguments.username,
@@ -115,9 +124,7 @@ def main(argv: list[str] | None = None) -> int:
             _json(output)
             return 0
         if arguments.command == "list-users":
-            with psycopg.connect(
-                settings.database.psycopg_url, row_factory=dict_row
-            ) as connection:
+            with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
                 rows = connection.execute(
                     """
                     SELECT public_id,username,email,display_name,status,
@@ -127,15 +134,30 @@ def main(argv: list[str] | None = None) -> int:
                 ).fetchall()
             _json([dict(row) for row in rows])
             return 0
+        if arguments.command == "create-batch-from-frozen-sample":
+            admin_row = _admin_principal(settings, arguments.admin_username)
+            sample = load_frozen_sample(arguments.sample_file, arguments.sample_id)
+            with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
+                project = connection.execute(
+                    "SELECT id FROM projects WHERE slug=%s",
+                    (arguments.project_slug,),
+                ).fetchone()
+            if project is None:
+                raise ValueError("project does not exist")
+            batch = create_batch_from_frozen_sample(
+                settings,
+                admin_row,
+                int(str(project["id"])),
+                sample,
+                batch_name=arguments.batch_name,
+            )
+            _json({"ok": True, **batch})
+            return 0
         if arguments.command == "seed-development":
             if settings.environment == "production":
                 raise ValueError("development seeding is forbidden in production")
-            admin_row = _admin_principal(
-                settings, arguments.admin_username
-            )
-            with psycopg.connect(
-                settings.database.psycopg_url, row_factory=dict_row
-            ) as connection:
+            admin_row = _admin_principal(settings, arguments.admin_username)
+            with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
                 existing = connection.execute(
                     "SELECT id,status FROM projects WHERE slug=%s",
                     (arguments.project_slug,),
@@ -201,9 +223,7 @@ def main(argv: list[str] | None = None) -> int:
             if settings.environment == "production":
                 raise ValueError("development seeding is forbidden in production")
             admin_row = _admin_principal(settings, arguments.admin_username)
-            with psycopg.connect(
-                settings.database.psycopg_url, row_factory=dict_row
-            ) as connection:
+            with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
                 pins = connection.execute(
                     """
                     SELECT c.id AS corpus_id,pr.id AS run_id,
@@ -247,9 +267,7 @@ def main(argv: list[str] | None = None) -> int:
                     admin_row,
                     slug="conference-general-pass",
                     name="Conference general policy pass",
-                    description=(
-                        "Streamlined policy-by-default general-domain annotation."
-                    ),
+                    description=("Streamlined policy-by-default general-domain annotation."),
                     mode="development",
                     corpus_id=pins["corpus_id"],
                     preprocessing_run_id=pins["run_id"],
@@ -279,9 +297,7 @@ def main(argv: list[str] | None = None) -> int:
                     admin_row,
                     slug="conference-aukus-pass",
                     name="Conference AUKUS second pass",
-                    description=(
-                        "AUKUS-only screen derived from submitted AU12 general labels."
-                    ),
+                    description=("AUKUS-only screen derived from submitted AU12 general labels."),
                     mode="development",
                     corpus_id=pins["corpus_id"],
                     preprocessing_run_id=pins["run_id"],
@@ -298,18 +314,14 @@ def main(argv: list[str] | None = None) -> int:
                     "general_project_id": general_id,
                     "aukus_project_id": aukus_id,
                     "general_task_count_requested": arguments.task_count,
-                    "aukus_tasks": (
-                        "Generate after AU12 general submissions are available"
-                    ),
+                    "aukus_tasks": ("Generate after AU12 general submissions are available"),
                     "development_only": True,
                 }
             )
             return 0
         user = _user(settings, arguments.username)
         if arguments.command == "reset-password":
-            password, generated = _password(
-                arguments, settings.minimum_password_length
-            )
+            password, generated = _password(arguments, settings.minimum_password_length)
             change_password(
                 settings,
                 int(str(user["id"])),

@@ -1,0 +1,19 @@
+slug: hostility_type
+name: Hostility type
+description: Supporting categories describing the form of targeted hostility.
+taxonomy_type: hostility_scale
+jurisdiction: AU
+language_code: en
+owner_scope: project
+version: 0.1.0
+status: draft
+version_description: Initial hostility-form categories.
+labels:
+  - {code: POLICY_PERFORMANCE, label: Policy performance, short_definition: Criticism of policy or governing performance., display_order: 1, is_active: true, is_analytical: true, is_fallback: false, requires_review: false}
+  - {code: COMPETENCE, label: Competence, short_definition: "Claims of incapacity, failure, or incompetence.", display_order: 2, is_active: true, is_analytical: true, is_fallback: false, requires_review: false}
+  - {code: DISHONESTY_INTEGRITY, label: Dishonesty or integrity, short_definition: "Allegations of lying, corruption, hypocrisy, or bad faith.", display_order: 3, is_active: true, is_analytical: true, is_fallback: false, requires_review: false}
+  - {code: MORAL_CONDEMNATION, label: Moral condemnation, short_definition: Moral blame or condemnation of the target., display_order: 4, is_active: true, is_analytical: true, is_fallback: false, requires_review: false}
+  - {code: RIDICULE_CONTEMPT, label: Ridicule or contempt, short_definition: "Mockery, derision, scorn, or contempt.", display_order: 5, is_active: true, is_analytical: true, is_fallback: false, requires_review: false}
+  - {code: LEGITIMACY, label: Legitimacy, short_definition: Challenges to the target's legitimacy or right to act., display_order: 6, is_active: true, is_analytical: true, is_fallback: false, requires_review: false}
+  - {code: BLAME, label: Blame, short_definition: Attribution of fault or responsibility., display_order: 7, is_active: true, is_analytical: true, is_fallback: false, requires_review: false}
+  - {code: OTHER, label: Other, short_definition: Another form of targeted hostility., display_order: 8, is_active: true, is_analytical: false, is_fallback: true, requires_review: false}
