@@ -22,6 +22,7 @@ class EvaluationPackage:
     context: dict[str, Any]
     records: tuple[dict[str, Any], ...]
     domain_codes: tuple[str, ...]
+    task: str = "policy"
 
     @property
     def schema(self) -> dict[str, Any]:
@@ -113,8 +114,32 @@ def load_evaluation_package(path: Path) -> EvaluationPackage:
         if not isinstance(labels, list):
             raise ValueError("policy-domain taxonomy labels must be a list")
         domain_codes = [str(_object(label, "taxonomy label")["code"]) for label in labels]
-    if not domain_codes:
+    schema_slug = str(schema["slug"])
+    task = "hostility" if schema_slug == "australian_partisan_hostility" else "policy"
+    if task == "policy" and not domain_codes:
         raise ValueError("Australian policy-domain taxonomy is missing")
+    if task == "hostility":
+        field_keys = {
+            str(_object(field, "schema field").get("field_key")) for field in schema["fields"]
+        }
+        if field_keys != {"hostility_present", "target", "evidence_span"}:
+            raise ValueError("hostility schema fields are missing or incompatible")
+        taxonomy_codes = {
+            str(taxonomy["slug"]): {
+                str(_object(label, "taxonomy label")["code"])
+                for label in taxonomy.get("labels", [])
+            }
+            for taxonomy in (_object(value, "taxonomy") for value in taxonomies)
+        }
+        if taxonomy_codes.get("hostility_presence") != {"YES", "NO", "UNSURE"}:
+            raise ValueError("hostility presence taxonomy is missing or incompatible")
+        if taxonomy_codes.get("hostility_target") != {
+            "OPPOSING_PARTISAN_TARGET",
+            "OTHER_POLITICAL_TARGET",
+            "NON_POLITICAL_TARGET",
+            "UNSURE",
+        }:
+            raise ValueError("hostility target taxonomy is missing or incompatible")
     records = tuple(_json_lines(files["annotations.jsonl"]))
     if manifest.get("record_count") != len(records):
         raise ValueError("manifest record_count does not match annotations.jsonl")
@@ -132,9 +157,61 @@ def load_evaluation_package(path: Path) -> EvaluationPackage:
         canonical = json.dumps(values, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         if human.get("values_sha256") != _sha256(canonical.encode("utf-8")):
             raise ValueError(f"record {record_id} human annotation hash mismatch")
-        if not isinstance(values.get("is_non_policy"), bool):
-            raise ValueError(f"record {record_id} has invalid is_non_policy")
-        primary = values.get("primary_australian_domain")
-        if primary is not None and primary not in domain_codes:
-            raise ValueError(f"record {record_id} has an unknown primary domain")
-    return EvaluationPackage(path, manifest, context, records, tuple(domain_codes))
+        if task == "policy":
+            if not isinstance(values.get("is_non_policy"), bool):
+                raise ValueError(f"record {record_id} has invalid is_non_policy")
+            primary = values.get("primary_australian_domain")
+            if primary is not None and primary not in domain_codes:
+                raise ValueError(f"record {record_id} has an unknown primary domain")
+        else:
+            _validate_hostility_values(record_id, values, str(speech["text"]))
+    if task == "hostility":
+        if schema.get("version") != "0.2.0":
+            raise ValueError("hostility evaluation requires schema version 0.2.0")
+        corpus = _object(manifest.get("corpus"), "manifest corpus")
+        if corpus.get("run_name") != "phase1-full-20260723-v4":
+            raise ValueError("hostility package has unexpected corpus run")
+    return EvaluationPackage(path, manifest, context, records, tuple(domain_codes), task)
+
+
+def _validate_hostility_values(record_id: str, values: dict[str, Any], text: str) -> None:
+    if set(values) != {"hostility_present", "target", "evidence_span"}:
+        raise ValueError(f"record {record_id} has invalid hostility fields")
+    presence, target, spans = (
+        values["hostility_present"],
+        values["target"],
+        values["evidence_span"],
+    )
+    if presence not in {"YES", "NO", "UNSURE"}:
+        raise ValueError(f"record {record_id} has invalid hostility_present")
+    allowed_targets = {
+        "OPPOSING_PARTISAN_TARGET",
+        "OTHER_POLITICAL_TARGET",
+        "NON_POLITICAL_TARGET",
+        "UNSURE",
+    }
+    if presence == "NO" and target is not None:
+        raise ValueError(f"record {record_id} NO label must have null target")
+    if presence != "NO" and target not in allowed_targets:
+        raise ValueError(f"record {record_id} has invalid hostility target")
+    if (
+        not isinstance(spans, list)
+        or (presence == "NO" and spans)
+        or (presence != "NO" and not spans)
+    ):
+        raise ValueError(f"record {record_id} has invalid hostility evidence cardinality")
+    for span in spans:
+        value = _object(span, f"record {record_id} evidence span")
+        start, end, evidence = value.get("start_offset"), value.get("end_offset"), value.get("text")
+        if (
+            not isinstance(start, int)
+            or isinstance(start, bool)
+            or not isinstance(end, int)
+            or isinstance(end, bool)
+            or not isinstance(evidence, str)
+            or start < 0
+            or end <= start
+            or end > len(text)
+            or text[start:end] != evidence
+        ):
+            raise ValueError(f"record {record_id} has invalid hostility evidence offsets/text")

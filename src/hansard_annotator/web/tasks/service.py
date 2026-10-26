@@ -504,6 +504,23 @@ def set_assignment_outcome(
 HUMAN_WORK_FILTERS = {"to_annotate", "in_progress", "completed", "skipped", "all"}
 
 
+def _applicable_human_work_filters(
+    field_keys: set[str], policy_status: str | None, primary_domain: str | None
+) -> tuple[str | None, str | None, bool, bool]:
+    supports_policy_status = bool(
+        {"is_non_policy", "content_status"}.intersection(field_keys)
+    )
+    supports_primary_domain = "primary_australian_domain" in field_keys
+    if supports_policy_status and policy_status not in {None, "policy", "non_policy"}:
+        raise ValueError("invalid policy status filter")
+    return (
+        policy_status if supports_policy_status else None,
+        primary_domain if supports_primary_domain else None,
+        supports_policy_status,
+        supports_primary_domain,
+    )
+
+
 def _human_work_cte() -> str:
     return """
         WITH human_work AS (
@@ -529,7 +546,8 @@ def _human_work_cte() -> str:
                           THEN 'policy' ELSE 'non_policy' END
                    ELSE NULL
                  END AS policy_status,
-                 av.values->>'primary_australian_domain' AS primary_domain
+                 av.values->>'primary_australian_domain' AS primary_domain,
+                 av.values->>'hostility_present' AS hostility_present
           FROM assignments a JOIN tasks t ON t.id=a.task_id
           JOIN speaker_turns st ON st.id=t.speaker_turn_id
           LEFT JOIN users u ON u.id=a.user_id
@@ -557,8 +575,6 @@ def human_annotation_work(
     """Return scoped counts plus one bounded page of Human Annotation work."""
     if status not in HUMAN_WORK_FILTERS:
         raise ValueError("invalid Human Annotation status filter")
-    if policy_status not in {None, "policy", "non_policy"}:
-        raise ValueError("invalid policy status filter")
     if page < 1 or page_size < 1 or page_size > 100:
         raise ValueError("invalid pagination")
     cleaned_domain = (primary_domain or "").strip() or None
@@ -566,6 +582,22 @@ def human_annotation_work(
     cleaned_query = (query or "").strip() or None
     with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
         project_role = require_project_role(connection, principal, project_id, VIEW_ROLES)
+        field_rows = connection.execute(
+            """
+            SELECT field.field_key FROM projects project
+            JOIN annotation_field_definitions field
+              ON field.annotation_schema_version_id=project.annotation_schema_version_id
+            WHERE project.id=%s AND field.is_active
+            """,
+            (project_id,),
+        ).fetchall()
+        field_keys = {str(row["field_key"]) for row in field_rows}
+        (
+            policy_status,
+            cleaned_domain,
+            supports_policy_status,
+            supports_primary_domain,
+        ) = _applicable_human_work_filters(field_keys, policy_status, cleaned_domain)
         own_only = project_role == "annotator"
         base_parameters: tuple[object, ...] = (
             project_id,
@@ -654,6 +686,8 @@ def human_annotation_work(
         "annotator": cleaned_annotator,
         "query": cleaned_query,
         "domain_labels": [dict(row) for row in domain_labels],
+        "supports_policy_status": supports_policy_status,
+        "supports_primary_domain": supports_primary_domain,
     }
 
 
@@ -683,8 +717,17 @@ def _version_summary(values: dict[str, object]) -> dict[str, object]:
         )
     else:
         policy_label = "Not applicable"
+    hostility = values.get("hostility_present")
     return {
         "policy_label": policy_label,
+        "has_policy_summary": policy_label != "Not applicable",
+        "summary_label": (
+            policy_label
+            if policy_label != "Not applicable"
+            else f"Hostility: {hostility}"
+            if hostility
+            else "Annotation"
+        ),
         "primary_domain": values.get("primary_australian_domain"),
         "secondary_domains": values.get("secondary_australian_domains") or [],
     }

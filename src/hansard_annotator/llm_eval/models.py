@@ -20,6 +20,17 @@ class StructuredPrediction:
 
 
 @dataclass(frozen=True)
+class HostilityPrediction:
+    hostility_present: str
+    target: str
+    evidence_spans: tuple[dict[str, object], ...] = ()
+    reasoning: str = ""
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class TokenUsage:
     input_tokens: int | None = None
     cached_input_tokens: int | None = None
@@ -43,7 +54,7 @@ class ProviderResponse:
 class RequestResult:
     record_id: str
     status: Status
-    prediction: StructuredPrediction | None
+    prediction: StructuredPrediction | HostilityPrediction | None
     usage: TokenUsage
     latency_ms: int
     retry_count: int

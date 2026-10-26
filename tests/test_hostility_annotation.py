@@ -8,6 +8,10 @@ from typing import Any
 from hansard_annotator.product.seeds import load_annotation_schema_seed, load_taxonomy_seed
 from hansard_annotator.web.annotations.validation import validate_annotation
 from hansard_annotator.web.exports.service import _derived_annotation_values, _simple_csv
+from hansard_annotator.web.tasks.service import (
+    _applicable_human_work_filters,
+    _version_summary,
+)
 
 ROOT = Path(__file__).parents[1]
 SCHEMA = ROOT / "config/annotation_schemas/australian_partisan_hostility/0.2.0.yaml"
@@ -137,6 +141,37 @@ def test_workspace_supports_highlight_restore_removal_and_exact_copy() -> None:
     assert "v=20261024-hostility-evidence-2" in base
     assert script.index('copyButton?.addEventListener("click", copySpeech)') < script.index("if (!form) return")
     assert "innerHTML" not in script
+
+
+def test_hostility_project_hides_and_ignores_policy_queue_filters() -> None:
+    detail = (ROOT / "src/hansard_annotator/web/templates/projects/detail.html").read_text(
+        encoding="utf-8"
+    )
+    assert "{% if human_work.supports_policy_status %}" in detail
+    assert "{% if human_work.supports_primary_domain %}" in detail
+    assert "Hostility {{ row.hostility_present }}" in detail
+    assert _applicable_human_work_filters(
+        {"hostility_present", "target", "evidence_span"},
+        "policy",
+        "AU12",
+    ) == (None, None, False, False)
+
+
+def test_policy_queue_filters_and_revision_summaries_remain_available() -> None:
+    assert _applicable_human_work_filters(
+        {"is_non_policy", "primary_australian_domain"},
+        "non_policy",
+        "AU12",
+    ) == ("non_policy", "AU12", True, True)
+    assert _version_summary({"is_non_policy": False})["summary_label"] == "Policy"
+    hostility = _version_summary({"hostility_present": "UNSURE"})
+    assert hostility["summary_label"] == "Hostility: UNSURE"
+    assert hostility["has_policy_summary"] is False
+    for template_name in ("detail.html", "history.html"):
+        template = (
+            ROOT / "src/hansard_annotator/web/templates/annotations" / template_name
+        ).read_text(encoding="utf-8")
+        assert "has_policy_summary" in template
 
 
 def test_partisan_hostility_derivation_and_simplified_csv() -> None:

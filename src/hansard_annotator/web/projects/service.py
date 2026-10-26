@@ -342,9 +342,13 @@ def get_project(
                 WHEN av.values ? 'discusses_aukus' THEN
                   CASE WHEN (av.values->>'discusses_aukus')::boolean
                        THEN 'AUKUS discussion' ELSE 'Not AUKUS' END
+                WHEN av.values ? 'hostility_present'
+                  THEN 'Hostility ' || (av.values->>'hostility_present')
                 WHEN COALESCE((av.values->>'is_non_policy')::boolean,false)
                   THEN 'Entirely non-policy'
-                ELSE COALESCE(av.values->>'primary_australian_domain','Policy')
+                WHEN av.values ? 'primary_australian_domain'
+                  THEN COALESCE(av.values->>'primary_australian_domain','Policy')
+                ELSE 'Submitted annotation'
               END AS distribution_label,
               CASE WHEN av.values ? 'secondary_australian_domains'
                    THEN 'General-domain pass' ELSE NULL END AS distribution_detail,

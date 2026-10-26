@@ -13,6 +13,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from hansard_annotator.llm_eval.hostility import (
+    prediction_json_schema as hostility_prediction_json_schema,
+)
+from hansard_annotator.llm_eval.hostility import (
+    validate_prediction as validate_hostility_prediction,
+)
 from hansard_annotator.llm_eval.models import RequestResult, TokenUsage
 from hansard_annotator.llm_eval.package import EvaluationPackage
 from hansard_annotator.llm_eval.prompt import (
@@ -45,6 +51,7 @@ class RunConfiguration:
     provider_prediction_schema_sha256: str | None = None
     inclusion_record_count: int = 0
     inclusion_set_sha256: str | None = None
+    prediction_contract_sha256: str | None = None
 
     def identity(self) -> str:
         values = asdict(self)
@@ -56,6 +63,8 @@ class RunConfiguration:
         if self.inclusion_record_count == 0 and self.inclusion_set_sha256 is None:
             values.pop("inclusion_record_count")
             values.pop("inclusion_set_sha256")
+        if self.prediction_contract_sha256 is None:
+            values.pop("prediction_contract_sha256")
         payload = json.dumps(values, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -82,7 +91,14 @@ def make_configuration(
 ) -> tuple[RunConfiguration, str]:
     system = build_system_prompt(package.context, prompt_version)
     schema = package.schema
-    prediction_schema = prediction_json_schema(package.domain_codes)
+    prediction_schema = (
+        hostility_prediction_json_schema()
+        if package.task == "hostility"
+        else prediction_json_schema(package.domain_codes)
+    )
+    contract_hash = hashlib.sha256(
+        json.dumps(prediction_schema, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     return RunConfiguration(
         provider,
         model,
@@ -101,6 +117,7 @@ def make_configuration(
         ),
         inclusion_record_count,
         inclusion_set_sha256,
+        contract_hash if package.task == "hostility" else None,
     ), system
 
 
@@ -200,7 +217,11 @@ def evaluate(
     initialise_run(output, configuration, resume=resume)
     checkpoint_path = output / "predictions.jsonl"
     checkpoints = load_checkpoints(checkpoint_path)
-    schema = prediction_json_schema(package.domain_codes)
+    schema = (
+        hostility_prediction_json_schema()
+        if package.task == "hostility"
+        else prediction_json_schema(package.domain_codes)
+    )
     with checkpoint_path.open("a", encoding="utf-8", newline="\n") as destination:
         for record in records:
             record_id = str(record["record_id"])
@@ -253,7 +274,13 @@ def evaluate(
                 )
             else:
                 try:
-                    prediction = validate_prediction(response.raw_prediction, package.domain_codes)
+                    prediction = (
+                        validate_hostility_prediction(
+                            response.raw_prediction, str(record["speech"]["text"])
+                        )
+                        if package.task == "hostility"
+                        else validate_prediction(response.raw_prediction, package.domain_codes)
+                    )
                     result = RequestResult(
                         record_id,
                         "success",

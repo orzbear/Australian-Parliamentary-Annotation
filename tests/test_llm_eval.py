@@ -320,9 +320,7 @@ def test_model_specific_pricing_metadata_is_reported() -> None:
         ("openai", "gpt-5.4-mini", 0.75),
     ),
 )
-def test_final_candidate_pricing_is_recognized(
-    provider: str, model: str, expected: float
-) -> None:
+def test_final_candidate_pricing_is_recognized(provider: str, model: str, expected: float) -> None:
     pricing = load_pricing(Path("config/llm_eval/pricing.yaml"))
     report = aggregate_costs(
         [{"status": "success", "usage": {"input_tokens": 1_000_000}}],
@@ -363,9 +361,7 @@ def test_incremental_resume_retry_and_incompatible_configuration(tmp_path: Path)
     output = tmp_path / "run"
     provider = FakeProvider(
         failures=1,
-        error=ProviderError(
-            "billed retry", usage=TokenUsage(5, 1, 0, 2, 7), retryable=True
-        ),
+        error=ProviderError("billed retry", usage=TokenUsage(5, 1, 0, 2, 7), retryable=True),
     )
     first = evaluate(
         package,
@@ -516,9 +512,7 @@ def test_openai_and_gemini_adapters_parse_usage(monkeypatch: pytest.MonkeyPatch)
             "output": [
                 {
                     "type": "message",
-                    "content": [
-                        {"type": "output_text", "text": json.dumps({"ok": True})}
-                    ],
+                    "content": [{"type": "output_text", "text": json.dumps({"ok": True})}],
                 }
             ],
             "usage": {
@@ -592,9 +586,7 @@ def test_openai_and_gemini_adapters_parse_usage(monkeypatch: pytest.MonkeyPatch)
         schema={"type": "object"},
         generation={"thinking_mode": "explicit_level", "thinking_level": "minimal"},
     )
-    assert captured[2][2]["generationConfig"]["thinkingConfig"] == {
-        "thinkingLevel": "minimal"
-    }
+    assert captured[2][2]["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "minimal"}
 
 
 def test_openai_http_400_preserves_safe_error_details(
@@ -718,7 +710,11 @@ def test_run_identity_changes_with_material_configuration(tmp_path: Path) -> Non
 def test_prompt_versions_coexist_with_distinct_hashes_and_run_identities(tmp_path: Path) -> None:
     package = load_evaluation_package(_package_dir(tmp_path))
     assert DEFAULT_PROMPT_VERSION == "phase4a-policy-v1"
-    assert available_prompt_versions() == ("phase4a-policy-v1", "phase4a-policy-v2")
+    assert available_prompt_versions() == (
+        "phase4a-policy-v1",
+        "phase4a-policy-v2",
+        "hostility-prompt-v1",
+    )
     v1 = build_system_prompt(package.context, "phase4a-policy-v1")
     v2 = build_system_prompt(package.context, "phase4a-policy-v2")
     assert v1.startswith("You classify quoted Australian parliamentary speech.")
@@ -805,7 +801,9 @@ def test_explicit_inclusion_selects_only_manifest_records_and_changes_identity(
     package = load_evaluation_package(_package_dir(tmp_path, [_record(1), _record(2), _record(3)]))
     included_ids = {str(package.records[0]["record_id"]), str(package.records[2]["record_id"])}
     inclusion_path = tmp_path / "development.txt"
-    inclusion_path.write_text("".join(f"{value}\n" for value in sorted(included_ids)), encoding="utf-8")
+    inclusion_path.write_text(
+        "".join(f"{value}\n" for value in sorted(included_ids)), encoding="utf-8"
+    )
     inclusion_path.with_suffix(".manifest.json").write_text(
         json.dumps(
             {

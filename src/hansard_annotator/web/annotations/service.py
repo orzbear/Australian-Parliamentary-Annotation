@@ -298,6 +298,7 @@ def revision_history(
                 )
             else:
                 item["policy_label"] = "Not applicable"
+            item["has_policy_summary"] = item["policy_label"] != "Not applicable"
             item["primary_domain"] = values.get("primary_australian_domain")
             item["secondary_domains"] = (
                 values.get("secondary_australian_domains") or []
