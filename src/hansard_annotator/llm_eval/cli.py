@@ -10,6 +10,15 @@ from pathlib import Path
 from typing import Any
 
 from hansard_annotator.llm_eval.costs import aggregate_costs, load_pricing
+from hansard_annotator.llm_eval.hostility import (
+    compute_metrics as compute_hostility_metrics,
+)
+from hansard_annotator.llm_eval.hostility import (
+    disagreements as hostility_disagreements,
+)
+from hansard_annotator.llm_eval.hostility import (
+    write_reports as write_hostility_reports,
+)
 from hansard_annotator.llm_eval.metrics import compute_metrics
 from hansard_annotator.llm_eval.package import load_evaluation_package
 from hansard_annotator.llm_eval.prompt import DEFAULT_PROMPT_VERSION, available_prompt_versions
@@ -42,9 +51,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--subset-seed", type=int)
     result.add_argument("--temperature", type=float)
     result.add_argument("--max-output-tokens", type=int, default=1000)
-    result.add_argument(
-        "--reasoning-effort", choices=("none", "minimal", "low", "medium", "high")
-    )
+    result.add_argument("--reasoning-effort", choices=("none", "minimal", "low", "medium", "high"))
     result.add_argument("--thinking-budget", type=int)
     result.add_argument("--thinking-level", choices=("minimal", "low", "medium", "high"))
     result.add_argument("--max-retries", type=int, default=2)
@@ -204,6 +211,7 @@ def main(argv: list[str] | None = None) -> int:
                         "provider_prediction_schema_sha256": (
                             configuration.provider_prediction_schema_sha256
                         ),
+                        "prediction_contract_sha256": (configuration.prediction_contract_sha256),
                         "pricing_found": pricing_check["pricing_found"],
                         "pricing_effective_date": pricing_check["pricing_effective_date"],
                     },
@@ -228,16 +236,29 @@ def main(argv: list[str] | None = None) -> int:
             inclusion_record_count=included_count,
             inclusion_set_sha256=inclusion_sha256,
         )
-        metric_values = compute_metrics(records, results, package.domain_codes)
-        cost_values = aggregate_costs(results, arguments.provider, arguments.model, pricing)
-        mismatch_values = mismatches(
-            records,
-            results,
-            snippet_chars=arguments.snippet_chars,
-            run_identity=configuration.identity(),
-            configured_model=arguments.model,
+        metric_values = (
+            compute_hostility_metrics(records, results)
+            if package.task == "hostility"
+            else compute_metrics(records, results, package.domain_codes)
         )
-        write_reports(arguments.output, metric_values, cost_values, mismatch_values)
+        cost_values = aggregate_costs(results, arguments.provider, arguments.model, pricing)
+        if package.task == "hostility":
+            mismatch_values = hostility_disagreements(
+                records,
+                results,
+                run_identity=configuration.identity(),
+                configured_model=arguments.model,
+            )
+            write_hostility_reports(arguments.output, metric_values, cost_values, mismatch_values)
+        else:
+            mismatch_values = mismatches(
+                records,
+                results,
+                snippet_chars=arguments.snippet_chars,
+                run_identity=configuration.identity(),
+                configured_model=arguments.model,
+            )
+            write_reports(arguments.output, metric_values, cost_values, mismatch_values)
         print(
             json.dumps(
                 {
