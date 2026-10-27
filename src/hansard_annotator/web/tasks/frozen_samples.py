@@ -30,8 +30,14 @@ class FrozenSample(BaseModel):
 
     schema_version: Literal["1"]
     sample_id: str = Field(pattern=r"^[a-z0-9][a-z0-9-]*$")
-    purpose: Literal["HOSTILITY_DEVELOPMENT"]
-    version: str
+    purpose: Literal["HOSTILITY_DEVELOPMENT", "HOSTILITY_HELDOUT_VALIDATION"]
+    version: str | None = None
+    sample_version: str | None = None
+    sample_role: Literal["development", "heldout_validation"] | None = None
+    source_frame_path: str | None = None
+    eligible_population: list[str] | None = None
+    development_sample_exclusion: str | None = None
+    algorithm_version: str | None = None
     source_frame_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_canonical_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     seed: int
@@ -44,6 +50,10 @@ class FrozenSample(BaseModel):
 
     @model_validator(mode="after")
     def validate_frozen_membership(self) -> FrozenSample:
+        if not self.version and not self.sample_version:
+            raise ValueError("frozen sample must declare a version")
+        if self.version and self.sample_version and self.version != self.sample_version:
+            raise ValueError("frozen sample version fields disagree")
         keys = [turn.turn_key for turn in self.turns]
         orders = [turn.sample_order for turn in self.turns]
         if len(set(keys)) != self.sample_size:
@@ -58,6 +68,10 @@ class FrozenSample(BaseModel):
         if selection_sha256(self.turns) != self.sample_sha256:
             raise ValueError("frozen sample SHA-256 does not match its turns")
         return self
+
+    @property
+    def effective_version(self) -> str:
+        return self.sample_version or self.version or ""
 
 
 def selection_sha256(turns: list[FrozenTurn]) -> str:
@@ -95,7 +109,7 @@ def create_batch_from_frozen_sample(
         "type": "frozen_sample",
         "schema_version": sample.schema_version,
         "sample_id": sample.sample_id,
-        "sample_version": sample.version,
+        "sample_version": sample.effective_version,
         "sample_sha256": sample.sample_sha256,
         "sample_size": sample.sample_size,
     }

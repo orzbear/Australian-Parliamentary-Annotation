@@ -714,6 +714,8 @@ def test_prompt_versions_coexist_with_distinct_hashes_and_run_identities(tmp_pat
         "phase4a-policy-v1",
         "phase4a-policy-v2",
         "hostility-prompt-v1",
+        "hostility-prompt-v1.1",
+        "hostility-prompt-v2",
     )
     v1 = build_system_prompt(package.context, "phase4a-policy-v1")
     v2 = build_system_prompt(package.context, "phase4a-policy-v2")

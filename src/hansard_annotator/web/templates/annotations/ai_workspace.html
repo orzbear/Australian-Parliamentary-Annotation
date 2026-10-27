@@ -17,17 +17,25 @@
       <p class="mt-2 text-lg">{{ prediction.major_heading_original }}{% if prediction.minor_heading_original %} · {{ prediction.minor_heading_original }}{% endif %}</p>
       {% if prediction.business_type %}<p class="mt-2 text-sm text-muted">{{ prediction.business_type }}</p>{% endif %}
     </div>
-    <div class="speech-text">{{ prediction.text_clean }}</div>
+    <div class="speech-text" data-speech-text>{{ prediction.text_clean }}</div>
   </article>
 
   <aside class="ai-review-sidebar">
     <section class="ai-suggestion-panel" aria-labelledby="ai-heading">
       <p class="eyebrow">AI suggestion — not yet human approved</p>
+      {% if prediction.prediction_task == 'hostility' %}
+      <h2 id="ai-heading" class="mt-1 text-2xl font-semibold">Hostility: {{ prediction.values.hostility_present }}</h2>
+      <dl class="metadata mt-3">
+        <div><dt>Target relationship</dt><dd>{{ prediction.values.target }}</dd></div>
+        <div><dt>Evidence passages</dt><dd>{% for span in prediction.values.evidence_spans %}<q>{{ span.text }}</q>{% if not loop.last %}<br>{% endif %}{% else %}None{% endfor %}</dd></div>
+      </dl>
+      {% else %}
       <h2 id="ai-heading" class="mt-1 text-2xl font-semibold">{{ 'Non-Policy' if prediction.is_non_policy else 'Policy' }}</h2>
       <dl class="metadata mt-3">
         <div><dt>Primary domain</dt><dd>{{ prediction.primary_domain_display }}</dd></div>
         <div><dt>Secondary domains</dt><dd>{{ prediction.secondary_domain_displays|join(', ') or 'None' }}</dd></div>
       </dl>
+      {% endif %}
       <div class="model-reasoning"><strong>Model reasoning</strong><p>{{ prediction.reasoning }}</p></div>
       <details class="provenance mt-4">
         <summary>Model provenance</summary>
@@ -45,11 +53,19 @@
     <section class="human-result-panel" aria-labelledby="human-result-heading">
       <p class="eyebrow">Recorded human annotation</p>
       <h2 id="human-result-heading" class="mt-1 text-xl font-semibold">AI versus human</h2>
+      {% if prediction.prediction_task == 'hostility' %}
+      <div class="comparison-grid mt-3">
+        <div><span>Hostility</span><strong>AI: {{ prediction.values.hostility_present }}</strong><strong>Human: {{ human_annotation.values.hostility_present }}</strong></div>
+        <div><span>Target</span><strong>AI: {{ prediction.values.target }}</strong><strong>Human: {{ human_annotation.values.target or 'N/A' }}</strong></div>
+        <div><span>Changed</span><strong>{{ human_annotation.changed_fields|join(', ') or 'None' }}</strong></div>
+      </div>
+      {% else %}
       <div class="comparison-grid mt-3">
         <div><span>Policy</span><strong>AI: {{ 'Non-Policy' if prediction.is_non_policy else 'Policy' }}</strong><strong>Human: {{ 'Non-Policy' if human_annotation.values.is_non_policy else 'Policy' }}</strong></div>
         <div><span>Primary</span><strong>AI: {{ prediction.primary_domain_display }}</strong><strong>Human: {{ human_annotation.primary_domain_display }}</strong></div>
         <div><span>Secondary</span><strong>AI: {{ prediction.secondary_domain_displays|join(', ') or 'None' }}</strong><strong>Human: {{ human_annotation.secondary_domain_displays|join(', ') or 'None' }}</strong></div>
       </div>
+      {% endif %}
       <p class="mt-3 text-sm text-muted">Revision {{ human_annotation.revision_number }} by {{ human_annotation.display_name }}</p>
     </section>
     {% endif %}
@@ -95,7 +111,13 @@
             {% elif field.field_type in ['boolean','uncertainty'] %}
               {% if field.ui_hints.get('control') == 'checkbox' %}<input type="hidden" name="{{ field.field_key }}" value="false"><label class="choice-card mt-3"><input type="checkbox" name="{{ field.field_key }}" value="true" {% if current is sameas true %}checked{% endif %}><span><strong>{{ field.ui_hints.get('checked_label', field.label) }}</strong></span></label>{% else %}<div class="inline-choices"><label><input type="radio" name="{{ field.field_key }}" value="false" {% if current is sameas false %}checked{% endif %}> No</label><label><input type="radio" name="{{ field.field_key }}" value="true" {% if current is sameas true %}checked{% endif %}> Yes</label></div>{% endif %}
             {% elif field.field_type == 'short_text' %}<input name="{{ field.field_key }}" value="{{ current or '' }}" maxlength="500">
-            {% elif field.field_type == 'long_text' %}<textarea name="{{ field.field_key }}" rows="3" maxlength="5000">{{ current or '' }}</textarea>{% endif %}
+              {% elif field.field_type == 'long_text' %}<textarea name="{{ field.field_key }}" rows="3" maxlength="5000">{{ current or '' }}</textarea>
+              {% elif field.field_type == 'evidence_span' %}
+                <input type="hidden" name="{{ field.field_key }}" value='{{ (current or []) | tojson }}' data-evidence-input>
+                <button class="btn btn-secondary mt-3" type="button" data-add-evidence>Add selected text as evidence</button>
+                <p class="help mt-2" data-evidence-feedback aria-live="polite">Select text in the speech, then add it as evidence.</p>
+                <ol class="mt-3 space-y-2" data-evidence-list></ol>
+              {% endif %}
             {% for message in errors.get(field.field_key, []) %}<p class="error-text">{{ message }}</p>{% endfor %}
           </fieldset>
         {% endfor %}

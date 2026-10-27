@@ -29,9 +29,21 @@ ISSUE_TYPES = (
     "EVIDENCE_SPAN_ERROR",
     "OTHER",
 )
+MAX_REASONING_LENGTH = 4000
 
 
-def prediction_json_schema() -> dict[str, Any]:
+def prediction_json_schema(prompt_version: str = "hostility-prompt-v1.1") -> dict[str, Any]:
+    evidence_properties: dict[str, Any] = {
+        "text": {"type": "string", "minLength": 1},
+    }
+    evidence_required = ["text"]
+    if prompt_version == "hostility-prompt-v1":
+        evidence_properties = {
+            "start_offset": {"type": "integer", "minimum": 0},
+            "end_offset": {"type": "integer", "minimum": 1},
+            **evidence_properties,
+        }
+        evidence_required = ["start_offset", "end_offset", "text"]
     return {
         "type": "object",
         "additionalProperties": False,
@@ -43,21 +55,29 @@ def prediction_json_schema() -> dict[str, Any]:
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "properties": {
-                        "start_offset": {"type": "integer", "minimum": 0},
-                        "end_offset": {"type": "integer", "minimum": 1},
-                        "text": {"type": "string", "minLength": 1},
-                    },
-                    "required": ["start_offset", "end_offset", "text"],
+                    "properties": evidence_properties,
+                    "required": evidence_required,
                 },
             },
-            "reasoning": {"type": "string", "maxLength": 1000},
+            "reasoning": {
+                "type": "string",
+                "maxLength": 1000 if prompt_version in {"hostility-prompt-v1", "hostility-prompt-v1.1"} else MAX_REASONING_LENGTH,
+            },
         },
         "required": ["hostility_present", "target", "evidence_spans", "reasoning"],
     }
 
 
-def validate_prediction(raw: object, text: str) -> HostilityPrediction:
+def validate_prediction(
+    raw: object, text: str, prompt_version: str = "hostility-prompt-v1.1"
+) -> HostilityPrediction:
+    prediction, _ = validate_prediction_with_diagnostics(raw, text, prompt_version)
+    return prediction
+
+
+def validate_prediction_with_diagnostics(
+    raw: object, text: str, prompt_version: str = "hostility-prompt-v1.1"
+) -> tuple[HostilityPrediction, dict[str, object]]:
     if not isinstance(raw, dict) or set(raw) != {
         "hostility_present",
         "target",
@@ -71,33 +91,61 @@ def validate_prediction(raw: object, text: str) -> HostilityPrediction:
         raise InvalidPrediction("hostility_present is unknown")
     if target not in MODEL_TARGET_CODES:
         raise InvalidPrediction("target is unknown")
-    if not isinstance(reasoning, str) or len(reasoning) > 1000:
+    if not isinstance(reasoning, str) or len(reasoning) > MAX_REASONING_LENGTH:
         raise InvalidPrediction("reasoning must be a short string")
     if not isinstance(spans, list):
         raise InvalidPrediction("evidence_spans must be a list")
     validated: list[dict[str, object]] = []
+    unmatched: list[str] = []
+    ambiguous: list[str] = []
     for span in spans:
-        if not isinstance(span, dict) or set(span) != {"start_offset", "end_offset", "text"}:
+        expected_fields = (
+            {"start_offset", "end_offset", "text"}
+            if prompt_version == "hostility-prompt-v1"
+            else {"text"}
+        )
+        if not isinstance(span, dict) or set(span) != expected_fields:
             raise InvalidPrediction("evidence span fields are invalid")
-        start, end, evidence = span["start_offset"], span["end_offset"], span["text"]
-        if (
-            not isinstance(start, int)
-            or isinstance(start, bool)
-            or not isinstance(end, int)
-            or isinstance(end, bool)
-            or not isinstance(evidence, str)
-            or start < 0
-            or end <= start
-            or end > len(text)
-            or text[start:end] != evidence
-        ):
-            raise InvalidPrediction("evidence span offsets/text do not match canonical text")
-        validated.append({"start_offset": start, "end_offset": end, "text": evidence})
-    if presence == "NO" and (target != "N/A" or validated):
+        evidence = span["text"]
+        if not isinstance(evidence, str) or not evidence:
+            raise InvalidPrediction("evidence text must be a non-empty exact string")
+        if prompt_version == "hostility-prompt-v1":
+            start, end = span["start_offset"], span["end_offset"]
+            if (
+                not isinstance(start, int)
+                or isinstance(start, bool)
+                or not isinstance(end, int)
+                or isinstance(end, bool)
+                or start < 0
+                or end <= start
+                or end > len(text)
+                or text[start:end] != evidence
+            ):
+                raise InvalidPrediction("evidence span offsets/text do not match canonical text")
+            validated.append({"start_offset": start, "end_offset": end, "text": evidence})
+            continue
+        start = text.find(evidence)
+        if start < 0:
+            unmatched.append(evidence)
+        elif text.find(evidence, start + 1) >= 0:
+            ambiguous.append(evidence)
+        else:
+            end = start + len(evidence)
+            assert text[start:end] == evidence
+            validated.append({"start_offset": start, "end_offset": end, "text": evidence})
+    if presence == "NO" and (target != "N/A" or spans):
         raise InvalidPrediction("NO requires target N/A and no evidence")
-    if presence != "NO" and (target == "N/A" or not validated):
-        raise InvalidPrediction("YES/UNSURE requires a target and evidence")
-    return HostilityPrediction(presence, target, tuple(validated), reasoning)
+    if presence != "NO" and (target == "N/A" or not spans):
+        raise InvalidPrediction("YES/UNSURE requires a target and evidence text")
+    diagnostics: dict[str, object] = {
+        "classification_valid": True,
+        "evidence_valid": not unmatched and not ambiguous,
+        "evidence_unmatched": unmatched,
+        "evidence_ambiguous": ambiguous,
+        "evidence_requested_count": len(spans),
+        "evidence_resolved_count": len(validated),
+    }
+    return HostilityPrediction(presence, target, tuple(validated), reasoning), diagnostics
 
 
 def partisan_hostility(values: dict[str, Any]) -> bool:
@@ -207,6 +255,29 @@ def compute_metrics(
         "partisan_hostility": _binary(
             [(partisan_hostility(h), partisan_hostility(p)) for h, p in pairs]
         ),
+        "evidence_quality": {
+            "classification_valid": len(pairs),
+            "valid": sum(
+                bool(by_id[str(record["record_id"])].get("diagnostics", {}).get("evidence_valid"))
+                for record in records
+                if str(record["record_id"]) in by_id
+                and by_id[str(record["record_id"])].get("status") == "success"
+            ),
+            "unmatched": sum(
+                bool(
+                    by_id[str(record["record_id"])].get("diagnostics", {}).get("evidence_unmatched")
+                )
+                for record in records
+                if str(record["record_id"]) in by_id
+            ),
+            "ambiguous": sum(
+                bool(
+                    by_id[str(record["record_id"])].get("diagnostics", {}).get("evidence_ambiguous")
+                )
+                for record in records
+                if str(record["record_id"]) in by_id
+            ),
+        },
     }
 
 
@@ -224,10 +295,12 @@ def disagreements(
         if not result or result.get("status") != "success":
             continue
         human, model = record["human_annotation"]["values"], result["prediction"]
-        if (human["hostility_present"], human.get("target")) == (
+        labels_match = (human["hostility_present"], human.get("target")) == (
             model["hostility_present"],
             None if model["target"] == "N/A" else model["target"],
-        ):
+        )
+        evidence_valid = result.get("diagnostics", {}).get("evidence_valid")
+        if labels_match and evidence_valid is not False:
             continue
         speech = record["speech"]
         output.append(
@@ -246,6 +319,10 @@ def disagreements(
                 "model_target": model["target"],
                 "model_evidence": model["evidence_spans"],
                 "model_reasoning": model.get("reasoning", ""),
+                "classification_valid": result.get("diagnostics", {}).get("classification_valid"),
+                "evidence_valid": result.get("diagnostics", {}).get("evidence_valid"),
+                "evidence_unmatched": result.get("diagnostics", {}).get("evidence_unmatched", []),
+                "evidence_ambiguous": result.get("diagnostics", {}).get("evidence_ambiguous", []),
                 "human_partisan_hostility": partisan_hostility(human),
                 "model_partisan_hostility": partisan_hostility(model),
                 "returned_model": result.get("returned_model"),
@@ -288,6 +365,7 @@ def write_reports(
         (output / "mismatches.csv").write_text("record_id\n", encoding="utf-8")
     identification, target = metrics["hostility_identification"], metrics["target_classification"]
     partisan = metrics["partisan_hostility"]
+    evidence = metrics["evidence_quality"]
     (output / "report.md").write_text(
         "# Hostility development evaluation report\n\n"
         "Development data used for prompt refinement; these are not final or held-out results.\n\n"
@@ -298,6 +376,9 @@ def write_reports(
         f"- Exact target accuracy: {target['exact_target_accuracy']:.2%}\n"
         f"- Partisan-hostility precision/recall/F1: {partisan['precision']:.2%} / "
         f"{partisan['recall']:.2%} / {partisan['f1']:.2%}\n"
+        f"- Classification-valid predictions: {evidence['classification_valid']}\n"
+        f"- Evidence valid / unmatched / ambiguous: {evidence['valid']} / "
+        f"{evidence['unmatched']} / {evidence['ambiguous']}\n"
         f"- Disagreements: {len(rows)}\n",
         encoding="utf-8",
     )

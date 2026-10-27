@@ -271,7 +271,8 @@ def _canonical_query() -> str:
                    THEN btrim(turn.text_raw)<>''
                  ELSE false
                END AS usable_text,
-               prediction.public_id AS prediction_public_id,prediction.is_non_policy,
+               prediction.public_id AS prediction_public_id,prediction.prediction_task,
+               prediction.prediction_values,prediction.is_non_policy,
                prediction.primary_australian_domain,
                prediction.secondary_australian_domains,prediction.reasoning,
                prediction.returned_model AS prediction_returned_model,

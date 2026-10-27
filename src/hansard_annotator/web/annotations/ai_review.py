@@ -8,6 +8,7 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from hansard_annotator.llm_eval.prediction_tasks import changed_fields, human_suggestion
 from hansard_annotator.web.annotations.renderer import load_schema
 from hansard_annotator.web.auth.models import Principal
 from hansard_annotator.web.config import WebSettings
@@ -233,7 +234,10 @@ def _compatible_review_project(
         JOIN speaker_turns st ON st.id=mp.speaker_turn_id
         JOIN reconstruction_runs rr ON rr.id=st.reconstruction_run_id
         JOIN projects p ON p.preprocessing_run_id=rr.preprocessing_run_id
+        JOIN annotation_schema_versions asv ON asv.id=p.annotation_schema_version_id
+        JOIN annotation_schemas ans ON ans.id=asv.annotation_schema_id
         WHERE mp.id=%s AND p.status='active'
+          AND ans.slug=mpr.annotation_schema_slug AND asv.version=mpr.annotation_schema_version
           AND (
             %s OR EXISTS (
               SELECT 1 FROM project_memberships membership
@@ -242,23 +246,12 @@ def _compatible_review_project(
                 AND membership.project_role IN ('project_manager','annotator','adjudicator')
             )
           )
-          AND NOT EXISTS (
-            SELECT required.field_key FROM (VALUES
-              ('is_non_policy'),('primary_australian_domain'),
-              ('secondary_australian_domains')
-            ) required(field_key)
-            WHERE NOT EXISTS (
-              SELECT 1 FROM annotation_field_definitions field
-              WHERE field.annotation_schema_version_id=p.annotation_schema_version_id
-                AND field.field_key=required.field_key AND field.is_active
-            )
-          )
         ORDER BY p.id
         """,
         (prediction_id, principal.is_admin, principal.user_id),
     ).fetchall()
     if not rows:
-        raise PermissionError("no active compatible policy-annotation project is available")
+        raise PermissionError("no active compatible annotation project is available")
     if len(rows) > 1:
         raise ValueError(
             "multiple active compatible review projects; pause all but the intended one"
@@ -275,7 +268,8 @@ def prediction_review_workspace(
     with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
         prediction = connection.execute(
             """
-            SELECT mp.id,mp.public_id,mp.speaker_turn_id,mp.is_non_policy,
+            SELECT mp.id,mp.public_id,mp.speaker_turn_id,mp.prediction_task,
+                   mp.prediction_values,mp.is_non_policy,
                    mp.primary_australian_domain,mp.secondary_australian_domains,
                    mp.reasoning,mp.created_at,
                    mpr.public_id AS run_public_id,mpr.configured_model,
@@ -325,19 +319,29 @@ def prediction_review_workspace(
             """,
             (prediction["id"],),
         ).fetchone()
-        suggested_values: dict[str, object] = {
-            "is_non_policy": prediction["is_non_policy"],
-            "primary_australian_domain": prediction["primary_australian_domain"],
-            "secondary_australian_domains": list(prediction["secondary_australian_domains"]),
-        }
+        task = str(prediction["prediction_task"])
+        if task not in {"policy", "hostility"}:
+            raise ValueError("unsupported prediction task")
+        prediction_values = dict(prediction["prediction_values"])
+        # Old policy rows can only have an empty default when inserted by legacy test/setup code.
+        if task == "policy" and not prediction_values:
+            prediction_values = {
+                "is_non_policy": prediction["is_non_policy"],
+                "primary_australian_domain": prediction["primary_australian_domain"],
+                "secondary_australian_domains": list(
+                    prediction["secondary_australian_domains"] or []
+                ),
+            }
+        suggested_values = human_suggestion(task, prediction_values)  # type: ignore[arg-type]
         values = dict(human["values"]) if human else suggested_values
         prediction_data = dict(prediction)
+        prediction_data["values"] = prediction_values
         prediction_data["primary_domain_display"] = _domain_display(
             prediction["primary_australian_domain"], domain_labels
         )
         prediction_data["secondary_domain_displays"] = [
             _domain_display(code, domain_labels)
-            for code in prediction["secondary_australian_domains"]
+            for code in prediction["secondary_australian_domains"] or []
         ]
         human_data = dict(human) if human else None
         if human_data:
@@ -349,6 +353,9 @@ def prediction_review_workspace(
                 _domain_display(code, domain_labels)
                 for code in human_values.get("secondary_australian_domains", [])
             ]
+            human_data["changed_fields"] = changed_fields(
+                task, suggested_values, human_values  # type: ignore[arg-type]
+            )
         return {
             "prediction": prediction_data,
             "effective_review": dict(effective_review) if effective_review else None,
@@ -444,13 +451,18 @@ def next_unreviewed_prediction(
             """
             SELECT mp.public_id FROM model_predictions mp
             WHERE (%s::text IS NULL OR mp.public_id::text<>%s::text)
+              AND (%s::text IS NULL OR mp.run_id=(
+                SELECT current.run_id FROM model_predictions current
+                WHERE current.public_id::text=%s::text
+              ))
               AND NOT EXISTS (
                 SELECT 1 FROM model_prediction_reviews review
                 WHERE review.model_prediction_id=mp.id
               )
             ORDER BY mp.id LIMIT 1
             """,
-            (current_prediction_public_id, current_prediction_public_id),
+            (current_prediction_public_id, current_prediction_public_id,
+             current_prediction_public_id, current_prediction_public_id),
         ).fetchone()
         return str(row["public_id"]) if row else None
 
@@ -517,7 +529,8 @@ def ai_review_queue(
                 row["primary_australian_domain"], domain_labels
             )
             value["secondary_domain_displays"] = [
-                _domain_display(code, domain_labels) for code in row["secondary_australian_domains"]
+                _domain_display(code, domain_labels)
+                for code in row["secondary_australian_domains"] or []
             ]
             output.append(value)
         return output
@@ -564,7 +577,8 @@ def _ai_review_queue_query(
             SELECT current_assignment.id AS assignment_id,
                    current_assignment.status AS assignment_status,
                    st.speaker_name_raw,st.speech_date,st.major_heading_original,
-                   mp.public_id AS prediction_id,mp.is_non_policy,
+                   mp.public_id AS prediction_id,mp.prediction_task,mp.prediction_values,
+                   mp.is_non_policy,
                    mp.primary_australian_domain,mp.secondary_australian_domains,
                    mpr.public_id AS run_id,
                    mpr.configured_model,mpr.prompt_version,

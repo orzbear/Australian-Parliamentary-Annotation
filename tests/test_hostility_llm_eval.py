@@ -8,16 +8,28 @@ from typing import Any
 import pytest
 
 from hansard_annotator.llm_eval.hostility import (
+    MAX_REASONING_LENGTH,
     compute_metrics,
     disagreements,
     partisan_hostility,
     prediction_json_schema,
     validate_prediction,
+    validate_prediction_with_diagnostics,
     write_reports,
+)
+from hansard_annotator.llm_eval.hostility_comparison import (
+    build_comparison_summary,
+    compare_hostility_runs,
+    write_hostility_comparison,
 )
 from hansard_annotator.llm_eval.models import ProviderResponse
 from hansard_annotator.llm_eval.package import load_evaluation_package
-from hansard_annotator.llm_eval.prompt import build_system_prompt, prompt_hash
+from hansard_annotator.llm_eval.prompt import (
+    HOSTILITY_PROMPT_V1_1,
+    HOSTILITY_PROMPT_V2,
+    build_system_prompt,
+    prompt_hash,
+)
 from hansard_annotator.llm_eval.runner import evaluate, make_configuration
 from hansard_annotator.llm_eval.validation import InvalidPrediction
 
@@ -103,9 +115,7 @@ def _raw(presence: str, target: str, text: str, evidence: bool = True) -> dict[s
     return {
         "hostility_present": presence,
         "target": target,
-        "evidence_spans": (
-            [{"start_offset": 0, "end_offset": len(text), "text": text}] if evidence else []
-        ),
+        "evidence_spans": ([{"text": text}] if evidence else []),
         "reasoning": "Diagnostic.",
     }
 
@@ -114,22 +124,95 @@ def test_hostility_package_dispatch_prompt_contract_and_run_identity(tmp_path: P
     package = load_evaluation_package(_package(tmp_path))
     assert package.task == "hostility"
     assert package.schema["version"] == "0.2.0"
-    prompt = build_system_prompt(package.context, "hostility-prompt-v1")
+    prompt = build_system_prompt(package.context, "hostility-prompt-v1.1")
     assert "MANDATORY ACCOUNTABILITY BOUNDARY" in prompt
     assert prompt_hash(prompt) == prompt_hash(
-        build_system_prompt(package.context, "hostility-prompt-v1")
+        build_system_prompt(package.context, "hostility-prompt-v1.1")
     )
     assert prediction_json_schema()["additionalProperties"] is False
+    new_evidence = prediction_json_schema()["properties"]["evidence_spans"]["items"]
+    old_evidence = prediction_json_schema("hostility-prompt-v1")["properties"]["evidence_spans"][
+        "items"
+    ]
+    assert set(new_evidence["properties"]) == {"text"}
+    assert set(old_evidence["properties"]) == {"start_offset", "end_offset", "text"}
     first, _ = make_configuration(
-        package, "gemini", "model", {"temperature": 0}, "hostility-prompt-v1"
+        package, "gemini", "model", {"temperature": 0}, "hostility-prompt-v1.1"
     )
     second, _ = make_configuration(
-        package, "gemini", "model", {"temperature": 0}, "hostility-prompt-v1"
+        package, "gemini", "model", {"temperature": 0}, "hostility-prompt-v1.1"
     )
     assert first.prediction_contract_sha256 is not None
     assert first.identity() == second.identity()
     with pytest.raises(ValueError, match="policy prompts cannot"):
         build_system_prompt(package.context, "phase4a-policy-v1")
+
+
+def test_corrected_hostility_package_validates_when_local_export_is_present() -> None:
+    path = Path(
+        "data/review/hostility-development-100-ai-codebook-input-508e297185bd"
+    )
+    if not path.exists():
+        pytest.skip("local corrected hostility development export is required")
+    package = load_evaluation_package(path)
+    assert len(package.records) == 100
+    assert package.manifest["snapshot_sha256"] == (
+        "508e297185bd8bd82c25cb86014b6264de66e6032ee99780eeb265eb33b714dd"
+    )
+    assert package.schema["slug"] == "australian_partisan_hostility"
+    assert package.schema["version"] == "0.2.0"
+    assert package.manifest["corpus"]["run_name"] == "phase1-full-20260723-v4"
+    generation = {
+        "max_output_tokens": 1000,
+        "temperature": 0.0,
+        "thinking_mode": "disabled",
+        "thinking_budget": 0,
+    }
+    v1, v1_prompt = make_configuration(
+        package, "gemini", "gemini-2.5-flash", generation, "hostility-prompt-v1.1"
+    )
+    v2, v2_prompt = make_configuration(
+        package, "gemini", "gemini-2.5-flash", generation, "hostility-prompt-v2"
+    )
+    assert prompt_hash(v1_prompt) == (
+        "2cd88c94a0bdb811069c3ca126859a493e39b9f075a65b4d5edc3a049461bfa0"
+    )
+    assert v1.prediction_contract_sha256 == (
+        "fc64d0bcbf138afe7385dbef9cf8d9902e377140c148268cba357649d7339367"
+    )
+    assert prompt_hash(v2_prompt) == (
+        "185f5162348ae3b3d735ea43247da18cf6b3c1bb12f8a72cad57e38ce31cb1a8"
+    )
+    assert v2.prediction_contract_sha256 == (
+        "dc716b49e0759ba7063973038b234f6696e778c4d90ee4a405d9600a2435b11d"
+    )
+
+
+def test_v1_1_identity_is_immutable_and_v2_is_frozen(tmp_path: Path) -> None:
+    package = load_evaluation_package(_package(tmp_path))
+    v2_prompt = build_system_prompt(package.context, "hostility-prompt-v2")
+    v1, _ = make_configuration(
+        package, "gemini", "gemini-2.5-flash", {}, "hostility-prompt-v1.1"
+    )
+    v2, _ = make_configuration(
+        package, "gemini", "gemini-2.5-flash", {}, "hostility-prompt-v2"
+    )
+    assert hashlib.sha256(HOSTILITY_PROMPT_V1_1.encode()).hexdigest() == (
+        "dc3ef4f2465bd7012ce892d6fe641739c598301cf0e520a8f13a8edd9c988ae8"
+    )
+    assert v1.prediction_contract_sha256 == (
+        "fc64d0bcbf138afe7385dbef9cf8d9902e377140c148268cba357649d7339367"
+    )
+    assert "Do not infer incompetence" in v2_prompt
+    assert hashlib.sha256(HOSTILITY_PROMPT_V2.encode()).hexdigest() == (
+        "3fd1b40f1c696a3af01a2b2d02012b5ffb154775a45f6b6d68dc6dfddb793806"
+    )
+    assert v2.prediction_contract_sha256 == (
+        "dc716b49e0759ba7063973038b234f6696e778c4d90ee4a405d9600a2435b11d"
+    )
+    assert prediction_json_schema("hostility-prompt-v2")["properties"]["evidence_spans"] == (
+        prediction_json_schema("hostility-prompt-v1.1")["properties"]["evidence_spans"]
+    )
 
 
 def test_hostility_structured_output_invariants_and_offsets() -> None:
@@ -147,11 +230,51 @@ def test_hostility_structured_output_invariants_and_offsets() -> None:
         _raw("UNSURE", "UNSURE", text, False),
         {
             **_raw("YES", "OPPOSING_PARTISAN_TARGET", text),
-            "evidence_spans": [{"start_offset": 0, "end_offset": 3, "text": "bad"}],
+            "evidence_spans": [{"text": ""}],
         },
     ):
         with pytest.raises(InvalidPrediction):
             validate_prediction(raw, text)
+
+
+def test_reasoning_telemetry_has_a_larger_but_finite_runtime_limit() -> None:
+    text = "The minister must act."
+    longer = _raw("NO", "N/A", text, False)
+    longer["reasoning"] = "x" * 1001
+    assert validate_prediction(longer, text).reasoning == "x" * 1001
+    excessive = {**longer, "reasoning": "x" * (MAX_REASONING_LENGTH + 1)}
+    with pytest.raises(InvalidPrediction, match="reasoning must be a short string"):
+        validate_prediction(excessive, text)
+
+
+def test_evidence_text_resolution_unique_unicode_and_multiline() -> None:
+    text = "Opening — naïve claim.\nSecond line is cruel. Closing."
+    quote = "naïve claim.\nSecond line is cruel."
+    prediction, diagnostics = validate_prediction_with_diagnostics(
+        _raw("YES", "OTHER_POLITICAL_TARGET", quote), text
+    )
+    start = text.index(quote)
+    assert prediction.evidence_spans == (
+        {"start_offset": start, "end_offset": start + len(quote), "text": quote},
+    )
+    assert text[start : start + len(quote)] == quote
+    assert diagnostics["classification_valid"] is True
+    assert diagnostics["evidence_valid"] is True
+
+
+def test_unmatched_and_ambiguous_evidence_preserve_valid_classification() -> None:
+    unmatched, unmatched_diagnostics = validate_prediction_with_diagnostics(
+        _raw("YES", "OPPOSING_PARTISAN_TARGET", "not verbatim"), "Canonical speech."
+    )
+    ambiguous, ambiguous_diagnostics = validate_prediction_with_diagnostics(
+        _raw("UNSURE", "UNSURE", "repeat"), "repeat then repeat"
+    )
+    assert unmatched.hostility_present == "YES" and unmatched.evidence_spans == ()
+    assert unmatched_diagnostics["evidence_valid"] is False
+    assert unmatched_diagnostics["evidence_unmatched"] == ["not verbatim"]
+    assert ambiguous.hostility_present == "UNSURE" and ambiguous.evidence_spans == ()
+    assert ambiguous_diagnostics["evidence_valid"] is False
+    assert ambiguous_diagnostics["evidence_ambiguous"] == ["repeat"]
 
 
 def test_hostility_metrics_and_derived_partisan_label() -> None:
@@ -211,12 +334,49 @@ def test_disagreement_artifacts_are_deterministic(tmp_path: Path) -> None:
         assert (first / name).read_bytes() == (second / name).read_bytes()
 
 
+def test_v1_1_v2_comparison_artifacts_are_deterministic(tmp_path: Path) -> None:
+    records = (
+        _record(1, "NO", None, "Failure."),
+        _record(2, "YES", "OPPOSING_PARTISAN_TARGET", "Incompetent."),
+    )
+    first = [
+        {"record_id": "annotation:1", "status": "success", "prediction": _raw("YES", "OTHER_POLITICAL_TARGET", "Failure.")},
+        {"record_id": "annotation:2", "status": "success", "prediction": _raw("YES", "OPPOSING_PARTISAN_TARGET", "Incompetent.")},
+    ]
+    second = [
+        {"record_id": "annotation:1", "status": "success", "prediction": _raw("NO", "N/A", "Failure.", False)},
+        {"record_id": "annotation:2", "status": "success", "prediction": _raw("YES", "OTHER_POLITICAL_TARGET", "Incompetent.")},
+    ]
+    rows = compare_hostility_runs(records, first, second)
+    assert [row["comparison_status"] for row in rows] == [
+        "V2_ONLY_CORRECT",
+        "V1_ONLY_CORRECT",
+    ]
+    metrics = compute_metrics(records, first)
+    summary = build_comparison_summary(metrics, compute_metrics(records, second), rows)
+    one, two = tmp_path / "one", tmp_path / "two"
+    write_hostility_comparison(one, rows, summary)
+    write_hostility_comparison(two, rows, summary)
+    for name in ("comparison.csv", "comparison.jsonl", "comparison_summary.json", "report.md"):
+        assert (one / name).read_bytes() == (two / name).read_bytes()
+
+
 class _Provider:
     name = "fake"
 
     def generate(self, **kwargs: object) -> ProviderResponse:
         text = str(kwargs["user_prompt"]).split("SPEECH:\n", 1)[1]
         return ProviderResponse(_raw("NO", "N/A", text, False), returned_model="fake-1")
+
+
+class _UnmatchedEvidenceProvider:
+    name = "fake"
+
+    def generate(self, **kwargs: object) -> ProviderResponse:
+        return ProviderResponse(
+            _raw("YES", "OPPOSING_PARTISAN_TARGET", "not copied from speech"),
+            returned_model="fake-1",
+        )
 
 
 def test_hostility_smoke_uses_shared_runner_without_paid_calls(tmp_path: Path) -> None:
@@ -228,8 +388,27 @@ def test_hostility_smoke_uses_shared_runner_without_paid_calls(tmp_path: Path) -
         "fake-1",
         tmp_path / "run",
         {},
-        prompt_version="hostility-prompt-v1",
+        prompt_version="hostility-prompt-v1.1",
         sleeper=lambda _: None,
     )
     assert results[0]["status"] == "success"
     assert results[0]["prediction"]["hostility_present"] == "NO"
+
+
+def test_runner_separates_evidence_failure_from_classification_failure(tmp_path: Path) -> None:
+    package = load_evaluation_package(_package(tmp_path))
+    results = evaluate(
+        package,
+        package.records[:1],
+        _UnmatchedEvidenceProvider(),
+        "fake-1",
+        tmp_path / "unmatched-run",
+        {},
+        prompt_version="hostility-prompt-v1.1",
+        sleeper=lambda _: None,
+    )
+    assert results[0]["status"] == "success"
+    assert results[0]["prediction"]["hostility_present"] == "YES"
+    assert results[0]["diagnostics"]["classification_valid"] is True
+    assert results[0]["diagnostics"]["evidence_valid"] is False
+    assert results[0]["diagnostics"]["evidence_unmatched"] == ["not copied from speech"]

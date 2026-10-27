@@ -1,0 +1,541 @@
+{
+  "schema_version": "1",
+  "sample_id": "hostility-heldout-100",
+  "sample_version": "1.0.0",
+  "sample_role": "heldout_validation",
+  "purpose": "HOSTILITY_HELDOUT_VALIDATION",
+  "source_frame_path": "data/processed/policy_sampling_frame.parquet",
+  "source_frame_sha256": "1bf170218eccc1282e44f729b69d8218425ab2e930cbafde223956b140d05189",
+  "source_canonical_sha256": "f80eb018e9058754d12157f598db2ac2ab8b569ba26c81f7b34ae6ff16601c1b",
+  "eligible_population": [
+    "policy_status == POLICY",
+    "prediction_outcome == PREDICTION",
+    "primary_domain in AU01-AU14",
+    "turn_key not in hostility-development-100"
+  ],
+  "development_sample_exclusion": "config/research_samples/hostility-development-100.json",
+  "seed": 20261026,
+  "allocation": {
+    "AU01": 12,
+    "AU02": 14,
+    "AU03": 8,
+    "AU04": 8,
+    "AU05": 9,
+    "AU06": 7,
+    "AU07": 12,
+    "AU08": 4,
+    "AU09": 4,
+    "AU10": 4,
+    "AU11": 2,
+    "AU12": 8,
+    "AU13": 7,
+    "AU14": 1
+  },
+  "selection_algorithm": "Hamilton largest-remainder allocation from frozen AU01-AU14 policy populations; within-domain sha256(turn_key + ':' + seed), turn_key; v1",
+  "algorithm_version": "1",
+  "sample_size": 100,
+  "sample_sha256": "f3d9451b3352025b769d263fc896f57683a741ea6fd9af0b6477651707cf3b36",
+  "created_at": "2026-10-26T10:20:37.515257+00:00",
+  "turns": [
+    {
+      "sample_order": 1,
+      "turn_key": "03c2fdcdc9a71ae700c4f13f167edac2bb24944b6c8fdb7582dcbfe1d5da5dfd",
+      "primary_domain": "AU01"
+    },
+    {
+      "sample_order": 2,
+      "turn_key": "b26dae6f02a62f07e5ceb80d5ef560c049a060cf6ad37f6fa5fe0823b9461aad",
+      "primary_domain": "AU01"
+    },
+    {
+      "sample_order": 3,
+      "turn_key": "580b2f5d3808c39ecdbd9ac32e900dc810f91f6248fb145730e31fdd304bcca0",
+      "primary_domain": "AU01"
+    },
+    {
+      "sample_order": 4,
+      "turn_key": "ae8a4d0afeb321eff705982b0e3af51f0d86ef4e0a270e9a086923565645b73f",
+      "primary_domain": "AU01"
+    },
+    {
+      "sample_order": 5,
+      "turn_key": "7b59e1a8e8c4baaeced7ac215aea27e124e34aa3eeccae311ec206c901ae7ac7",
+      "primary_domain": "AU01"
+    },
+    {
+      "sample_order": 6,
+      "turn_key": "d953b756354fd782c409137e6ed5b0fa66e47bb94d81057e7905aaf625efa490",
+      "primary_domain": "AU01"
+    },
+    {
+      "sample_order": 7,
+      "turn_key": "1d1a04c516e763f10ce6d49acaa15da5503544df2ed30564b46bce0e448eb33b",
+      "primary_domain": "AU01"
+    },
+    {
+      "sample_order": 8,
+      "turn_key": "1d27b148b55b253ad2e8fd25611a53f1e364e46d9ba0fe8db16ea59bbd2060f4",
+      "primary_domain": "AU01"
+    },
+    {
+      "sample_order": 9,
+      "turn_key": "d45d4270cce62b2127a6ab4c7b40f53263f123b5e2430b6de6edc21e95e29d15",
+      "primary_domain": "AU01"
+    },
+    {
+      "sample_order": 10,
+      "turn_key": "853134c60d5ff83b9905270313d0f5d508c47f2b5f11244c3413075a9517eb34",
+      "primary_domain": "AU01"
+    },
+    {
+      "sample_order": 11,
+      "turn_key": "b001af721a92a0b96d797762f0bff81b252aca25f3ba42adafe2886860d85f2a",
+      "primary_domain": "AU01"
+    },
+    {
+      "sample_order": 12,
+      "turn_key": "2c6596f80072ceb2fa81a6d18e567255c015e66d70670b150d188038331f9f42",
+      "primary_domain": "AU01"
+    },
+    {
+      "sample_order": 13,
+      "turn_key": "037187c1a8eed50547415dcab54364f1a2f84bcdf0eca07f3dc14ba1ac09a216",
+      "primary_domain": "AU02"
+    },
+    {
+      "sample_order": 14,
+      "turn_key": "ab9ce773a111df9e41f41e20c36c6a4bda3e2d8213727eca64edf855925ad55f",
+      "primary_domain": "AU02"
+    },
+    {
+      "sample_order": 15,
+      "turn_key": "1d8b42308313f1f2f069e2d22f654f38aafc3c58fb2279906f9e8cf6173f25ef",
+      "primary_domain": "AU02"
+    },
+    {
+      "sample_order": 16,
+      "turn_key": "d86ea9c6c1870a466f6ff4d6c2924978e00670e3425ec796bd3b4ff263cf9503",
+      "primary_domain": "AU02"
+    },
+    {
+      "sample_order": 17,
+      "turn_key": "935802db8e8c9aa5b5c377ea6f8d22ecec38d1eb892f25f52cfb4529bf4ed841",
+      "primary_domain": "AU02"
+    },
+    {
+      "sample_order": 18,
+      "turn_key": "d6f402aeabc903be189ec0f41e5a2d5b5526b1b89636c3eab0a898c08d04a8fa",
+      "primary_domain": "AU02"
+    },
+    {
+      "sample_order": 19,
+      "turn_key": "778fad190cd3290d2ec795e6879d276b23fdc02609b5c174559c5e3dbdb301ba",
+      "primary_domain": "AU02"
+    },
+    {
+      "sample_order": 20,
+      "turn_key": "97db17f1a68b52db16331976d4c70625a8dea2870107ea98fd76eace158fce7b",
+      "primary_domain": "AU02"
+    },
+    {
+      "sample_order": 21,
+      "turn_key": "0b674d0ffdc323397aa2dc38860d51d417b398852e5c40d27a360457d386eca8",
+      "primary_domain": "AU02"
+    },
+    {
+      "sample_order": 22,
+      "turn_key": "4f2224aec083798666fc8b03ce98eb959bd095a667348c0392bbd0d90b07cbcf",
+      "primary_domain": "AU02"
+    },
+    {
+      "sample_order": 23,
+      "turn_key": "53d9dc7880716169b85799a468bd7eae22ddefc0f1fadb3fb1bcbc13bffa0b96",
+      "primary_domain": "AU02"
+    },
+    {
+      "sample_order": 24,
+      "turn_key": "a7874832c3d4eb1aefa0c243be08f41698379a643a9da6165750d5ca6086705c",
+      "primary_domain": "AU02"
+    },
+    {
+      "sample_order": 25,
+      "turn_key": "a1c4777d5a84060828da8f5bf077a093071b9fea35573254c04bc0fae4f29947",
+      "primary_domain": "AU02"
+    },
+    {
+      "sample_order": 26,
+      "turn_key": "07926b3a7abb5b13c950dfde0fc31be553389d723ed493fd337672199f24877a",
+      "primary_domain": "AU02"
+    },
+    {
+      "sample_order": 27,
+      "turn_key": "e7391bd7b6784a15b9912d4eb808b20d8813791dba8fd78a5fbee8a1a295b0b9",
+      "primary_domain": "AU03"
+    },
+    {
+      "sample_order": 28,
+      "turn_key": "74a2d2b9244c6572212c0c9615ccc6f65eec6bdd443111eba6d2deb27a7e9215",
+      "primary_domain": "AU03"
+    },
+    {
+      "sample_order": 29,
+      "turn_key": "a2ed1f53b17cb76942c5b4e069d690b8f7e516678ae03caef447c80345336846",
+      "primary_domain": "AU03"
+    },
+    {
+      "sample_order": 30,
+      "turn_key": "71c1a627cde1f46941fcf87295b719a3ee8aba13ca192b5e052c7aa5af7c7b0f",
+      "primary_domain": "AU03"
+    },
+    {
+      "sample_order": 31,
+      "turn_key": "e6ee46bd182cf774d9aa85b8a13810aae61346da6d8680a494986f859cce8321",
+      "primary_domain": "AU03"
+    },
+    {
+      "sample_order": 32,
+      "turn_key": "28ad7a41d159e7bb3f2b2458b9a0357c0f951321662d4f185feb00075a7948fb",
+      "primary_domain": "AU03"
+    },
+    {
+      "sample_order": 33,
+      "turn_key": "b7b8b1b2ad2f52025e787015a6bb53507a27b3acfae35aca51e10165f2fe5fe2",
+      "primary_domain": "AU03"
+    },
+    {
+      "sample_order": 34,
+      "turn_key": "14eb46372e17855bb95a07b0213393e9ba406bb3305001b8bc232deb48348ed4",
+      "primary_domain": "AU03"
+    },
+    {
+      "sample_order": 35,
+      "turn_key": "c68c5b3d256f85d523ef6f38d136a06c7ebcfbadfd1522ab4b0de742b307e7e1",
+      "primary_domain": "AU04"
+    },
+    {
+      "sample_order": 36,
+      "turn_key": "4cfc9c746b68c860051cb5601f68621e9d13fa86b28f47e2fbc6fe8a16ed9466",
+      "primary_domain": "AU04"
+    },
+    {
+      "sample_order": 37,
+      "turn_key": "56d243516be80a55d718662e98a95cbfb1cea31afef2e50beab5f152458d3352",
+      "primary_domain": "AU04"
+    },
+    {
+      "sample_order": 38,
+      "turn_key": "531e2ce41f0d366460f770abf34679632f9bced61348ebf77ccb9abb57528fe6",
+      "primary_domain": "AU04"
+    },
+    {
+      "sample_order": 39,
+      "turn_key": "8e7a5c2d35906566891bf69643b7e2af73164de3e1e0c31625f4da8fdbc70d96",
+      "primary_domain": "AU04"
+    },
+    {
+      "sample_order": 40,
+      "turn_key": "dc361f05978515a9821acd8ca6745171ded841f9f6174e2d9b83bcafb3acf046",
+      "primary_domain": "AU04"
+    },
+    {
+      "sample_order": 41,
+      "turn_key": "b80518068e8073a7d7c20bdfb469be48207e90468bb028ee3772342a3c08800b",
+      "primary_domain": "AU04"
+    },
+    {
+      "sample_order": 42,
+      "turn_key": "aeb72a19f60d9ef0c2c7491a32e1292e909dee72116f9eb1ebde62049b92036e",
+      "primary_domain": "AU04"
+    },
+    {
+      "sample_order": 43,
+      "turn_key": "12c0cfd0c3f6d396676b5c3e71f0d221708ca8185fa008e5e6198864c9ef806d",
+      "primary_domain": "AU05"
+    },
+    {
+      "sample_order": 44,
+      "turn_key": "fc5f3c6831eb8bc14537099533fa930546bbbfaf626e913464c2092e5d7a3321",
+      "primary_domain": "AU05"
+    },
+    {
+      "sample_order": 45,
+      "turn_key": "e64770bed584634a7fda9239d65334d5d2b8dac681fa8ad2c4c5e75bbfa09f8f",
+      "primary_domain": "AU05"
+    },
+    {
+      "sample_order": 46,
+      "turn_key": "f74e4c30d1fa0fc90b9ca288d8c1b0c7cd94dc7c1ad9663736d333d1544d9891",
+      "primary_domain": "AU05"
+    },
+    {
+      "sample_order": 47,
+      "turn_key": "ad986acf994db94164fc502baf6bb6b6e5417113bbbf150ca077f9fcec140d9c",
+      "primary_domain": "AU05"
+    },
+    {
+      "sample_order": 48,
+      "turn_key": "e9222061c4e34214ee94fb3b1a5a4de3a8f9fb6aa3151861e5de7c8e1c28979b",
+      "primary_domain": "AU05"
+    },
+    {
+      "sample_order": 49,
+      "turn_key": "f936541c2151ac957d5fea4d206293d0e331fe6d40337ff6745225c980d72a91",
+      "primary_domain": "AU05"
+    },
+    {
+      "sample_order": 50,
+      "turn_key": "f73f1d6c85f685fc76df5ee6e5feab52ff50ce0820b569ad42d403ad1c38755f",
+      "primary_domain": "AU05"
+    },
+    {
+      "sample_order": 51,
+      "turn_key": "99d3ab90107c634faf4b2689cf3b008e016c455c2ee1a3e53a6b761bac84c797",
+      "primary_domain": "AU05"
+    },
+    {
+      "sample_order": 52,
+      "turn_key": "860803ab9ac58d67bfb607f7eb912ff79ac94de18cb6b346d588fb471939191d",
+      "primary_domain": "AU06"
+    },
+    {
+      "sample_order": 53,
+      "turn_key": "8c120eb6b344cbf16295c601ca1766cc1794ffa7e05e412d099671a3b135a508",
+      "primary_domain": "AU06"
+    },
+    {
+      "sample_order": 54,
+      "turn_key": "b4929f1f9232e110414369a8d308ef5ca18b2a93dde6acd5eff57d0cd1a66ad5",
+      "primary_domain": "AU06"
+    },
+    {
+      "sample_order": 55,
+      "turn_key": "0f659b8b18efc4a70acb4729ab5e894b4ef4d07d0fc44f08484cf8b8a7e4be6c",
+      "primary_domain": "AU06"
+    },
+    {
+      "sample_order": 56,
+      "turn_key": "2440b169a5763cbd71a864993c89a009c6e70bcfbd14ef73998c2d4ae9991310",
+      "primary_domain": "AU06"
+    },
+    {
+      "sample_order": 57,
+      "turn_key": "babe27f002b5168a35d9aa0a38391eadcc5fded11aa7d55e77104b7a177f1938",
+      "primary_domain": "AU06"
+    },
+    {
+      "sample_order": 58,
+      "turn_key": "5b9a5fb39e66e0b1be748135096a02d92fe30c31efa45a60f010bacf1a2d119d",
+      "primary_domain": "AU06"
+    },
+    {
+      "sample_order": 59,
+      "turn_key": "9d3b19eaa9601043575ea00b76f04f34a128416178c5d41d3253a21d089f8cef",
+      "primary_domain": "AU07"
+    },
+    {
+      "sample_order": 60,
+      "turn_key": "9f507a0e08ecb0ee1de0ad5d7fcb12d434d94c0ead1bb9f16307bf02136c1cc7",
+      "primary_domain": "AU07"
+    },
+    {
+      "sample_order": 61,
+      "turn_key": "c7dbc3477e191e207c0a38144e31c9df4c372034bcfddc6ed39d68250b7b2841",
+      "primary_domain": "AU07"
+    },
+    {
+      "sample_order": 62,
+      "turn_key": "a17b1ffdcd401597f307db9bd09ec28fdeec333f3e211cfa0694c528c3228a48",
+      "primary_domain": "AU07"
+    },
+    {
+      "sample_order": 63,
+      "turn_key": "b9f902bf48426cfc68d589367efdca85c6f4686218e50220bbc1402ee737e8b3",
+      "primary_domain": "AU07"
+    },
+    {
+      "sample_order": 64,
+      "turn_key": "a720ae2c54c5843bbbf776de81218134bc91a1ca96a19eb056c32a1569b28b6e",
+      "primary_domain": "AU07"
+    },
+    {
+      "sample_order": 65,
+      "turn_key": "ce08c34b2edb4632bd5324fe27f62a065f554cf14dab66ba9eba3667a4f91481",
+      "primary_domain": "AU07"
+    },
+    {
+      "sample_order": 66,
+      "turn_key": "97cca5ac68ca8dda03bb59dde54f42a61a57a55a995f419bfcf0bb25472091ca",
+      "primary_domain": "AU07"
+    },
+    {
+      "sample_order": 67,
+      "turn_key": "4b1b1087ba65642ab645c22834973a4743b325a6f940860b6a422a0a18d4fddc",
+      "primary_domain": "AU07"
+    },
+    {
+      "sample_order": 68,
+      "turn_key": "c5642e11416e511298305f2952638825905d218f67e4ac9a4b9e903b0e842c7f",
+      "primary_domain": "AU07"
+    },
+    {
+      "sample_order": 69,
+      "turn_key": "fde9844be2e7299b8486cff55a8e7228c758e3ce02b2a02ace821f8069976211",
+      "primary_domain": "AU07"
+    },
+    {
+      "sample_order": 70,
+      "turn_key": "6f25c3d9c3f19471fd2d7ef157a9cea6e5ca39de44a089dadc7d6950cfd47a3b",
+      "primary_domain": "AU07"
+    },
+    {
+      "sample_order": 71,
+      "turn_key": "d922b82c04d30fc75da959720270045a61b97ab419c6b3cca075f84c3452efb4",
+      "primary_domain": "AU08"
+    },
+    {
+      "sample_order": 72,
+      "turn_key": "427bc216999d010fd73e71fa632c51d617c6d3b47c40418655813b9fbe0f5075",
+      "primary_domain": "AU08"
+    },
+    {
+      "sample_order": 73,
+      "turn_key": "8c8a5d5c205ede30c5af56a66601dbb96f2de2916b08fd1302d2cd0c0a27288b",
+      "primary_domain": "AU08"
+    },
+    {
+      "sample_order": 74,
+      "turn_key": "73083e3980615ba60775c359ace7708bcb13be171a7e3e3ccfaa83b311fb7389",
+      "primary_domain": "AU08"
+    },
+    {
+      "sample_order": 75,
+      "turn_key": "875f98ccea842cc3708999a3882de0d71598ec98a2099f8689b5fe10bac3f6c4",
+      "primary_domain": "AU09"
+    },
+    {
+      "sample_order": 76,
+      "turn_key": "8473915c4792143c644fd4d93787a585888aa3a1b883b4267edf31061fdc0548",
+      "primary_domain": "AU09"
+    },
+    {
+      "sample_order": 77,
+      "turn_key": "74e49a5a5160f8d06045724fb4973e2f7e819abf5767eff646905500fa017536",
+      "primary_domain": "AU09"
+    },
+    {
+      "sample_order": 78,
+      "turn_key": "b31361da43a642920c23e3809641fd5be545af0b4161350fbb8cb2abb921ac01",
+      "primary_domain": "AU09"
+    },
+    {
+      "sample_order": 79,
+      "turn_key": "6834d44435da14dc0c252def1ae73422235f14f1c404a8f86ffb611dd3c00244",
+      "primary_domain": "AU10"
+    },
+    {
+      "sample_order": 80,
+      "turn_key": "4339d27892c3535244f8b244dae7143d06ece65892feb3c1c67135c11b4f9a07",
+      "primary_domain": "AU10"
+    },
+    {
+      "sample_order": 81,
+      "turn_key": "3cf8670cfcbcedaaad2b54d511bf35a40f5bd90850c899aeaa0da4b4ea4985f5",
+      "primary_domain": "AU10"
+    },
+    {
+      "sample_order": 82,
+      "turn_key": "caec28d3119ed3c41abc745ee4b4e72cedd31ac21c57918f842658ba57a3226e",
+      "primary_domain": "AU10"
+    },
+    {
+      "sample_order": 83,
+      "turn_key": "ac6ba04d356e563ade6159c52970b34996c3d55bdc9910244d8f85155d1e51e5",
+      "primary_domain": "AU11"
+    },
+    {
+      "sample_order": 84,
+      "turn_key": "2dbe87d040284a163645fd9aec0afd59fe5fdeee2e2c285a1f9f8cf5b41bb674",
+      "primary_domain": "AU11"
+    },
+    {
+      "sample_order": 85,
+      "turn_key": "ca457a9576579e6d8acf49fcf09457d3cbab6b2488a053c385addaf4a71fe9c4",
+      "primary_domain": "AU12"
+    },
+    {
+      "sample_order": 86,
+      "turn_key": "76d0c67351811c8f3cc9b5c7fd4a331339243f781f990920a35f2f3b1104e3fe",
+      "primary_domain": "AU12"
+    },
+    {
+      "sample_order": 87,
+      "turn_key": "02bd565a2d4d3ab0ab58bdcf954518b34699fd40f495127cd4870587eedd821d",
+      "primary_domain": "AU12"
+    },
+    {
+      "sample_order": 88,
+      "turn_key": "7a4956e00d7bef4e547f52ed669ac021c136d9fa5201571a0c00f7be70b7d899",
+      "primary_domain": "AU12"
+    },
+    {
+      "sample_order": 89,
+      "turn_key": "f5712057ca56b10e642ee6fde5167986f7c276964903191b0189fc02b2f7d80a",
+      "primary_domain": "AU12"
+    },
+    {
+      "sample_order": 90,
+      "turn_key": "fd659fe336a195571f6a04e24914b70c7e47ab662bc95919df7eea97c56a99ca",
+      "primary_domain": "AU12"
+    },
+    {
+      "sample_order": 91,
+      "turn_key": "96d4ee77bf7cf9843600e037eea38fc26985bca32e1c69a4879e947c5592b295",
+      "primary_domain": "AU12"
+    },
+    {
+      "sample_order": 92,
+      "turn_key": "7ce781d7ad88320ab95b8687820bbb21907050c2398fec40ba5f34e27d54ab0e",
+      "primary_domain": "AU12"
+    },
+    {
+      "sample_order": 93,
+      "turn_key": "935e5f1b6da8e873ea32a1ce147285e635b987951dccbcc3f64693052f6496e7",
+      "primary_domain": "AU13"
+    },
+    {
+      "sample_order": 94,
+      "turn_key": "a605a9c161dccecb92e5b1c83a000b48799ddfce3b7ca1195dfb315aa640930a",
+      "primary_domain": "AU13"
+    },
+    {
+      "sample_order": 95,
+      "turn_key": "ef276026733d66feb00d5be71b551ae2db30b816dad2bee9ce8f825d13cb04b7",
+      "primary_domain": "AU13"
+    },
+    {
+      "sample_order": 96,
+      "turn_key": "6c6f86efcd480b2c5952ad80c429317f26a41f5699040d8cdcb86ee42e280063",
+      "primary_domain": "AU13"
+    },
+    {
+      "sample_order": 97,
+      "turn_key": "7af32d9e5bef27539f1b0d97b14fa3eb2e8e95cb3f4e7295af7b1f297f73ec93",
+      "primary_domain": "AU13"
+    },
+    {
+      "sample_order": 98,
+      "turn_key": "102cf4b9f23b00856cb67446e73c518c244b59f646adc74d806de5f512fc2411",
+      "primary_domain": "AU13"
+    },
+    {
+      "sample_order": 99,
+      "turn_key": "93152b48f811ee666b741361d6e9428ef3f122d6c0a64a899fcd5d3e1428d696",
+      "primary_domain": "AU13"
+    },
+    {
+      "sample_order": 100,
+      "turn_key": "6c873fb9330824be6ecf24fd858eeb9241262e71d8de8574ed87c921789bbbfb",
+      "primary_domain": "AU14"
+    }
+  ]
+}

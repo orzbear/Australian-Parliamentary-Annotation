@@ -17,9 +17,14 @@ from hansard_annotator.llm_eval.hostility import (
     prediction_json_schema as hostility_prediction_json_schema,
 )
 from hansard_annotator.llm_eval.hostility import (
-    validate_prediction as validate_hostility_prediction,
+    validate_prediction_with_diagnostics as validate_hostility_prediction,
 )
-from hansard_annotator.llm_eval.models import RequestResult, TokenUsage
+from hansard_annotator.llm_eval.models import (
+    HostilityPrediction,
+    RequestResult,
+    StructuredPrediction,
+    TokenUsage,
+)
 from hansard_annotator.llm_eval.package import EvaluationPackage
 from hansard_annotator.llm_eval.prompt import (
     DEFAULT_PROMPT_VERSION,
@@ -92,7 +97,7 @@ def make_configuration(
     system = build_system_prompt(package.context, prompt_version)
     schema = package.schema
     prediction_schema = (
-        hostility_prediction_json_schema()
+        hostility_prediction_json_schema(prompt_version)
         if package.task == "hostility"
         else prediction_json_schema(package.domain_codes)
     )
@@ -218,7 +223,7 @@ def evaluate(
     checkpoint_path = output / "predictions.jsonl"
     checkpoints = load_checkpoints(checkpoint_path)
     schema = (
-        hostility_prediction_json_schema()
+        hostility_prediction_json_schema(prompt_version)
         if package.task == "hostility"
         else prediction_json_schema(package.domain_codes)
     )
@@ -274,13 +279,22 @@ def evaluate(
                 )
             else:
                 try:
-                    prediction = (
-                        validate_hostility_prediction(
-                            response.raw_prediction, str(record["speech"]["text"])
+                    prediction: StructuredPrediction | HostilityPrediction
+                    if package.task == "hostility":
+                        prediction, evidence_diagnostics = validate_hostility_prediction(
+                            response.raw_prediction,
+                            str(record["speech"]["text"]),
+                            prompt_version,
                         )
-                        if package.task == "hostility"
-                        else validate_prediction(response.raw_prediction, package.domain_codes)
-                    )
+                    else:
+                        prediction = validate_prediction(
+                            response.raw_prediction, package.domain_codes
+                        )
+                        evidence_diagnostics = {}
+                    success_diagnostics = {
+                        **response.diagnostics,
+                        **evidence_diagnostics,
+                    }
                     result = RequestResult(
                         record_id,
                         "success",
@@ -289,11 +303,13 @@ def evaluate(
                         latency,
                         retries,
                         response.returned_model,
-                        diagnostics=response.diagnostics,
+                        diagnostics=success_diagnostics,
                     )
                 except InvalidPrediction as invalid:
                     diagnostics = dict(response.diagnostics)
                     diagnostics["schema_validation_error"] = str(invalid)
+                    if package.task == "hostility":
+                        diagnostics.update({"classification_valid": False, "evidence_valid": False})
                     result = RequestResult(
                         record_id,
                         "invalid",
