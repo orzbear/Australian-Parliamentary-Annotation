@@ -1956,7 +1956,7 @@ def test_hostility_terminal_invalid_import_is_immutable_and_idempotent(
     }
     invalid = {
         "record_id": record_id, "status": "invalid",
-        "prediction": {"hostility_present": "YES", "evidence_span": "ambiguous"},
+        "prediction": None,
         "validation_error": "hostility evidence must resolve uniquely to canonical text",
         "provider_response": {"responseId": "terminal-invalid-response"},
         "request_index": 0, "response_index": 0, "returned_model": FROZEN_MODEL,
@@ -1977,6 +1977,20 @@ def test_hostility_terminal_invalid_import_is_immutable_and_idempotent(
         "annotation_schema_slug": "australian_partisan_hostility",
         "annotation_schema_version": "0.2.0",
         "expected_configuration": expected,
+        "terminal_recovery_history": {
+            record_id: [
+                {
+                    "attempt_number": attempt,
+                    "recovery_id": f"recovery-{attempt}",
+                    "provider_job_id": f"batches/recovery-{attempt}",
+                    "original_validation_error": invalid["validation_error"],
+                    "replacement_validation_result": "invalid",
+                    "replacement_validation_error": invalid["validation_error"],
+                }
+                for attempt in range(1, 5)
+            ]
+        },
+        "require_terminal_recovery_lineage": True,
     }
     first = import_predictions(artifact, settings, dry_run=False, **kwargs)
     repeated = import_predictions(artifact, settings, dry_run=False, **kwargs)
@@ -1992,7 +2006,13 @@ def test_hostility_terminal_invalid_import_is_immutable_and_idempotent(
         ).fetchone()
         assert outcome is not None
         assert outcome[0:2] == ("INVALID_OUTPUT", "EVIDENCE_RESOLUTION_FAILED")
-        assert outcome[2]["attempt_count"] == 1
+        assert outcome[2]["attempt_count"] == 4
+        assert outcome[2]["recovery_attempt_count"] == 4
+        assert outcome[2]["recovery_attempt_number"] == 4
+        assert outcome[2]["recovery_provider_job_id"] == "batches/recovery-4"
+        assert outcome[2]["original_validation_error"] == invalid["validation_error"]
+        assert outcome[2]["final_validation_error"] == invalid["validation_error"]
+        assert len(outcome[2]["recovery_attempt_history"]) == 4
         with pytest.raises(psycopg.errors.ObjectNotInPrerequisiteState):
             connection.execute(
                 "UPDATE model_prediction_abstentions SET resolution_reason='PROHIBITED_CONTENT'"
