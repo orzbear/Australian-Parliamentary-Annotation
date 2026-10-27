@@ -44,7 +44,7 @@ from hansard_annotator.db.review_export import (
     export_review_sample,
 )
 from hansard_annotator.llm_eval.import_predictions import import_predictions
-from hansard_annotator.llm_eval.operations import canonical_hash
+from hansard_annotator.llm_eval.operations import FROZEN_MODEL, canonical_hash
 from hansard_annotator.llm_eval.prediction_tasks import adapt_hostility_prediction
 from hansard_annotator.product.cli import main as product_cli
 from hansard_annotator.product.loaders import (
@@ -186,7 +186,7 @@ def database_url(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     cleanup_url = TEST_URL.replace("postgresql+psycopg://", "postgresql://")
     with psycopg.connect(cleanup_url, autocommit=True) as connection:
         connection.execute(
-            "TRUNCATE model_prediction_abstentions,"
+            "TRUNCATE model_prediction_outcome_reviews,model_prediction_abstentions,"
             "ai_annotation_campaign_recovery_records,"
             "ai_annotation_campaign_recoveries,ai_annotation_campaign_records,"
             "ai_annotation_campaign_batches,ai_annotation_campaigns,"
@@ -1074,6 +1074,11 @@ def test_phase4d_migration_constraints_immutability_linkage_and_downgrade_guard(
         "speaker_turns",
     }
     command.upgrade(config, "head")
+    inspector = inspect(create_database_engine(settings))
+    assert "model_prediction_outcome_reviews" in inspector.get_table_names()
+    assert "terminal_invalid_count" in {
+        column["name"] for column in inspector.get_columns("ai_annotation_campaigns")
+    }
 
     import_validated_run(settings, _fixture_run(tmp_path, run_id="phase4d-db-fixture"))
     password = "phase4d database test password"
@@ -1914,6 +1919,86 @@ def test_provider_refusals_import_separately_and_exclude_same_configuration(
     assert record_ids[1] in override_selected
 
 
+def test_hostility_terminal_invalid_import_is_immutable_and_idempotent(
+    database_url: str, tmp_path: Path
+) -> None:
+    settings = DatabaseSettings.from_environment()
+    import_validated_run(settings, _fixture_run(tmp_path, run_id="terminal-invalid-fixture"))
+    url = database_url.replace("postgresql+psycopg://", "postgresql://")
+    with psycopg.connect(url) as connection:
+        turn = connection.execute(
+            "SELECT turn_key FROM speaker_turns ORDER BY id LIMIT 1"
+        ).fetchone()
+    assert turn is not None
+    record_id = f"turn:{turn[0]}"
+    artifact = tmp_path / "terminal-invalid-artifact"
+    artifact.mkdir()
+    provenance = {
+        "provider": "gemini", "model": FROZEN_MODEL,
+        "prompt_version": "hostility-prompt-v2",
+        "assembled_prompt_sha256": "a" * 64, "canonical_schema_sha256": "b" * 64,
+        "prediction_contract_sha256": "c" * 64, "provider_schema_sha256": "d" * 64,
+        "thinking_budget": 0, "execution_mode": "batch",
+        "batch_id": "batches/terminal-invalid-fixture", "record_ids_sha256": "e" * 64,
+    }
+    summary = {
+        "provenance": provenance, "batch_status": {"model": FROZEN_MODEL},
+        "coverage": {
+            "planned_requests": 1, "successful_provider_responses": 1,
+            "failed_provider_responses": 0, "valid_structured_predictions": 0,
+            "invalid_structured_predictions": 1, "provider_refused": 0,
+            "missing_responses": 0, "duplicate_mappings": 0,
+            "accounting_invariant_ok": False,
+        },
+        "tokens": {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0},
+        "cost": {"token_processing_cost_usd": 0, "explicit_cache_storage_cost_usd": 0,
+                 "total_pilot_cost_usd": 0},
+    }
+    invalid = {
+        "record_id": record_id, "status": "invalid",
+        "prediction": {"hostility_present": "YES", "evidence_span": "ambiguous"},
+        "validation_error": "hostility evidence must resolve uniquely to canonical text",
+        "provider_response": {"responseId": "terminal-invalid-response"},
+        "request_index": 0, "response_index": 0, "returned_model": FROZEN_MODEL,
+        "usage": {},
+    }
+    (artifact / "operational_summary.json").write_text(json.dumps(summary), encoding="utf-8")
+    (artifact / "predictions.jsonl").write_text(json.dumps(invalid) + "\n", encoding="utf-8")
+    expected = {
+        key: provenance[key]
+        for key in (
+            "provider", "model", "prompt_version", "assembled_prompt_sha256",
+            "canonical_schema_sha256", "prediction_contract_sha256",
+            "provider_schema_sha256", "execution_mode",
+        )
+    }
+    kwargs = {
+        "prediction_task": "hostility",
+        "annotation_schema_slug": "australian_partisan_hostility",
+        "annotation_schema_version": "0.2.0",
+        "expected_configuration": expected,
+    }
+    first = import_predictions(artifact, settings, dry_run=False, **kwargs)
+    repeated = import_predictions(artifact, settings, dry_run=False, **kwargs)
+    assert first["inserted_predictions"] == 0
+    assert first["inserted_terminal_invalid_outcomes"] == 1
+    assert repeated["inserted_runs"] == 0
+    assert repeated["existing_terminal_invalid_outcomes"] == 1
+    with psycopg.connect(url) as connection:
+        assert connection.execute("SELECT count(*) FROM model_predictions").fetchone()[0] == 0
+        outcome = connection.execute(
+            "SELECT resolution_type,resolution_reason,outcome_provenance "
+            "FROM model_prediction_abstentions"
+        ).fetchone()
+        assert outcome is not None
+        assert outcome[0:2] == ("INVALID_OUTPUT", "EVIDENCE_RESOLUTION_FAILED")
+        assert outcome[2]["attempt_count"] == 1
+        with pytest.raises(psycopg.errors.ObjectNotInPrerequisiteState):
+            connection.execute(
+                "UPDATE model_prediction_abstentions SET resolution_reason='PROHIBITED_CONTENT'"
+            )
+
+
 def test_canonical_full_corpus_ai_export_combines_exact_configuration_runs(
     database_url: str, tmp_path: Path
 ) -> None:
@@ -2104,7 +2189,7 @@ def test_canonical_full_corpus_ai_export_combines_exact_configuration_runs(
             """
             INSERT INTO model_prediction_abstentions
               (run_id,speaker_turn_id,record_id,resolution_reason,
-               refusal_provenance,artifact_reference)
+               outcome_provenance,artifact_reference)
             VALUES (%s,%s,%s,'PROHIBITED_CONTENT',%s,'test/provider_refusals.jsonl')
             """,
             (

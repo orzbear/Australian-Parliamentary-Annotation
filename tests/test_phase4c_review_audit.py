@@ -158,6 +158,39 @@ def test_accepted_and_edited_flags_overlap_without_replacing_outcomes() -> None:
     assert summary["flag_analysis"]["unique_flag_notes"] == {"Boundary unclear": 2}
 
 
+def test_terminal_hostility_failure_stays_distinct_in_review_audit() -> None:
+    row = _row(1, status=None)
+    row.update(
+        prediction_task="hostility",
+        ai_valid_prediction=False,
+        ai_outcome_status="INVALID_OUTPUT",
+        ai_failure_reason="EVIDENCE_RESOLUTION_FAILED",
+        ai_prediction_values=None,
+        ai_is_non_policy=None,
+        ai_primary_domain=None,
+        ai_secondary_domains=None,
+        ai_reasoning=None,
+        review_status="human_annotated_after_ai_failure",
+        annotation_version_id=123,
+        human_speaker_turn_id=1,
+        human_values={"hostility_present": "YES", "target": "PARTY_OR_COALITION", "evidence_span": []},
+    )
+    run = _run(0)
+    run["invalid_count"] = 1
+    run["prediction_task"] = "hostility"
+    summary, edited, flagged = analyse_review_rows(run, [row])
+    exported = full_review_rows([row])[0]
+    assert not edited and not flagged
+    assert summary["counts"]["terminal_ai_failures"] == 1
+    assert summary["counts"]["coverage"] == 0
+    assert exported["ai_valid_prediction"] is False
+    assert exported["ai_outcome_status"] == "INVALID_OUTPUT"
+    assert exported["ai_prediction_values"] is None
+    assert exported["ai_hostility_present"] is None
+    assert exported["reviewed_hostility"] == "YES"
+    assert exported["terminal_review_action"] == "human_annotated_after_ai_failure"
+
+
 def test_flag_without_terminal_decision_is_still_exported() -> None:
     row = _row(1, status=None, flag_notes=["Needs codebook clarification"])
     summary, edited, flagged = analyse_review_rows(_run(1), [row])
@@ -219,11 +252,11 @@ class _Result:
 
 class _RecordingConnection:
     def __init__(self) -> None:
-        self.query = ""
+        self.queries: list[str] = []
         self.parameters: tuple[object, ...] = ()
 
     def execute(self, query: str, parameters: tuple[object, ...]) -> _Result:
-        self.query = query
+        self.queries.append(query)
         self.parameters = parameters
         return _Result([])
 
@@ -231,8 +264,9 @@ class _RecordingConnection:
 def test_latest_effective_terminal_review_is_selected_without_duplicate_rows() -> None:
     connection = _RecordingConnection()
     assert _load_rows(connection, 7) == []  # type: ignore[arg-type]
-    assert "review.review_status IN ('accepted','edited','skipped')" in connection.query
-    assert "ORDER BY reviewed_at DESC,id DESC LIMIT 1" in connection.query
+    assert any("review.review_status IN ('accepted','edited','skipped')" in query for query in connection.queries)
+    assert any("ORDER BY reviewed_at DESC,id DESC LIMIT 1" in query for query in connection.queries)
+    assert any("resolution_type='INVALID_OUTPUT'" in query for query in connection.queries)
     assert connection.parameters == (7,)
 
 

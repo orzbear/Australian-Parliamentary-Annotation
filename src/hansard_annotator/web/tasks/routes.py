@@ -17,6 +17,7 @@ from hansard_annotator.web.annotations.ai_review import (
     ensure_prediction_assignment,
     next_unreviewed_prediction,
     prediction_review_workspace,
+    record_outcome_review,
     record_prediction_review,
 )
 from hansard_annotator.web.annotations.service import (
@@ -469,6 +470,8 @@ def individual_ai_review(
     principal: Annotated[Principal, Depends(require_principal)],
 ) -> object:
     workspace = _review_workspace_or_http(settings, principal, prediction_id)
+    if workspace.get("ai_unavailable"):
+        raise HTTPException(status_code=409, detail="no valid AI prediction is available to accept")
     return _templates(request).TemplateResponse(
         request,
         "annotations/ai_workspace.html",
@@ -485,6 +488,8 @@ async def accept_prediction(
 ) -> RedirectResponse:
     await enforce_csrf(request, principal, settings)
     workspace = _review_workspace_or_http(settings, principal, prediction_id)
+    if workspace.get("ai_unavailable"):
+        raise HTTPException(status_code=409, detail="no valid AI prediction is available to accept")
     assignment_id = ensure_prediction_assignment(settings, principal, prediction_id)
     payload = _accepted_ai_payload(
         {"fields": workspace["fields"], "ai_prediction": workspace["prediction"],
@@ -526,15 +531,22 @@ async def edit_prediction(
             {"principal": principal, **workspace, "errors": error.outcome.errors},
             status_code=422,
         )
-    status = _prediction_decision_status(payload, workspace["suggested_values"])
-    record_prediction_review(
-        settings,
-        principal,
-        prediction_id,
-        status,
-        assignment_id=assignment_id,
-        annotation_version_id=cast(int, result["annotation_version_id"]),
-    )
+    if workspace.get("ai_unavailable"):
+        record_outcome_review(
+            settings, principal, prediction_id, "human_annotated_after_ai_failure",
+            assignment_id=assignment_id,
+            annotation_version_id=cast(int, result["annotation_version_id"]),
+        )
+    else:
+        status = _prediction_decision_status(payload, workspace["suggested_values"])
+        record_prediction_review(
+            settings,
+            principal,
+            prediction_id,
+            status,
+            assignment_id=assignment_id,
+            annotation_version_id=cast(int, result["annotation_version_id"]),
+        )
     return RedirectResponse(_next_review_destination(settings, prediction_id), status_code=303)
 
 
@@ -547,7 +559,9 @@ async def flag_prediction(
     note: Annotated[str, Form()],
 ) -> RedirectResponse:
     await enforce_csrf(request, principal, settings)
-    _review_workspace_or_http(settings, principal, prediction_id)
+    workspace = _review_workspace_or_http(settings, principal, prediction_id)
+    if workspace.get("ai_unavailable"):
+        raise HTTPException(status_code=409, detail="codebook flags require a valid AI prediction")
     if not note.strip():
         raise HTTPException(status_code=422, detail="codebook flag note is required")
     record_prediction_review(settings, principal, prediction_id, "flagged_codebook", note=note)
@@ -562,8 +576,11 @@ async def skip_prediction(
     principal: Annotated[Principal, Depends(require_principal)],
 ) -> RedirectResponse:
     await enforce_csrf(request, principal, settings)
-    _review_workspace_or_http(settings, principal, prediction_id)
-    record_prediction_review(settings, principal, prediction_id, "skipped")
+    workspace = _review_workspace_or_http(settings, principal, prediction_id)
+    if workspace.get("ai_unavailable"):
+        record_outcome_review(settings, principal, prediction_id, "skipped")
+    else:
+        record_prediction_review(settings, principal, prediction_id, "skipped")
     return RedirectResponse(_next_review_destination(settings, prediction_id), status_code=303)
 
 

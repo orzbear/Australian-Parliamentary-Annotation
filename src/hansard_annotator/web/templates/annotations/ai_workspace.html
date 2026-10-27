@@ -22,6 +22,12 @@
 
   <aside class="ai-review-sidebar">
     <section class="ai-suggestion-panel" aria-labelledby="ai-heading">
+      {% if ai_unavailable %}
+      <p class="eyebrow">Terminal model outcome</p>
+      <h2 id="ai-heading" class="mt-1 text-2xl font-semibold">AI prediction unavailable</h2>
+      <p class="mt-3">{{ prediction.failure_message }}</p>
+      <p class="mt-2 text-sm text-muted">Evidence could not be resolved uniquely to the source speech. Review the speech and annotate from scratch.</p>
+      {% else %}
       <p class="eyebrow">AI suggestion — not yet human approved</p>
       {% if prediction.prediction_task == 'hostility' %}
       <h2 id="ai-heading" class="mt-1 text-2xl font-semibold">Hostility: {{ prediction.values.hostility_present }}</h2>
@@ -37,6 +43,7 @@
       </dl>
       {% endif %}
       <div class="model-reasoning"><strong>Model reasoning</strong><p>{{ prediction.reasoning }}</p></div>
+      {% endif %}
       <details class="provenance mt-4">
         <summary>Model provenance</summary>
         <dl class="metadata mt-2">
@@ -53,7 +60,9 @@
     <section class="human-result-panel" aria-labelledby="human-result-heading">
       <p class="eyebrow">Recorded human annotation</p>
       <h2 id="human-result-heading" class="mt-1 text-xl font-semibold">AI versus human</h2>
-      {% if prediction.prediction_task == 'hostility' %}
+      {% if ai_unavailable %}
+      <p class="mt-3 text-sm text-muted">Human annotation recorded after AI failure.</p>
+      {% elif prediction.prediction_task == 'hostility' %}
       <div class="comparison-grid mt-3">
         <div><span>Hostility</span><strong>AI: {{ prediction.values.hostility_present }}</strong><strong>Human: {{ human_annotation.values.hostility_present }}</strong></div>
         <div><span>Target</span><strong>AI: {{ prediction.values.target }}</strong><strong>Human: {{ human_annotation.values.target or 'N/A' }}</strong></div>
@@ -79,21 +88,21 @@
     {% endif %}
 
     <section class="human-review-panel" aria-labelledby="human-form-heading">
-      <div class="annotation-title"><p class="eyebrow">Human review</p><h2 id="human-form-heading" class="mt-1 text-2xl font-semibold">Confirm or correct</h2><p class="mt-2 text-sm text-muted">Controls begin with the AI suggestion. Submitted values become a normal human annotation revision.</p></div>
+      <div class="annotation-title"><p class="eyebrow">Human review</p><h2 id="human-form-heading" class="mt-1 text-2xl font-semibold">{% if ai_unavailable %}Annotate from scratch{% else %}Confirm or correct{% endif %}</h2><p class="mt-2 text-sm text-muted">{% if ai_unavailable %}No AI values are prefilled. Your submission becomes a normal human annotation revision linked to the terminal AI failure.{% else %}Controls begin with the AI suggestion. Submitted values become a normal human annotation revision.{% endif %}</p></div>
       <div class="secondary-actions">
-        <form method="post" action="/ai-reviews/{{ prediction.public_id }}/flag">{{ csrf(principal) }}<label for="flag-note">Codebook issue note</label><textarea id="flag-note" name="note" rows="2" maxlength="2000" placeholder="AU07/AU08 boundary unclear" required></textarea><button class="btn btn-danger mt-2" type="submit">Flag codebook issue</button></form>
+        {% if not ai_unavailable %}<form method="post" action="/ai-reviews/{{ prediction.public_id }}/flag">{{ csrf(principal) }}<label for="flag-note">Codebook issue note</label><textarea id="flag-note" name="note" rows="2" maxlength="2000" placeholder="AU07/AU08 boundary unclear" required></textarea><button class="btn btn-danger mt-2" type="submit">Flag codebook issue</button></form>{% endif %}
         <div class="flex flex-wrap gap-2">
           <form method="post" action="/ai-reviews/{{ prediction.public_id }}/skip">{{ csrf(principal) }}<button class="btn btn-quiet" type="submit">Skip &amp; next</button></form>
           <a class="btn btn-quiet" href="/ai-reviews?status=unreviewed">Back to queue</a>
         </div>
       </div>
-      <form class="primary-review-action" method="post" action="/ai-reviews/{{ prediction.public_id }}/accept">
+      {% if not ai_unavailable %}<form class="primary-review-action" method="post" action="/ai-reviews/{{ prediction.public_id }}/accept">
         {{ csrf(principal) }}
         <button class="btn btn-primary" type="submit">Accept AI &amp; next</button>
-      </form>
+      </form>{% endif %}
       <input id="correction-toggle" class="correction-toggle-input" type="checkbox" data-correction-toggle {% if errors %}checked{% endif %}>
       <div class="correction-toggle-wrap">
-        <label class="choice-card" for="correction-toggle"><span><strong>I want to correct the annotation</strong><small>Open the human controls to change policy status or categories.</small></span></label>
+        <label class="choice-card" for="correction-toggle"><span><strong>{% if ai_unavailable %}Enter human annotation{% else %}I want to correct the annotation{% endif %}</strong><small>{% if ai_unavailable %}Open the human controls and classify the speech yourself.{% else %}Open the human controls to change policy status or categories.{% endif %}</small></span></label>
       </div>
       <form id="annotation-form" method="post" action="/ai-reviews/{{ prediction.public_id }}/edit" data-dirty-form data-correction-form>
         {{ csrf(principal) }}

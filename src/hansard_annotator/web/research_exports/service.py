@@ -54,7 +54,8 @@ def export_catalog(settings: WebSettings, principal: Principal) -> dict[str, Any
                        run.valid_count,run.imported_at,campaign.name AS campaign_name,
                        count(prediction.id) AS prediction_count,
                        (SELECT count(*) FROM model_prediction_abstentions abstention
-                        WHERE abstention.run_id=run.id) AS provider_refusal_count,
+                        WHERE abstention.run_id=run.id
+                          AND abstention.resolution_type='PROVIDER_REFUSAL') AS provider_refusal_count,
                        count(prediction.id) FILTER (WHERE terminal.review_status IS NOT NULL)
                          AS reviewed_count,
                        count(prediction.id) FILTER (WHERE terminal.review_status IS NULL)
@@ -218,11 +219,13 @@ def provider_refusal_export(
             SELECT abstention.public_id AS abstention_id,abstention.record_id,
                    abstention.speaker_turn_id,turn.turn_key,turn.speech_date,turn.chamber,
                    turn.speaker_name_raw,abstention.resolution_type,
-                   abstention.resolution_reason,abstention.refusal_provenance,
+                   abstention.resolution_reason,
+                   abstention.outcome_provenance AS refusal_provenance,
                    abstention.artifact_reference,abstention.created_at
             FROM model_prediction_abstentions abstention
             JOIN speaker_turns turn ON turn.id=abstention.speaker_turn_id
-            WHERE abstention.run_id=%s ORDER BY abstention.record_id,abstention.id
+            WHERE abstention.run_id=%s AND abstention.resolution_type='PROVIDER_REFUSAL'
+            ORDER BY abstention.record_id,abstention.id
             """,
             (run["id"],),
         ).fetchall()
