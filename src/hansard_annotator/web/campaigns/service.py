@@ -23,6 +23,7 @@ from hansard_annotator.llm_eval.hostility import prediction_json_schema as hosti
 from hansard_annotator.llm_eval.import_predictions import (
     import_predictions,
     inspect_prediction_artifact,
+    iter_terminal_invalid_artifact,
     load_prediction_artifact,
 )
 from hansard_annotator.llm_eval.operations import (
@@ -2696,14 +2697,24 @@ def validate_campaign(
         coverage = summary["coverage"]
         valid_count = int(coverage.get("valid_structured_predictions") or 0)
         refusal_count = int(coverage.get("provider_refused") or 0)
-        if row_count != valid_count or valid_count + refusal_count != int(
+        terminal_invalid_count = sum(
+            1
+            for _row in iter_terminal_invalid_artifact(
+                directory, prediction_task=configuration.prediction_task
+            )
+        )
+        invalid_reported = int(coverage.get("invalid_structured_predictions") or 0)
+        if invalid_reported != terminal_invalid_count:
+            raise CampaignError("terminal invalid outcomes do not match collected results")
+        if terminal_invalid_count and configuration.prediction_task != "hostility":
+            raise CampaignError("terminal invalid outcomes are not supported for this task")
+        if row_count != valid_count or valid_count + refusal_count + terminal_invalid_count != int(
             campaign["planned_count"]
         ):
             raise CampaignError("validated result coverage does not equal planned records")
         if any(
             int(coverage.get(key) or 0)
             for key in (
-                "invalid_structured_predictions",
                 "failed_provider_responses",
                 "missing_responses",
                 "duplicate_mappings",
@@ -2713,10 +2724,10 @@ def validate_campaign(
         updated = connection.execute(
             """
             UPDATE ai_annotation_campaigns SET status='VALIDATED',validated_at=now(),
-              valid_count=%s,invalid_count=%s
+              valid_count=%s,invalid_count=%s,terminal_invalid_count=%s
             WHERE id=%s RETURNING *
             """,
-            (valid_count, 0, campaign["id"]),
+            (valid_count, 0, terminal_invalid_count, campaign["id"]),
         ).fetchone()
         assert updated is not None
         return dict(updated)
@@ -2751,12 +2762,37 @@ def import_campaign(
             "provider_schema_sha256": configuration.provider_schema_sha256,
             "execution_mode": configuration.execution_mode,
         }
+        history_rows = connection.execute(
+            """SELECT campaign_record.record_id,recovery.attempt_number,
+                      recovery.public_id::text AS recovery_id,recovery.provider_job_id,
+                      recovery.status,recovery.artifact_reference,
+                      recovery_record.original_validation_error
+               FROM ai_annotation_campaign_recoveries recovery
+               JOIN ai_annotation_campaign_recovery_records recovery_record
+                 ON recovery_record.recovery_id=recovery.id
+               JOIN ai_annotation_campaign_records campaign_record
+                 ON campaign_record.id=recovery_record.campaign_record_id
+               WHERE recovery.campaign_id=%s
+               ORDER BY campaign_record.record_id,recovery.attempt_number""",
+            (campaign["id"],),
+        ).fetchall()
+        terminal_recovery_history: dict[str, list[dict[str, Any]]] = {}
+        for history_row in history_rows:
+            terminal_recovery_history.setdefault(str(history_row["record_id"]), []).append(
+                dict(history_row)
+            )
         result = import_predictions(
             artifact, settings.database, dry_run=False,
             prediction_task=configuration.prediction_task,
             annotation_schema_slug=configuration.annotation_schema_slug,
             annotation_schema_version=configuration.annotation_schema_version,
             expected_configuration=expected,
+            terminal_recovery_history=terminal_recovery_history,
+            campaign_provenance={
+                "campaign_id": str(campaign["public_id"]),
+                "campaign_name": str(campaign["name"]),
+                "configuration_id": str(campaign["configuration_id"]),
+            },
         )
         run = connection.execute(
             "SELECT id FROM model_prediction_runs WHERE artifact_sha256=%s",

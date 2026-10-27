@@ -1070,6 +1070,9 @@ def test_import_links_existing_phase4c_run_and_repeated_import_is_idempotent(
 ) -> None:
     campaign = {
         "id": 1,
+        "public_id": "campaign-public-id",
+        "name": "Fixture campaign",
+        "configuration_id": "policy-v2",
         "status": "VALIDATED",
         "model_prediction_run_id": None,
         "artifact_reference": str(tmp_path / "artifact"),

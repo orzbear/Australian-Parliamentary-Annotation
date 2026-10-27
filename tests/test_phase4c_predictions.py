@@ -8,7 +8,10 @@ from typing import Any
 import pytest
 from fastapi import HTTPException
 
-from hansard_annotator.llm_eval.import_predictions import load_prediction_artifact
+from hansard_annotator.llm_eval.import_predictions import (
+    iter_terminal_invalid_artifact,
+    load_prediction_artifact,
+)
 from hansard_annotator.llm_eval.operations import (
     APPROVED_PRODUCTION_GENERATION,
     APPROVED_PRODUCTION_MODEL,
@@ -92,6 +95,49 @@ def test_prediction_artifact_accepts_new_production_identity_without_rewriting_h
     assert historical_summary["provenance"]["thinking_budget"] == 0
     assert current_loaded["provenance"]["model"] == APPROVED_PRODUCTION_MODEL
     assert current_loaded["provenance"]["thinking_level"] == "minimal"
+
+
+def test_hostility_terminal_evidence_failure_is_not_a_prediction(tmp_path: Path) -> None:
+    artifact = tmp_path / "hostility-terminal"
+    _write_artifact(artifact)
+    summary_path = artifact / "operational_summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["coverage"].update(
+        planned_requests=2,
+        valid_structured_predictions=1,
+        invalid_structured_predictions=1,
+        provider_refused=0,
+        failed_provider_responses=0,
+        missing_responses=0,
+        duplicate_mappings=0,
+        accounting_invariant_ok=False,
+    )
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+    invalid = {
+        "record_id": "turn:invalid-key",
+        "status": "invalid",
+        "prediction": {"hostility_present": "YES", "evidence_span": "ambiguous"},
+        "validation_error": "hostility evidence must resolve uniquely to canonical text",
+        "provider_response": {"responseId": "response-1"},
+        "request_index": 1,
+    }
+    with (artifact / "predictions.jsonl").open("a", encoding="utf-8") as target:
+        target.write(json.dumps(invalid) + "\n")
+    expected = {
+        "provider": "gemini",
+        "prompt_version": FROZEN_PROMPT_VERSION,
+        "assembled_prompt_sha256": FROZEN_PROMPT_SHA256,
+        "canonical_schema_sha256": FROZEN_CANONICAL_SCHEMA_SHA256,
+        "execution_mode": "batch",
+    }
+    _summary, predictions, _digest = load_prediction_artifact(
+        artifact,
+        prediction_task="hostility",
+        expected_configuration=expected,
+    )
+    terminal = list(iter_terminal_invalid_artifact(artifact, prediction_task="hostility"))
+    assert [row["record_id"] for row in predictions] == ["turn:stable-key"]
+    assert [row["record_id"] for row in terminal] == ["turn:invalid-key"]
 
 
 @pytest.mark.parametrize(

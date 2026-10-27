@@ -281,7 +281,7 @@ def _canonical_query() -> str:
                prediction.match_count AS prediction_match_count,
                abstention.public_id AS abstention_public_id,
                abstention.resolution_type,abstention.resolution_reason,
-               abstention.refusal_provenance,
+               abstention.outcome_provenance AS refusal_provenance,
                abstention.artifact_reference AS abstention_artifact_reference,
                abstention.created_at AS abstention_created_at,
                abstention.match_count AS abstention_match_count,
