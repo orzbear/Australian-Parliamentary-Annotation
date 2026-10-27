@@ -276,7 +276,11 @@ def _prediction_insert_values(
             (
                 run_id, turn_ids[turn_key], row["record_id"], prediction["is_non_policy"],
                 prediction["primary_australian_domain"],
-                prediction["secondary_australian_domains"], prediction["reasoning"],
+                prediction["secondary_australian_domains"], Jsonb({
+                    "is_non_policy": prediction["is_non_policy"],
+                    "primary_australian_domain": prediction["primary_australian_domain"],
+                    "secondary_australian_domains": prediction["secondary_australian_domains"],
+                }), prediction["reasoning"],
                 Jsonb(response) if response is not None else None,
                 f"{directory}/predictions.jsonl#{row.get('request_index')}", response_id,
                 usage.get("input_tokens", 0), usage.get("cached_input_tokens", 0),
@@ -370,7 +374,8 @@ def import_predictions(
         run = connection.execute(
             """
             INSERT INTO model_prediction_runs
-              (artifact_sha256,provider,configured_model,returned_model,prompt_version,
+              (artifact_sha256,prediction_task,annotation_schema_slug,
+               annotation_schema_version,provider,configured_model,returned_model,prompt_version,
                prompt_sha256,canonical_schema_sha256,prediction_contract_sha256,
                provider_schema_sha256,generation_config,execution_mode,provider_job_id,
                cache_identifier,pricing_format_version,pricing_effective_date,
@@ -379,11 +384,14 @@ def import_predictions(
                input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,
                token_processing_cost_usd,cache_storage_cost_usd,total_cost_usd,status,metadata)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                    %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             RETURNING id
             """,
             (
                 artifact_sha256,
+                "policy",
+                "australian_policy_annotation",
+                "0.2.0",
                 provenance["provider"],
                 provenance["model"],
                 status.get("model"),
@@ -434,11 +442,11 @@ def import_predictions(
                 """
                 INSERT INTO model_predictions
                   (run_id,speaker_turn_id,record_id,is_non_policy,primary_australian_domain,
-                   secondary_australian_domains,reasoning,validation_status,
+                   secondary_australian_domains,prediction_values,reasoning,validation_status,
                    raw_provider_response,artifact_reference,provider_response_id,input_tokens,
                    cached_input_tokens,output_tokens,reasoning_tokens,request_index,response_index,
                    returned_model)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,'success',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'success',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """,
                 values,
             )

@@ -45,6 +45,7 @@ from hansard_annotator.db.review_export import (
 )
 from hansard_annotator.llm_eval.import_predictions import import_predictions
 from hansard_annotator.llm_eval.operations import canonical_hash
+from hansard_annotator.llm_eval.prediction_tasks import adapt_hostility_prediction
 from hansard_annotator.product.cli import main as product_cli
 from hansard_annotator.product.loaders import (
     load_annotation_schema,
@@ -2460,6 +2461,199 @@ def test_phase4c_prediction_runs_allow_same_turn_across_immutable_runs(
                 "UPDATE model_predictions SET reasoning='changed' WHERE run_id=%s",
                 (run_ids[0],),
             )
+
+
+def test_task_aware_prediction_migration_round_trip_with_existing_policy_data(
+    database_url: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HANSARD_DATABASE_URL", database_url)
+    config = Config("alembic.ini")
+    command.downgrade(config, "20261020_10")
+    settings = DatabaseSettings(url=database_url, processed_data_root=Path("data/processed"))
+    import_validated_run(settings, _fixture_run(tmp_path, run_id="task-aware-migration"))
+    url = database_url.replace("postgresql+psycopg://", "postgresql://")
+    with psycopg.connect(url, row_factory=dict_row) as connection:
+        turn = connection.execute(
+            "SELECT id,turn_key,text_clean FROM speaker_turns ORDER BY id LIMIT 1"
+        ).fetchone()
+        assert turn is not None
+        policy_run = connection.execute(
+            """
+            INSERT INTO model_prediction_runs
+              (artifact_sha256,provider,configured_model,prompt_version,prompt_sha256,
+               canonical_schema_sha256,execution_mode,record_set_sha256,
+               requested_count,provider_success_count,provider_failure_count,
+               valid_count,invalid_count,status)
+            VALUES (%s,'gemini','gemini-2.5-flash','phase4a-policy-v2',%s,%s,
+                    'batch',%s,1,1,0,1,0,'imported') RETURNING id
+            """,
+            ("a" * 64, "b" * 64, "c" * 64, "d" * 64),
+        ).fetchone()
+        assert policy_run is not None
+        policy = connection.execute(
+            """
+            INSERT INTO model_predictions
+              (run_id,speaker_turn_id,record_id,is_non_policy,
+               primary_australian_domain,secondary_australian_domains,
+               reasoning,validation_status)
+            VALUES (%s,%s,%s,false,'AU06',ARRAY['AU02'],'Policy reason.','success')
+            RETURNING id
+            """,
+            (policy_run["id"], turn["id"], f"turn:{turn['turn_key']}"),
+        ).fetchone()
+        assert policy is not None
+
+    command.upgrade(config, "head")
+    with psycopg.connect(url, row_factory=dict_row) as connection:
+        migrated = connection.execute(
+            """
+            SELECT mp.*,run.prediction_task AS run_task,run.annotation_schema_slug,
+                   run.annotation_schema_version
+            FROM model_predictions mp JOIN model_prediction_runs run ON run.id=mp.run_id
+            WHERE mp.id=%s
+            """,
+            (policy["id"],),
+        ).fetchone()
+        assert migrated is not None
+        assert migrated["prediction_task"] == migrated["run_task"] == "policy"
+        assert migrated["annotation_schema_slug"] == "australian_policy_annotation"
+        assert migrated["annotation_schema_version"] == "0.2.0"
+        assert migrated["prediction_values"] == {
+            "is_non_policy": False,
+            "primary_australian_domain": "AU06",
+            "secondary_australian_domains": ["AU02"],
+        }
+        with pytest.raises(psycopg.errors.CheckViolation), connection.transaction():
+            connection.execute(
+                """
+                INSERT INTO model_predictions
+                  (run_id,speaker_turn_id,record_id,prediction_task,prediction_values,
+                   is_non_policy,secondary_australian_domains,reasoning,validation_status)
+                VALUES (%s,%s,'turn:malformed-policy','policy','{}',false,'{}',
+                        'Missing primary.','success')
+                """,
+                (policy_run["id"], turn["id"]),
+            )
+
+        adapted = adapt_hostility_prediction(
+            {
+                "hostility_present": "YES",
+                "target": "OPPOSING_PARTISAN_TARGET",
+                "evidence_spans": [{"text": str(turn["text_clean"])[:10]}],
+                "reasoning": "Representative hostility reason.",
+            },
+            str(turn["text_clean"]),
+        )
+        hostility_run = connection.execute(
+            """
+            INSERT INTO model_prediction_runs
+              (artifact_sha256,prediction_task,annotation_schema_slug,
+               annotation_schema_version,provider,configured_model,prompt_version,
+               prompt_sha256,canonical_schema_sha256,execution_mode,record_set_sha256,
+               requested_count,provider_success_count,provider_failure_count,
+               valid_count,invalid_count,status)
+            VALUES (%s,'hostility',%s,%s,'gemini','gemini-2.5-flash',
+                    'hostility-prompt-v2',%s,%s,'batch',%s,1,1,0,1,0,'imported')
+            RETURNING id
+            """,
+            ("e" * 64, adapted.schema_slug, adapted.schema_version,
+             "f" * 64, "1" * 64, "2" * 64),
+        ).fetchone()
+        assert hostility_run is not None
+        hostility = connection.execute(
+            """
+            INSERT INTO model_predictions
+              (run_id,speaker_turn_id,record_id,prediction_task,prediction_values,
+               is_non_policy,primary_australian_domain,secondary_australian_domains,
+               reasoning,validation_status)
+            VALUES (%s,%s,'turn:hostility','hostility',%s,NULL,NULL,NULL,%s,'success')
+            RETURNING id,prediction_task,prediction_values,reasoning,is_non_policy,
+                      primary_australian_domain,secondary_australian_domains
+            """,
+            (hostility_run["id"], turn["id"], Jsonb(adapted.values), adapted.reasoning),
+        ).fetchone()
+        assert hostility is not None
+        assert hostility["prediction_task"] == "hostility"
+        assert hostility["prediction_values"] == adapted.values
+        assert hostility["reasoning"] == "Representative hostility reason."
+        assert hostility["is_non_policy"] is None
+        assert hostility["primary_australian_domain"] is None
+        assert hostility["secondary_australian_domains"] is None
+        with pytest.raises(
+            psycopg.errors.ObjectNotInPrerequisiteState
+        ), connection.transaction():
+            connection.execute(
+                "UPDATE model_predictions SET reasoning='changed' WHERE id=%s",
+                (hostility["id"],),
+            )
+        mismatch_run = connection.execute(
+            """
+            INSERT INTO model_prediction_runs
+              (artifact_sha256,provider,configured_model,prompt_version,prompt_sha256,
+               canonical_schema_sha256,execution_mode,record_set_sha256,
+               requested_count,provider_success_count,provider_failure_count,
+               valid_count,invalid_count,status)
+            VALUES (%s,'gemini','gemini-2.5-flash','phase4a-policy-v2',%s,%s,
+                    'batch',%s,1,1,0,1,0,'imported') RETURNING id
+            """,
+            ("3" * 64, "4" * 64, "5" * 64, "6" * 64),
+        ).fetchone()
+        assert mismatch_run is not None
+        with pytest.raises(psycopg.errors.ForeignKeyViolation), connection.transaction():
+            connection.execute(
+                """
+                INSERT INTO model_predictions
+                  (run_id,speaker_turn_id,record_id,prediction_task,prediction_values,
+                   reasoning,validation_status)
+                VALUES (%s,%s,'turn:wrong-task','hostility','{}','Wrong run task.','success')
+                """,
+                (mismatch_run["id"], turn["id"]),
+            )
+
+    with pytest.raises(RuntimeError, match="hostility predictions exist"):
+        command.downgrade(config, "20261020_10")
+    with psycopg.connect(url) as connection:
+        connection.execute(
+            "ALTER TABLE model_predictions DISABLE TRIGGER trg_model_predictions_append_only"
+        )
+        connection.execute("DELETE FROM model_predictions WHERE prediction_task='hostility'")
+        connection.execute(
+            "ALTER TABLE model_predictions ENABLE TRIGGER trg_model_predictions_append_only"
+        )
+        connection.execute(
+            "ALTER TABLE model_prediction_runs DISABLE TRIGGER "
+            "trg_model_prediction_runs_append_only"
+        )
+        connection.execute("DELETE FROM model_prediction_runs WHERE prediction_task='hostility'")
+        connection.execute(
+            "ALTER TABLE model_prediction_runs ENABLE TRIGGER "
+            "trg_model_prediction_runs_append_only"
+        )
+    command.downgrade(config, "20261020_10")
+    with psycopg.connect(url) as connection:
+        columns = {
+            row[0]
+            for row in connection.execute(
+                """
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name='model_predictions'
+                """
+            )
+        }
+        assert "prediction_task" not in columns
+        assert "prediction_values" not in columns
+        assert connection.execute(
+            "SELECT count(*) FROM model_predictions WHERE id=%s", (policy["id"],)
+        ).fetchone()[0] == 1
+    command.upgrade(config, "head")
+    with psycopg.connect(url, row_factory=dict_row) as connection:
+        reupgraded = connection.execute(
+            "SELECT prediction_task,prediction_values FROM model_predictions WHERE id=%s",
+            (policy["id"],),
+        ).fetchone()
+        assert reupgraded is not None
+        assert reupgraded["prediction_task"] == "policy"
+        assert reupgraded["prediction_values"]["primary_australian_domain"] == "AU06"
 
 
 def test_phase3_authentication_lockout_sessions_and_disable(

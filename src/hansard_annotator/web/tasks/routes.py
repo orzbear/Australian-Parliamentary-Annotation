@@ -308,12 +308,21 @@ def _accepted_ai_payload(metadata: dict[str, object]) -> dict[str, object]:
         key = str(field["field_key"])
         field_type = str(field["field_type"])
         payload[key] = [] if field_type == "multiple_taxonomy" else None
-    payload["is_non_policy"] = bool(prediction["is_non_policy"])
-    payload["primary_australian_domain"] = prediction["primary_australian_domain"]
-    payload["secondary_australian_domains"] = list(
-        cast(list[str], prediction["secondary_australian_domains"])
-    )
-    if prediction["primary_australian_domain"] == "AU_OTHER_REVIEW":
+    suggested = cast(dict[str, object], metadata.get("suggested_values") or {})
+    if not suggested:
+        suggested = {
+            key: prediction.get(key)
+            for key in (
+                "is_non_policy",
+                "primary_australian_domain",
+                "secondary_australian_domains",
+            )
+        }
+    payload.update(suggested)
+    if (
+        prediction.get("prediction_task") == "policy"
+        and prediction["primary_australian_domain"] == "AU_OTHER_REVIEW"
+    ):
         payload["fallback_explanation"] = prediction["reasoning"]
     return payload
 
@@ -447,14 +456,8 @@ def _next_review_destination(settings: WebSettings, prediction_id: str) -> str:
 
 
 def _prediction_decision_status(payload: dict[str, object], suggested_values: object) -> str:
-    decision_values = {
-        key: payload.get(key)
-        for key in (
-            "is_non_policy",
-            "primary_australian_domain",
-            "secondary_australian_domains",
-        )
-    }
+    suggested = cast(dict[str, object], suggested_values)
+    decision_values = {key: payload.get(key) for key in suggested}
     return "accepted" if decision_values == suggested_values else "edited"
 
 
@@ -484,7 +487,8 @@ async def accept_prediction(
     workspace = _review_workspace_or_http(settings, principal, prediction_id)
     assignment_id = ensure_prediction_assignment(settings, principal, prediction_id)
     payload = _accepted_ai_payload(
-        {"fields": workspace["fields"], "ai_prediction": workspace["prediction"]}
+        {"fields": workspace["fields"], "ai_prediction": workspace["prediction"],
+         "suggested_values": workspace["suggested_values"]}
     )
     event_type = "revised" if workspace["human_annotation"] else "submitted"
     result = save_annotation(settings, principal, assignment_id, payload, event_type=event_type)

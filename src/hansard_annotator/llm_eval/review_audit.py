@@ -14,6 +14,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 from hansard_annotator.db.config import DatabaseSettings
+from hansard_annotator.llm_eval.prediction_tasks import changed_fields, human_suggestion
 
 TERMINAL_STATES = {"accepted", "edited", "skipped"}
 DECISION_FIELDS = (
@@ -53,6 +54,9 @@ def _label(non_policy: bool, primary: object) -> str:
 
 
 def _changed_fields(row: dict[str, Any], human: dict[str, Any]) -> list[str]:
+    if row.get("prediction_task") == "hostility":
+        suggested = human_suggestion("hostility", row["ai_prediction_values"])
+        return changed_fields("hostility", suggested, human)
     changed: list[str] = []
     if bool(row["ai_is_non_policy"]) != bool(human.get("is_non_policy")):
         changed.append("is_non_policy")
@@ -66,6 +70,8 @@ def _changed_fields(row: dict[str, Any], human: dict[str, Any]) -> list[str]:
 
 
 def _edit_category(row: dict[str, Any], human: dict[str, Any], changed: list[str]) -> str:
+    if row.get("prediction_task") == "hostility":
+        return "HOSTILITY_" + ("_AND_".join(key.upper() for key in changed) or "UNCHANGED")
     ai_non_policy = bool(row["ai_is_non_policy"])
     human_non_policy = bool(human.get("is_non_policy"))
     if not ai_non_policy and human_non_policy:
@@ -155,12 +161,21 @@ def analyse_review_rows(
                 f"accepted prediction {row['prediction_id']} differs from its human annotation"
             )
 
-        ai_label = _label(bool(row["ai_is_non_policy"]), row["ai_primary_domain"])
-        human_label = (
+        if row.get("prediction_task") == "hostility":
+            ai_values = row["ai_prediction_values"]
+            ai_label = f"{ai_values.get('hostility_present')}:{ai_values.get('target')}"
+            human_label = (
+                f"{human.get('hostility_present')}:{human.get('target') or 'N/A'}"
+                if human
+                else ""
+            )
+        else:
+            ai_label = _label(bool(row["ai_is_non_policy"]), row["ai_primary_domain"])
+            human_label = (
             _label(bool(human.get("is_non_policy")), human.get("primary_australian_domain"))
             if human
             else ""
-        )
+            )
         base = {
             "prediction_id": str(row["prediction_id"]),
             "run_id": str(row["run_public_id"]),
@@ -177,6 +192,9 @@ def analyse_review_rows(
             "ai_primary_domain": row["ai_primary_domain"],
             "ai_secondary_domains": _normalise_domains(row["ai_secondary_domains"]),
             "ai_reasoning": row.get("ai_reasoning"),
+            "prediction_task": row.get("prediction_task"),
+            "ai_prediction_values": row.get("ai_prediction_values"),
+            "human_values": human or None,
             "human_is_non_policy": human.get("is_non_policy") if human else None,
             "human_primary_domain": human.get("primary_australian_domain") if human else None,
             "human_secondary_domains": _normalise_domains(human.get("secondary_australian_domains"))
@@ -308,6 +326,8 @@ def full_review_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "minor_heading": row.get("minor_heading"),
                 "business_type": row.get("business_type"),
                 "speech_text": row.get("speech_text"),
+                "prediction_task": row.get("prediction_task"),
+                "ai_prediction_values": row.get("ai_prediction_values"),
                 "ai_is_non_policy": bool(row["ai_is_non_policy"]),
                 "ai_primary_domain": row.get("ai_primary_domain"),
                 "ai_secondary_domains": _normalise_domains(row.get("ai_secondary_domains")),
@@ -327,6 +347,7 @@ def full_review_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 )
                 if human
                 else [],
+                "human_values": human or None,
                 "codebook_flagged": bool(row.get("codebook_flag_count", 0)),
                 "codebook_flag_note": notes[-1] if notes else None,
                 "all_codebook_flag_notes": notes,
@@ -520,7 +541,8 @@ def _load_runs(connection: psycopg.Connection[Any]) -> list[dict[str, Any]]:
         dict(row)
         for row in connection.execute(
             """
-            SELECT id,public_id,provider,configured_model,returned_model,prompt_version,
+            SELECT id,public_id,prediction_task,annotation_schema_slug,
+                   annotation_schema_version,provider,configured_model,returned_model,prompt_version,
                    prompt_sha256,canonical_schema_sha256,prediction_contract_sha256,
                    provider_schema_sha256,generation_config,execution_mode,
                    provider_job_id,artifact_sha256,record_set_sha256,imported_at,valid_count
@@ -536,7 +558,9 @@ def _load_rows(connection: psycopg.Connection[Any], run_id: int) -> list[dict[st
         for row in connection.execute(
             """
             SELECT mp.id,mp.public_id AS prediction_id,mp.run_id,run.public_id AS run_public_id,
-                   mp.record_id,mp.speaker_turn_id,mp.is_non_policy AS ai_is_non_policy,
+                   mp.record_id,mp.speaker_turn_id,mp.prediction_task,
+                   mp.prediction_values AS ai_prediction_values,
+                   mp.is_non_policy AS ai_is_non_policy,
                    mp.primary_australian_domain AS ai_primary_domain,
                    mp.secondary_australian_domains AS ai_secondary_domains,
                    mp.reasoning AS ai_reasoning,
@@ -620,6 +644,8 @@ def create_review_audit(
         "minor_heading",
         "business_type",
         "speech_text",
+        "prediction_task",
+        "ai_prediction_values",
         "ai_is_non_policy",
         "ai_primary_domain",
         "ai_secondary_domains",
@@ -627,6 +653,7 @@ def create_review_audit(
         "human_is_non_policy",
         "human_primary_domain",
         "human_secondary_domains",
+        "human_values",
         "review_status",
         "review_note",
         "codebook_flagged",
@@ -659,6 +686,8 @@ def create_review_audit(
             "minor_heading",
             "business_type",
             "speech_text",
+            "prediction_task",
+            "ai_prediction_values",
             "ai_is_non_policy",
             "ai_primary_domain",
             "ai_secondary_domains",
@@ -672,6 +701,7 @@ def create_review_audit(
             "human_is_non_policy",
             "human_primary_domain",
             "human_secondary_domains",
+            "human_values",
             "codebook_flagged",
             "codebook_flag_note",
             "all_codebook_flag_notes",
