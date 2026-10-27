@@ -200,7 +200,9 @@ def iter_prediction_artifact(
 
 
 def iter_terminal_invalid_artifact(
-    directory: Path, *, prediction_task: str
+    directory: Path, *, prediction_task: str,
+    terminal_recovery_history: dict[str, list[dict[str, Any]]] | None = None,
+    require_recovery_lineage: bool = False,
 ) -> Iterator[dict[str, Any]]:
     if prediction_task != "hostility":
         return
@@ -221,9 +223,67 @@ def iter_terminal_invalid_artifact(
                 not isinstance(record_id, str)
                 or not record_id.startswith("turn:")
                 or not isinstance(response, dict)
-                or value.get("prediction") is None
+                or value.get("prediction") is not None
             ):
                 raise ValueError(f"prediction line {number} has incomplete invalid provenance")
+            history = (terminal_recovery_history or {}).get(record_id, [])
+            if require_recovery_lineage and not history:
+                raise ValueError(
+                    f"prediction line {number} has no authoritative recovery provenance"
+                )
+            if not history:
+                value = {
+                    **value,
+                    "recovery_attempt_history": value.get("recovery_attempt_history", []),
+                    "attempt_count": int(value.get("recovery_attempt_number") or 0) + 1,
+                    "final_validation_error": value["validation_error"],
+                }
+            if history:
+                normalized_history: list[dict[str, Any]] = []
+                previous_attempt = 0
+                original_errors: set[str] = set()
+                for attempt in history:
+                    attempt_number = attempt.get("attempt_number")
+                    if (
+                        not isinstance(attempt_number, int)
+                        or attempt_number <= previous_attempt
+                        or not isinstance(attempt.get("recovery_id"), str)
+                        or not attempt.get("recovery_id")
+                        or not isinstance(attempt.get("provider_job_id"), str)
+                        or not attempt.get("provider_job_id")
+                        or attempt.get("replacement_validation_result") != "invalid"
+                        or attempt.get("replacement_validation_error")
+                        != value["validation_error"]
+                        or not isinstance(attempt.get("original_validation_error"), str)
+                        or not attempt.get("original_validation_error")
+                        or attempt.get("lineage_consistent") is False
+                    ):
+                        raise ValueError(
+                            f"prediction line {number} has inconsistent recovery provenance"
+                        )
+                    previous_attempt = attempt_number
+                    original_errors.add(str(attempt["original_validation_error"]))
+                    normalized_history.append(dict(attempt))
+                if len(original_errors) != 1:
+                    raise ValueError(
+                        f"prediction line {number} has conflicting original validation errors"
+                    )
+                latest = normalized_history[-1]
+                value = {
+                    **value,
+                    "recovery_attempt_history": normalized_history,
+                    "recovery_attempt_count": len(normalized_history),
+                    "attempt_count": len(normalized_history),
+                    "recovery_attempt_number": latest["attempt_number"],
+                    "recovery_provider_job_id": latest["provider_job_id"],
+                    "original_validation_error": next(iter(original_errors)),
+                    "replacement_validation_result": latest[
+                        "replacement_validation_result"
+                    ],
+                    "final_validation_error": latest[
+                        "replacement_validation_error"
+                    ],
+                }
             yield value
 
 
@@ -327,10 +387,16 @@ def _batched_refusals(directory: Path) -> Iterator[list[dict[str, Any]]]:
 
 
 def _batched_terminal_invalid(
-    directory: Path, *, prediction_task: str
+    directory: Path, *, prediction_task: str,
+    terminal_recovery_history: dict[str, list[dict[str, Any]]] | None = None,
+    require_recovery_lineage: bool = False,
 ) -> Iterator[list[dict[str, Any]]]:
     batch: list[dict[str, Any]] = []
-    for value in iter_terminal_invalid_artifact(directory, prediction_task=prediction_task):
+    for value in iter_terminal_invalid_artifact(
+        directory, prediction_task=prediction_task,
+        terminal_recovery_history=terminal_recovery_history,
+        require_recovery_lineage=require_recovery_lineage,
+    ):
         batch.append(value)
         if len(batch) == IMPORT_BATCH_SIZE:
             yield batch
@@ -399,6 +465,7 @@ def import_predictions(
     annotation_schema_version: str = "0.2.0",
     expected_configuration: dict[str, Any] | None = None,
     terminal_recovery_history: dict[str, list[dict[str, Any]]] | None = None,
+    require_terminal_recovery_lineage: bool = False,
     campaign_provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     summary = _prediction_artifact_summary(
@@ -458,7 +525,11 @@ def import_predictions(
                     if len(unknown) < 100:
                         unknown.append(turn_key)
         terminal_invalid_records = 0
-        for batch in _batched_terminal_invalid(directory, prediction_task=prediction_task):
+        for batch in _batched_terminal_invalid(
+            directory, prediction_task=prediction_task,
+            terminal_recovery_history=terminal_recovery_history,
+            require_recovery_lineage=require_terminal_recovery_lineage,
+        ):
             terminal_invalid_records += len(batch)
             turns = _turns_for_rows(connection, batch)
             matching_turns += len(turns)
@@ -615,7 +686,11 @@ def import_predictions(
             )
             inserted_refusals += len(values)
         inserted_terminal_invalid = 0
-        for batch in _batched_terminal_invalid(directory, prediction_task=prediction_task):
+        for batch in _batched_terminal_invalid(
+            directory, prediction_task=prediction_task,
+            terminal_recovery_history=terminal_recovery_history,
+            require_recovery_lineage=require_terminal_recovery_lineage,
+        ):
             turns = _turns_for_rows(connection, batch)
             values = [
                 (
@@ -627,16 +702,9 @@ def import_predictions(
                         **row,
                         "outcome": "INVALID_OUTPUT",
                         "category": "EVIDENCE_RESOLUTION_FAILED",
-                        "recovery_attempt_history": (terminal_recovery_history or {}).get(
-                            str(row["record_id"]), row.get("recovery_attempt_history", [])
+                        "recovery_attempt_history": row.get(
+                            "recovery_attempt_history", []
                         ),
-                        "attempt_count": max(
-                            int(row.get("recovery_attempt_number") or 0),
-                            len((terminal_recovery_history or {}).get(
-                                str(row["record_id"]), row.get("recovery_attempt_history", [])
-                            )),
-                        ) + 1,
-                        "final_validation_error": row.get("validation_error"),
                         "campaign": campaign_provenance or {},
                     }),
                     f"{directory}/predictions.jsonl#{row.get('request_index')}",

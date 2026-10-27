@@ -1905,6 +1905,60 @@ def _collected_recoveries(
     ]
 
 
+def _terminal_recovery_history(
+    connection: psycopg.Connection[dict[str, Any]], campaign_id: int
+) -> dict[str, list[dict[str, Any]]]:
+    """Resolve terminal-invalid provenance from append-only recovery records and artifacts."""
+    rows = connection.execute(
+        """
+        SELECT campaign_record.record_id,recovery.attempt_number,
+               recovery.public_id::text AS recovery_id,recovery.provider_job_id,
+               recovery.artifact_reference,recovery_record.original_validation_error
+        FROM ai_annotation_campaign_recoveries recovery
+        JOIN ai_annotation_campaign_recovery_records recovery_record
+          ON recovery_record.recovery_id=recovery.id
+        JOIN ai_annotation_campaign_records campaign_record
+          ON campaign_record.id=recovery_record.campaign_record_id
+        WHERE recovery.campaign_id=%s AND recovery.status='COLLECTED'
+        ORDER BY campaign_record.record_id,recovery.attempt_number
+        """,
+        (campaign_id,),
+    ).fetchall()
+    history: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        record_id = str(row["record_id"])
+        reference = row.get("artifact_reference")
+        if not isinstance(reference, str) or not reference:
+            raise CampaignError("terminal invalid outcome has incomplete recovery lineage")
+        try:
+            matching = [
+                value for value in iter_jsonl(Path(reference) / "predictions.jsonl")
+                if value.get("record_id") == record_id
+            ]
+        except OSError:
+            matching = []
+        recovered = matching[0] if len(matching) == 1 else {}
+        lineage_consistent = (
+            len(matching) == 1
+            and recovered.get("recovery_attempt_number") == int(row["attempt_number"])
+            and recovered.get("recovery_provider_job_id") == row["provider_job_id"]
+            and recovered.get("original_validation_error")
+            == row["original_validation_error"]
+        )
+        history.setdefault(record_id, []).append(
+            {
+                "attempt_number": int(row["attempt_number"]),
+                "recovery_id": str(row["recovery_id"]),
+                "provider_job_id": str(row["provider_job_id"] or ""),
+                "original_validation_error": str(row["original_validation_error"]),
+                "replacement_validation_result": str(recovered.get("status") or "missing"),
+                "replacement_validation_error": recovered.get("validation_error"),
+                "lineage_consistent": lineage_consistent,
+            }
+        )
+    return history
+
+
 def _original_coverage_complete(campaign: dict[str, Any]) -> None:
     metadata = campaign.get("operational_metadata")
     coverage = metadata.get("coverage") if isinstance(metadata, dict) else None
@@ -2697,10 +2751,17 @@ def validate_campaign(
         coverage = summary["coverage"]
         valid_count = int(coverage.get("valid_structured_predictions") or 0)
         refusal_count = int(coverage.get("provider_refused") or 0)
+        recovery_history = (
+            _terminal_recovery_history(connection, int(campaign["id"]))
+            if configuration.prediction_task == "hostility"
+            else None
+        )
         terminal_invalid_count = sum(
             1
             for _row in iter_terminal_invalid_artifact(
-                directory, prediction_task=configuration.prediction_task
+                directory, prediction_task=configuration.prediction_task,
+                terminal_recovery_history=recovery_history,
+                require_recovery_lineage=True,
             )
         )
         invalid_reported = int(coverage.get("invalid_structured_predictions") or 0)
@@ -2762,25 +2823,9 @@ def import_campaign(
             "provider_schema_sha256": configuration.provider_schema_sha256,
             "execution_mode": configuration.execution_mode,
         }
-        history_rows = connection.execute(
-            """SELECT campaign_record.record_id,recovery.attempt_number,
-                      recovery.public_id::text AS recovery_id,recovery.provider_job_id,
-                      recovery.status,recovery.artifact_reference,
-                      recovery_record.original_validation_error
-               FROM ai_annotation_campaign_recoveries recovery
-               JOIN ai_annotation_campaign_recovery_records recovery_record
-                 ON recovery_record.recovery_id=recovery.id
-               JOIN ai_annotation_campaign_records campaign_record
-                 ON campaign_record.id=recovery_record.campaign_record_id
-               WHERE recovery.campaign_id=%s
-               ORDER BY campaign_record.record_id,recovery.attempt_number""",
-            (campaign["id"],),
-        ).fetchall()
-        terminal_recovery_history: dict[str, list[dict[str, Any]]] = {}
-        for history_row in history_rows:
-            terminal_recovery_history.setdefault(str(history_row["record_id"]), []).append(
-                dict(history_row)
-            )
+        terminal_recovery_history = _terminal_recovery_history(
+            connection, int(campaign["id"])
+        )
         result = import_predictions(
             artifact, settings.database, dry_run=False,
             prediction_task=configuration.prediction_task,
@@ -2788,6 +2833,7 @@ def import_campaign(
             annotation_schema_version=configuration.annotation_schema_version,
             expected_configuration=expected,
             terminal_recovery_history=terminal_recovery_history,
+            require_terminal_recovery_lineage=True,
             campaign_provenance={
                 "campaign_id": str(campaign["public_id"]),
                 "campaign_name": str(campaign["name"]),

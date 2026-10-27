@@ -116,10 +116,19 @@ def test_hostility_terminal_evidence_failure_is_not_a_prediction(tmp_path: Path)
     invalid = {
         "record_id": "turn:invalid-key",
         "status": "invalid",
-        "prediction": {"hostility_present": "YES", "evidence_span": "ambiguous"},
+        "prediction": None,
         "validation_error": "hostility evidence must resolve uniquely to canonical text",
         "provider_response": {"responseId": "response-1"},
         "request_index": 1,
+        "provider": "gemini",
+        "configured_model": FROZEN_MODEL,
+        "returned_model": FROZEN_MODEL,
+        "prompt_version": FROZEN_PROMPT_VERSION,
+        "prompt_sha256": FROZEN_PROMPT_SHA256,
+        "schema_sha256": FROZEN_CANONICAL_SCHEMA_SHA256,
+        "batch_id": "batches/production-shape",
+        "response_index": 1,
+        "usage": {"input_tokens": 10},
     }
     with (artifact / "predictions.jsonl").open("a", encoding="utf-8") as target:
         target.write(json.dumps(invalid) + "\n")
@@ -138,6 +147,107 @@ def test_hostility_terminal_evidence_failure_is_not_a_prediction(tmp_path: Path)
     terminal = list(iter_terminal_invalid_artifact(artifact, prediction_task="hostility"))
     assert [row["record_id"] for row in predictions] == ["turn:stable-key"]
     assert [row["record_id"] for row in terminal] == ["turn:invalid-key"]
+
+
+def test_historical_hostility_invalid_row_uses_four_recovery_attempts(
+    tmp_path: Path,
+) -> None:
+    artifact = tmp_path / "hostility-historical-terminal"
+    _write_artifact(artifact)
+    summary_path = artifact / "operational_summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["coverage"].update(
+        planned_requests=100,
+        valid_structured_predictions=99,
+        invalid_structured_predictions=1,
+        provider_refused=0,
+        failed_provider_responses=0,
+        missing_responses=0,
+        duplicate_mappings=0,
+        accounting_invariant_ok=False,
+    )
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+    valid_rows = [
+        json.loads(line)
+        for line in (artifact / "predictions.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    valid_rows.extend(
+        {**valid_rows[0], "record_id": f"turn:synthetic-{index}"}
+        for index in range(2, 100)
+    )
+    invalid = {
+        "record_id": "turn:historical-invalid",
+        "status": "invalid",
+        "prediction": None,
+        "validation_error": "hostility evidence must resolve uniquely to canonical text",
+        "provider_response": {"responseId": "historical-response"},
+        "provider": "gemini",
+        "configured_model": FROZEN_MODEL,
+        "returned_model": FROZEN_MODEL,
+        "prompt_version": FROZEN_PROMPT_VERSION,
+        "prompt_sha256": FROZEN_PROMPT_SHA256,
+        "schema_sha256": FROZEN_CANONICAL_SCHEMA_SHA256,
+        "batch_id": "batches/historical",
+        "request_index": 99,
+        "response_index": 99,
+        "usage": {"input_tokens": 10},
+    }
+    (artifact / "predictions.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in [*valid_rows, invalid]),
+        encoding="utf-8",
+    )
+    recovery_history = {
+        "turn:historical-invalid": [
+            {
+                "attempt_number": attempt,
+                "recovery_id": f"recovery-{attempt}",
+                "provider_job_id": f"batches/recovery-{attempt}",
+                "original_validation_error": "hostility evidence must resolve uniquely to canonical text",
+                "replacement_validation_result": "invalid",
+                "replacement_validation_error": "hostility evidence must resolve uniquely to canonical text",
+            }
+            for attempt in range(1, 5)
+        ]
+    }
+    terminal = list(
+        iter_terminal_invalid_artifact(
+            artifact,
+            prediction_task="hostility",
+            terminal_recovery_history=recovery_history,
+            require_recovery_lineage=True,
+        )
+    )
+    assert len(terminal) == 1
+    assert terminal[0]["prediction"] is None
+    assert terminal[0]["attempt_count"] == 4
+    assert terminal[0]["recovery_attempt_count"] == 4
+    assert terminal[0]["recovery_attempt_number"] == 4
+    assert terminal[0]["recovery_provider_job_id"] == "batches/recovery-4"
+    assert terminal[0]["original_validation_error"] == invalid["validation_error"]
+    assert terminal[0]["final_validation_error"] == invalid["validation_error"]
+    assert "recovery_attempt_number" not in invalid
+
+
+def test_terminal_invalid_campaign_requires_recoverable_lineage(tmp_path: Path) -> None:
+    artifact = tmp_path / "hostility-lineage-required"
+    _write_artifact(artifact)
+    invalid = {
+        "record_id": "turn:invalid-key",
+        "status": "invalid",
+        "prediction": None,
+        "validation_error": "hostility evidence must resolve uniquely to canonical text",
+        "provider_response": {"responseId": "response-1"},
+    }
+    with (artifact / "predictions.jsonl").open("a", encoding="utf-8") as target:
+        target.write(json.dumps(invalid) + "\n")
+    with pytest.raises(ValueError, match="no authoritative recovery provenance"):
+        list(
+            iter_terminal_invalid_artifact(
+                artifact,
+                prediction_task="hostility",
+                require_recovery_lineage=True,
+            )
+        )
 
 
 @pytest.mark.parametrize(
