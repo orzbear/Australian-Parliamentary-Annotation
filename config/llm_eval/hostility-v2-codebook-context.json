@@ -1,0 +1,205 @@
+{
+  "schema": {
+    "content_sha256": "959a51a987e0777cb72dc7ad12cd5b896429bef400b79f386764a20ddc3d5669",
+    "fields": [
+      {
+        "display_order": 1,
+        "field_key": "hostility_present",
+        "field_type": "single_taxonomy",
+        "help_text": "YES for targeted negative affect, blame, accusation, ridicule, contempt, condemnation, competence or integrity attack, delegitimizing criticism, or clearly adversarial negative rhetoric toward an identifiable target. Exclude ordinary policy disagreement, negative consequences without an attacked actor, untargeted emotion, unendorsed quotations, and neutral or procedural disagreement.",
+        "label": "Hostility present",
+        "maximum_items": null,
+        "minimum_items": null,
+        "required": true,
+        "requirement_rules": {},
+        "taxonomy_version_id": 3,
+        "validation_rules": {},
+        "visibility_rules": {}
+      },
+      {
+        "display_order": 2,
+        "field_key": "target",
+        "field_type": "single_taxonomy",
+        "help_text": "Classify the target's relationship to the speaker's partisan position.",
+        "label": "Target relationship",
+        "maximum_items": null,
+        "minimum_items": null,
+        "required": false,
+        "requirement_rules": {
+          "null_unless": {
+            "field_not_equals": {
+              "field": "hostility_present",
+              "value": "NO"
+            }
+          },
+          "required_when": {
+            "field_not_equals": {
+              "field": "hostility_present",
+              "value": "NO"
+            }
+          }
+        },
+        "taxonomy_version_id": 4,
+        "validation_rules": {},
+        "visibility_rules": {
+          "allowed_when": {
+            "field_not_equals": {
+              "field": "hostility_present",
+              "value": "NO"
+            }
+          }
+        }
+      },
+      {
+        "display_order": 3,
+        "field_key": "evidence_span",
+        "field_type": "evidence_span",
+        "help_text": "Select one or more exact passages in the speech that support the hostility decision or explain the uncertainty.",
+        "label": "Evidence",
+        "maximum_items": null,
+        "minimum_items": null,
+        "required": false,
+        "requirement_rules": {
+          "null_unless": {
+            "field_not_equals": {
+              "field": "hostility_present",
+              "value": "NO"
+            }
+          },
+          "required_when": {
+            "field_not_equals": {
+              "field": "hostility_present",
+              "value": "NO"
+            }
+          }
+        },
+        "taxonomy_version_id": null,
+        "validation_rules": {},
+        "visibility_rules": {
+          "allowed_when": {
+            "field_not_equals": {
+              "field": "hostility_present",
+              "value": "NO"
+            }
+          }
+        }
+      }
+    ],
+    "name": "Australian Targeted Partisan Hostility",
+    "slug": "australian_partisan_hostility",
+    "status": "draft",
+    "version": "0.2.0"
+  },
+  "taxonomies": [
+    {
+      "content_sha256": "c712510fc243c7d47535d9bad0572abaaad62efa39b74e4c7d33a560443fa6d8",
+      "labels": [
+        {
+          "borderline_examples": [],
+          "code": "NO",
+          "exclusion_rules": [],
+          "full_definition": null,
+          "inclusion_rules": [],
+          "is_fallback": false,
+          "label": "No",
+          "negative_examples": [],
+          "positive_examples": [],
+          "requires_review": false,
+          "short_definition": "No endorsed targeted hostility is present."
+        },
+        {
+          "borderline_examples": [],
+          "code": "YES",
+          "exclusion_rules": [],
+          "full_definition": null,
+          "inclusion_rules": [],
+          "is_fallback": false,
+          "label": "Yes",
+          "negative_examples": [],
+          "positive_examples": [],
+          "requires_review": false,
+          "short_definition": "Endorsed targeted hostility is present."
+        },
+        {
+          "borderline_examples": [],
+          "code": "UNSURE",
+          "exclusion_rules": [],
+          "full_definition": null,
+          "inclusion_rules": [],
+          "is_fallback": false,
+          "label": "Unsure",
+          "negative_examples": [],
+          "positive_examples": [],
+          "requires_review": true,
+          "short_definition": "The evidence is genuinely ambiguous or borderline."
+        }
+      ],
+      "name": "Hostility presence",
+      "slug": "hostility_presence",
+      "status": "draft",
+      "version": "0.1.0"
+    },
+    {
+      "content_sha256": "446c170e672ea6cffab1c1d6946eaab0865292854415e2de29e7888d8b78b3e9",
+      "labels": [
+        {
+          "borderline_examples": [],
+          "code": "OPPOSING_PARTISAN_TARGET",
+          "exclusion_rules": [],
+          "full_definition": null,
+          "inclusion_rules": [],
+          "is_fallback": false,
+          "label": "Opposing partisan target",
+          "negative_examples": [],
+          "positive_examples": [],
+          "requires_review": false,
+          "short_definition": "The speaker's opposing party, MP, government/opposition side, or clearly opposing partisan bloc."
+        },
+        {
+          "borderline_examples": [],
+          "code": "OTHER_POLITICAL_TARGET",
+          "exclusion_rules": [],
+          "full_definition": null,
+          "inclusion_rules": [],
+          "is_fallback": false,
+          "label": "Other political target",
+          "negative_examples": [],
+          "positive_examples": [],
+          "requires_review": false,
+          "short_definition": "A political actor not clearly established as the speaker's partisan out-group."
+        },
+        {
+          "borderline_examples": [],
+          "code": "NON_POLITICAL_TARGET",
+          "exclusion_rules": [],
+          "full_definition": null,
+          "inclusion_rules": [],
+          "is_fallback": false,
+          "label": "Non-political target",
+          "negative_examples": [],
+          "positive_examples": [],
+          "requires_review": false,
+          "short_definition": "A non-partisan or non-political actor, group, institution, ideology, policy, or program."
+        },
+        {
+          "borderline_examples": [],
+          "code": "UNSURE",
+          "exclusion_rules": [],
+          "full_definition": null,
+          "inclusion_rules": [],
+          "is_fallback": false,
+          "label": "Unsure",
+          "negative_examples": [],
+          "positive_examples": [],
+          "requires_review": true,
+          "short_definition": "The target relationship cannot be determined reliably from the available context."
+        }
+      ],
+      "name": "Hostility target relationship",
+      "slug": "hostility_target",
+      "status": "draft",
+      "version": "0.2.0"
+    }
+  ]
+}
+

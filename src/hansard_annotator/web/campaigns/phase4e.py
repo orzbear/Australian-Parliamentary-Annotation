@@ -37,6 +37,7 @@ from hansard_annotator.web.campaigns.service import (
     GeminiGateway,
     LiveGeminiGateway,
     _artifact_directory,
+    _campaign_configuration,
     _production_domain_codes,
     _provider_plan,
     cache_plan_status,
@@ -493,6 +494,8 @@ def plan_campaign_chunks(
             raise CampaignError("full production requires human-annotation exclusion OFF")
         if configuration_class(dict(campaign)) != "APPROVED_PRODUCTION":
             raise CampaignError("full production requires the approved frozen configuration")
+        if _campaign_configuration(dict(campaign)).prediction_task != "policy":
+            raise CampaignError("full production orchestration is only supported for policy campaigns")
 
         def records() -> Iterator[dict[str, Any]]:
             with connection.cursor(name=f"phase4e_chunks_{campaign['id']}") as cursor:
@@ -589,6 +592,8 @@ def authorize_full_production(
             raise LookupError("AI annotation campaign not found")
         if campaign["orchestration_status"] != "PLANNED" or campaign["authorized_at"] is not None:
             raise CampaignError("campaign is not awaiting full-production authorization")
+        if _campaign_configuration(dict(campaign)).prediction_task != "policy":
+            raise CampaignError("full production orchestration is only supported for policy campaigns")
         estimate = Decimal(str(campaign["estimated_total_cost_usd"] or 0))
         if spend_ceiling_usd < estimate:
             raise CampaignError("authorization ceiling is below the current campaign estimate")

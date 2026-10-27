@@ -80,11 +80,14 @@ from hansard_annotator.web.campaigns.recovery import (
 from hansard_annotator.web.campaigns.service import (
     create_campaign,
     deterministic_selection,
+    get_campaign,
     import_campaign,
+    list_campaigns,
     other_exclusion_reason,
     plan_campaign,
     production_configuration,
     resolve_campaign_provider_refusals,
+    transition_campaign,
     validate_campaign,
 )
 from hansard_annotator.web.config import WebSettings
@@ -1070,6 +1073,7 @@ def test_phase4d_migration_constraints_immutability_linkage_and_downgrade_guard(
         "model_prediction_runs",
         "speaker_turns",
     }
+    command.upgrade(config, "head")
 
     import_validated_run(settings, _fixture_run(tmp_path, run_id="phase4d-db-fixture"))
     password = "phase4d database test password"
@@ -2654,6 +2658,685 @@ def test_task_aware_prediction_migration_round_trip_with_existing_policy_data(
         assert reupgraded is not None
         assert reupgraded["prediction_task"] == "policy"
         assert reupgraded["prediction_values"]["primary_australian_domain"] == "AU06"
+
+
+def test_campaign_configuration_migration_round_trip_and_constraints(
+    database_url: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HANSARD_DATABASE_URL", database_url)
+    config = Config("alembic.ini")
+    command.downgrade(config, "20261027_11")
+    web_settings = _web_settings(database_url)
+    import_validated_run(
+        web_settings.database,
+        _fixture_run(tmp_path, run_id="campaign-config-migration"),
+    )
+    password = "campaign config migration password"
+    create_user(
+        web_settings,
+        "campaign-migration-admin",
+        "Campaign Migration Admin",
+        password,
+        admin=True,
+        must_change_password=False,
+    )
+    admin, _ = authenticate(web_settings, "campaign-migration-admin", password)
+    policy_config = production_configuration()
+    url = database_url.replace("postgresql+psycopg://", "postgresql://")
+
+    with psycopg.connect(url, row_factory=dict_row) as connection:
+        pre12_columns = {
+            row["column_name"]
+            for row in connection.execute(
+                """
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name='ai_annotation_campaigns'
+                """
+            )
+        }
+        assert not (
+            {
+                "configuration_id",
+                "prediction_task",
+                "annotation_schema_slug",
+                "annotation_schema_version",
+                "record_set_id",
+                "approved_record_set_sha256",
+            }
+            & pre12_columns
+        )
+        corpus = connection.execute("SELECT id FROM corpora LIMIT 1").fetchone()
+        assert corpus is not None
+        corpus_id = int(corpus["id"])
+        turns = connection.execute(
+            "SELECT id,turn_key FROM speaker_turns ORDER BY id LIMIT 3"
+        ).fetchall()
+        assert len(turns) == 3
+
+        policy_run = connection.execute(
+            """
+            INSERT INTO model_prediction_runs
+              (artifact_sha256,prediction_task,annotation_schema_slug,
+               annotation_schema_version,provider,configured_model,prompt_version,
+               prompt_sha256,canonical_schema_sha256,prediction_contract_sha256,
+               provider_schema_sha256,generation_config,execution_mode,
+               record_set_sha256,requested_count,provider_success_count,
+               provider_failure_count,valid_count,invalid_count,status,provider_job_id)
+            VALUES (%s,'policy','australian_policy_annotation','0.2.0',%s,%s,%s,%s,%s,
+                    %s,%s,%s,%s,%s,1,1,0,1,0,'imported','batches/legacy-policy-imported')
+            RETURNING id
+            """,
+            (
+                "1" * 64,
+                policy_config["provider"],
+                policy_config["configured_model"],
+                policy_config["prompt_version"],
+                policy_config["prompt_sha256"],
+                policy_config["canonical_schema_sha256"],
+                policy_config["prediction_contract_sha256"],
+                policy_config["provider_schema_sha256"],
+                Jsonb(policy_config["generation_config"]),
+                policy_config["execution_mode"],
+                "2" * 64,
+            ),
+        ).fetchone()
+        assert policy_run is not None
+        policy_run_id = int(policy_run["id"])
+
+        draft_pre12 = connection.execute(
+            """
+            INSERT INTO ai_annotation_campaigns
+              (name,corpus_id,created_by_user_id,status,provider,configured_model,
+               prompt_version,prompt_sha256,canonical_schema_sha256,
+               prediction_contract_sha256,provider_schema_sha256,generation_config,
+               execution_mode,configuration_class)
+            VALUES ('Legacy Policy Draft',%s,%s,'DRAFT',%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                    'APPROVED_PRODUCTION')
+            RETURNING id,public_id
+            """,
+            (
+                corpus_id,
+                admin.user_id,
+                policy_config["provider"],
+                policy_config["configured_model"],
+                policy_config["prompt_version"],
+                policy_config["prompt_sha256"],
+                policy_config["canonical_schema_sha256"],
+                policy_config["prediction_contract_sha256"],
+                policy_config["provider_schema_sha256"],
+                Jsonb(policy_config["generation_config"]),
+                policy_config["execution_mode"],
+            ),
+        ).fetchone()
+        ready_pre12 = connection.execute(
+            """
+            INSERT INTO ai_annotation_campaigns
+              (name,corpus_id,created_by_user_id,status,provider,configured_model,
+               prompt_version,prompt_sha256,canonical_schema_sha256,
+               prediction_contract_sha256,provider_schema_sha256,generation_config,
+               execution_mode,configuration_class,selection_definition,
+               record_set_sha256,planned_count,planned_at)
+            VALUES ('Legacy Policy Ready',%s,%s,'READY',%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                    'APPROVED_PRODUCTION',%s,%s,2,now())
+            RETURNING id,public_id
+            """,
+            (
+                corpus_id,
+                admin.user_id,
+                policy_config["provider"],
+                policy_config["configured_model"],
+                policy_config["prompt_version"],
+                policy_config["prompt_sha256"],
+                policy_config["canonical_schema_sha256"],
+                policy_config["prediction_contract_sha256"],
+                policy_config["provider_schema_sha256"],
+                Jsonb(policy_config["generation_config"]),
+                policy_config["execution_mode"],
+                Jsonb(
+                    {
+                        "eligibility_rule": "prompt_text_present_v1",
+                        "exclude_human_annotated": True,
+                        "seed": "legacy-ready-seed",
+                        "limit": 2,
+                    }
+                ),
+                "3" * 64,
+            ),
+        ).fetchone()
+        imported_pre12 = connection.execute(
+            """
+            INSERT INTO ai_annotation_campaigns
+              (name,corpus_id,created_by_user_id,status,provider,configured_model,
+               prompt_version,prompt_sha256,canonical_schema_sha256,
+               prediction_contract_sha256,provider_schema_sha256,generation_config,
+               execution_mode,configuration_class,selection_definition,
+               record_set_sha256,planned_count,provider_job_id,provider_state,
+               model_prediction_run_id,planned_at,submitted_at,imported_at)
+            VALUES ('Legacy Policy Imported',%s,%s,'IMPORTED',%s,%s,%s,%s,%s,%s,%s,%s,
+                    %s,'APPROVED_PRODUCTION',%s,%s,1,'batches/legacy-policy-imported',
+                    'BATCH_STATE_SUCCEEDED',%s,now(),now(),now())
+            RETURNING id,public_id
+            """,
+            (
+                corpus_id,
+                admin.user_id,
+                policy_config["provider"],
+                policy_config["configured_model"],
+                policy_config["prompt_version"],
+                policy_config["prompt_sha256"],
+                policy_config["canonical_schema_sha256"],
+                policy_config["prediction_contract_sha256"],
+                policy_config["provider_schema_sha256"],
+                Jsonb(policy_config["generation_config"]),
+                policy_config["execution_mode"],
+                Jsonb(
+                    {
+                        "eligibility_rule": "prompt_text_present_v1",
+                        "exclude_human_annotated": False,
+                        "seed": "legacy-imported-seed",
+                        "limit": 1,
+                    }
+                ),
+                "2" * 64,
+                policy_run_id,
+            ),
+        ).fetchone()
+        assert draft_pre12 is not None
+        assert ready_pre12 is not None
+        assert imported_pre12 is not None
+        for index, turn in enumerate(turns[:2]):
+            connection.execute(
+                """
+                INSERT INTO ai_annotation_campaign_records
+                  (campaign_id,speaker_turn_id,record_id,selection_order,record_sha256)
+                VALUES (%s,%s,%s,%s,%s)
+                """,
+                (
+                    ready_pre12["id"],
+                    turn["id"],
+                    f"turn:{turn['turn_key']}",
+                    index,
+                    "4" * 64,
+                ),
+            )
+        connection.execute(
+            """
+            INSERT INTO ai_annotation_campaign_records
+              (campaign_id,speaker_turn_id,record_id,selection_order,record_sha256)
+            VALUES (%s,%s,%s,0,%s)
+            """,
+            (
+                imported_pre12["id"],
+                turns[2]["id"],
+                f"turn:{turns[2]['turn_key']}",
+                "5" * 64,
+            ),
+        )
+
+    command.upgrade(config, "20261027_12")
+
+    with psycopg.connect(url, row_factory=dict_row) as connection:
+        post12_columns = {
+            row["column_name"]: (row["is_nullable"], row["column_default"])
+            for row in connection.execute(
+                """
+                SELECT column_name,is_nullable,column_default
+                FROM information_schema.columns
+                WHERE table_name='ai_annotation_campaigns'
+                  AND column_name IN (
+                    'configuration_id','prediction_task','annotation_schema_slug',
+                    'annotation_schema_version','record_set_id',
+                    'approved_record_set_sha256'
+                  )
+                """
+            )
+        }
+        assert set(post12_columns) == {
+            "configuration_id",
+            "prediction_task",
+            "annotation_schema_slug",
+            "annotation_schema_version",
+            "record_set_id",
+            "approved_record_set_sha256",
+        }
+        assert post12_columns["configuration_id"][0] == "NO"
+        assert post12_columns["prediction_task"][0] == "NO"
+        assert post12_columns["annotation_schema_slug"][0] == "NO"
+        assert post12_columns["annotation_schema_version"][0] == "NO"
+        assert post12_columns["record_set_id"][0] == "YES"
+        assert post12_columns["approved_record_set_sha256"][0] == "YES"
+
+        constraints = {
+            row["conname"]
+            for row in connection.execute(
+                """
+                SELECT conname FROM pg_constraint
+                WHERE conrelid='ai_annotation_campaigns'::regclass
+                  AND conname IN (
+                    'ai_campaign_configuration_id_check',
+                    'ai_campaign_prediction_task_check',
+                    'ai_campaign_configuration_shape_check'
+                  )
+                """
+            )
+        }
+        assert constraints == {
+            "ai_campaign_configuration_id_check",
+            "ai_campaign_prediction_task_check",
+            "ai_campaign_configuration_shape_check",
+        }
+
+        for expected_id, expected_status in (
+            (draft_pre12["id"], "DRAFT"),
+            (ready_pre12["id"], "READY"),
+            (imported_pre12["id"], "IMPORTED"),
+        ):
+            migrated_row = connection.execute(
+                "SELECT * FROM ai_annotation_campaigns WHERE id=%s",
+                (expected_id,),
+            ).fetchone()
+            assert migrated_row is not None
+            assert migrated_row["status"] == expected_status
+            assert migrated_row["configuration_id"] == "policy-v2"
+            assert migrated_row["prediction_task"] == "policy"
+            assert (
+                migrated_row["annotation_schema_slug"]
+                == "australian_policy_annotation"
+            )
+            assert migrated_row["annotation_schema_version"] == "0.2.0"
+            assert migrated_row["record_set_id"] is None
+            assert migrated_row["approved_record_set_sha256"] is None
+            assert migrated_row["configured_model"] == policy_config["configured_model"]
+            assert migrated_row["prompt_version"] == policy_config["prompt_version"]
+            assert migrated_row["prompt_sha256"] == policy_config["prompt_sha256"]
+
+    for item in (draft_pre12, ready_pre12, imported_pre12):
+        detail = get_campaign(web_settings, admin, str(item["public_id"]))
+        assert detail["configuration_id"] == "policy-v2"
+        assert detail["configuration_display_label"] == "Policy classification — Frozen V2"
+        assert detail["prediction_task"] == "policy"
+        assert detail["annotation_schema_slug"] == "australian_policy_annotation"
+        assert detail["annotation_schema_version"] == "0.2.0"
+        assert detail["record_set_mode"] == "deterministic_selection"
+
+    # Pre-submission lifecycle on migrated DRAFT policy campaign works normally
+    planned_legacy = plan_campaign(
+        web_settings,
+        admin,
+        str(draft_pre12["public_id"]),
+        limit=2,
+        seed="post-12-plan-seed",
+        exclude_human_annotated=True,
+    ).campaign
+    assert planned_legacy["status"] == "PLANNED"
+    assert planned_legacy["planned_count"] == 2
+    ready_legacy = transition_campaign(
+        web_settings, admin, str(draft_pre12["public_id"]), "READY"
+    )
+    assert ready_legacy["status"] == "READY"
+
+    # Create representative Hostility V2 campaign through normal service path
+    hostility_campaign = create_campaign(
+        web_settings,
+        admin,
+        name="Hostility V2 Held-Out Validation",
+        corpus_id=corpus_id,
+        configuration_id="hostility-v2",
+    )
+    expected_sample_sha = (
+        "f3d9451b3352025b769d263fc896f57683a741ea6fd9af0b6477651707cf3b36"
+    )
+    assert hostility_campaign["configuration_id"] == "hostility-v2"
+    assert hostility_campaign["prediction_task"] == "hostility"
+    assert (
+        hostility_campaign["annotation_schema_slug"]
+        == "australian_partisan_hostility"
+    )
+    assert hostility_campaign["annotation_schema_version"] == "0.2.0"
+    assert hostility_campaign["record_set_id"] == "hostility-heldout-100"
+    assert hostility_campaign["approved_record_set_sha256"] == expected_sample_sha
+    assert hostility_campaign["provider"] == "gemini"
+    assert hostility_campaign["configured_model"] == "gemini-2.5-flash"
+    assert hostility_campaign["prompt_version"] == "hostility-prompt-v2"
+    assert (
+        hostility_campaign["prompt_sha256"]
+        == "185f5162348ae3b3d735ea43247da18cf6b3c1bb12f8a72cad57e38ce31cb1a8"
+    )
+    assert (
+        hostility_campaign["prediction_contract_sha256"]
+        == "dc716b49e0759ba7063973038b234f6696e778c4d90ee4a405d9600a2435b11d"
+    )
+    assert hostility_campaign["generation_config"] == {"thinking_budget": 0}
+    hostility_detail = get_campaign(
+        web_settings, admin, str(hostility_campaign["public_id"])
+    )
+    assert (
+        hostility_detail["configuration_display_label"]
+        == "Targeted hostility — Frozen V2"
+    )
+    assert hostility_detail["record_set_mode"] == "frozen_sample"
+    assert hostility_detail["approved_record_set_size"] == 100
+    assert len(list_campaigns(web_settings, admin)) == 4
+
+    # Constraint rejections
+    invalid_shapes: tuple[tuple[str, str, str, str, str | None, str | None], ...] = (
+        (
+            "unknown-v2",
+            "policy",
+            "australian_policy_annotation",
+            "0.2.0",
+            None,
+            None,
+        ),
+        (
+            "hostility-v2",
+            "policy",
+            "australian_partisan_hostility",
+            "0.2.0",
+            "hostility-heldout-100",
+            expected_sample_sha,
+        ),
+        (
+            "hostility-v2",
+            "hostility",
+            "australian_policy_annotation",
+            "0.2.0",
+            "hostility-heldout-100",
+            expected_sample_sha,
+        ),
+        (
+            "hostility-v2",
+            "hostility",
+            "australian_partisan_hostility",
+            "0.1.0",
+            "hostility-heldout-100",
+            expected_sample_sha,
+        ),
+        (
+            "hostility-v2",
+            "hostility",
+            "australian_partisan_hostility",
+            "0.2.0",
+            "hostility-development-100",
+            expected_sample_sha,
+        ),
+        (
+            "hostility-v2",
+            "hostility",
+            "australian_partisan_hostility",
+            "0.2.0",
+            "hostility-heldout-100",
+            "0" * 64,
+        ),
+        (
+            "policy-v2",
+            "hostility",
+            "australian_policy_annotation",
+            "0.2.0",
+            None,
+            None,
+        ),
+        (
+            "policy-v2",
+            "policy",
+            "australian_partisan_hostility",
+            "0.2.0",
+            None,
+            None,
+        ),
+        (
+            "policy-v2",
+            "policy",
+            "australian_policy_annotation",
+            "0.2.0",
+            "hostility-heldout-100",
+            None,
+        ),
+        (
+            "policy-v2",
+            "policy",
+            "australian_policy_annotation",
+            "0.2.0",
+            None,
+            expected_sample_sha,
+        ),
+    )
+    with psycopg.connect(url, row_factory=dict_row) as connection:
+        for (
+            cfg_id,
+            task,
+            schema_slug,
+            schema_ver,
+            rec_set_id,
+            rec_set_sha,
+        ) in invalid_shapes:
+            with pytest.raises(
+                psycopg.errors.CheckViolation
+            ), connection.transaction():
+                connection.execute(
+                    """
+                    INSERT INTO ai_annotation_campaigns
+                      (name,corpus_id,created_by_user_id,configuration_id,
+                       prediction_task,annotation_schema_slug,
+                       annotation_schema_version,record_set_id,
+                       approved_record_set_sha256,provider,configured_model,
+                       prompt_version,prompt_sha256,canonical_schema_sha256,
+                       prediction_contract_sha256,provider_schema_sha256,
+                       generation_config,execution_mode,configuration_class)
+                    VALUES ('Invalid Shape',%s,%s,%s,%s,%s,%s,%s,%s,'gemini',
+                            'gemini-2.5-flash','hostility-prompt-v2',%s,%s,%s,%s,
+                            '{"thinking_budget":0}'::jsonb,'batch','APPROVED_PRODUCTION')
+                    """,
+                    (
+                        corpus_id,
+                        admin.user_id,
+                        cfg_id,
+                        task,
+                        schema_slug,
+                        schema_ver,
+                        rec_set_id,
+                        rec_set_sha,
+                        hostility_campaign["prompt_sha256"],
+                        hostility_campaign["canonical_schema_sha256"],
+                        hostility_campaign["prediction_contract_sha256"],
+                        hostility_campaign["provider_schema_sha256"],
+                    ),
+                )
+
+        # Provenance immutability lifecycle boundaries on READY -> SUBMITTED -> IMPORTED
+        connection.execute(
+            """
+            UPDATE ai_annotation_campaigns SET
+              cache_status='REUSABLE',cache_identifier='cachedContents/ready-cache',
+              cache_content_sha256=%s,cache_model='models/gemini-3.1-flash-lite',
+              cache_display_name='phase4d-ready-cache',cache_created_at=now(),
+              cache_expires_at=now()+interval '24 hours',cache_verified_at=now()
+            WHERE id=%s AND status='READY'
+            """,
+            (policy_config["prompt_sha256"], draft_pre12["id"]),
+        )
+        connection.execute(
+            """
+            UPDATE ai_annotation_campaigns SET
+              status='SUBMITTED',provider_job_id='batches/submitted-policy-001',
+              provider_state='BATCH_STATE_PENDING',submitted_at=now()
+            WHERE id=%s AND status='READY'
+            """,
+            (draft_pre12["id"],),
+        )
+
+        # Post-submission provenance mutations are rejected
+        for mutation_sql, params in (
+            (
+                """
+                UPDATE ai_annotation_campaigns SET
+                  configuration_id='hostility-v2',prediction_task='hostility',
+                  annotation_schema_slug='australian_partisan_hostility',
+                  annotation_schema_version='0.2.0',
+                  record_set_id='hostility-heldout-100',
+                  approved_record_set_sha256=%s
+                WHERE id=%s
+                """,
+                (expected_sample_sha, draft_pre12["id"]),
+            ),
+            (
+                "UPDATE ai_annotation_campaigns SET configured_model='gemini-2.5-flash' WHERE id=%s",
+                (draft_pre12["id"],),
+            ),
+            (
+                "UPDATE ai_annotation_campaigns SET prompt_version='hostility-prompt-v2' WHERE id=%s",
+                (draft_pre12["id"],),
+            ),
+            (
+                "UPDATE ai_annotation_campaigns SET prompt_sha256=%s WHERE id=%s",
+                ("9" * 64, draft_pre12["id"]),
+            ),
+            (
+                "UPDATE ai_annotation_campaigns SET prediction_contract_sha256=%s WHERE id=%s",
+                ("8" * 64, draft_pre12["id"]),
+            ),
+            (
+                "UPDATE ai_annotation_campaigns SET record_set_sha256=%s WHERE id=%s",
+                ("7" * 64, draft_pre12["id"]),
+            ),
+            (
+                "UPDATE ai_annotation_campaigns SET planned_count=99 WHERE id=%s",
+                (draft_pre12["id"],),
+            ),
+            (
+                "UPDATE ai_annotation_campaigns SET cache_identifier='cachedContents/mutated' WHERE id=%s",
+                (draft_pre12["id"],),
+            ),
+        ):
+            with pytest.raises(
+                psycopg.errors.RaiseException,
+                match="submitted campaign provenance is immutable",
+            ), connection.transaction():
+                connection.execute(mutation_sql, params)
+
+        with pytest.raises(
+            psycopg.errors.RaiseException,
+            match="campaign provider job identity is immutable",
+        ), connection.transaction():
+            connection.execute(
+                "UPDATE ai_annotation_campaigns SET provider_job_id='batches/other' WHERE id=%s",
+                (draft_pre12["id"],),
+            )
+
+        # Normal operational status transitions after submission remain allowed
+        connection.execute(
+            """
+            UPDATE ai_annotation_campaigns SET status='RUNNING',
+              provider_state='BATCH_STATE_RUNNING' WHERE id=%s
+            """,
+            (draft_pre12["id"],),
+        )
+        connection.execute(
+            """
+            UPDATE ai_annotation_campaigns SET status='PROVIDER_COMPLETED',
+              provider_state='BATCH_STATE_SUCCEEDED',provider_success_count=2,
+              provider_completed_at=now() WHERE id=%s
+            """,
+            (draft_pre12["id"],),
+        )
+        connection.execute(
+            """
+            UPDATE ai_annotation_campaigns SET status='COLLECTED',
+              artifact_reference='/tmp/collected',artifact_sha256=%s,
+              valid_count=2,invalid_count=0,collected_at=now() WHERE id=%s
+            """,
+            ("6" * 64, draft_pre12["id"]),
+        )
+        connection.execute(
+            """
+            UPDATE ai_annotation_campaigns SET status='VALIDATED',
+              validated_at=now() WHERE id=%s
+            """,
+            (draft_pre12["id"],),
+        )
+
+    # Downgrade guard refuses while hostility campaign exists
+    with pytest.raises(RuntimeError, match="downgrade refused: hostility campaigns exist"):
+        command.downgrade(config, "20261027_11")
+
+    with psycopg.connect(url) as connection:
+        connection.execute(
+            "DELETE FROM ai_annotation_campaigns WHERE id=%s",
+            (hostility_campaign["id"],),
+        )
+
+    command.downgrade(config, "20261027_11")
+    with psycopg.connect(url, row_factory=dict_row) as connection:
+        downgraded_columns = {
+            row["column_name"]
+            for row in connection.execute(
+                """
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name='ai_annotation_campaigns'
+                """
+            )
+        }
+        assert not (
+            {
+                "configuration_id",
+                "prediction_task",
+                "annotation_schema_slug",
+                "annotation_schema_version",
+                "record_set_id",
+                "approved_record_set_sha256",
+            }
+            & downgraded_columns
+        )
+        downgraded_constraints = {
+            row["conname"]
+            for row in connection.execute(
+                """
+                SELECT conname FROM pg_constraint
+                WHERE conrelid='ai_annotation_campaigns'::regclass
+                  AND conname IN (
+                    'ai_campaign_configuration_id_check',
+                    'ai_campaign_prediction_task_check',
+                    'ai_campaign_configuration_shape_check'
+                  )
+                """
+            )
+        }
+        assert not downgraded_constraints
+        surviving = connection.execute(
+            "SELECT id,status FROM ai_annotation_campaigns ORDER BY id"
+        ).fetchall()
+        assert [(row["id"], row["status"]) for row in surviving] == [
+            (draft_pre12["id"], "VALIDATED"),
+            (ready_pre12["id"], "READY"),
+            (imported_pre12["id"], "IMPORTED"),
+        ]
+        # Restored trigger at 20261027_11 still protects submitted campaigns
+        with pytest.raises(
+            psycopg.errors.RaiseException,
+            match="submitted campaign provenance is immutable",
+        ), connection.transaction():
+            connection.execute(
+                "UPDATE ai_annotation_campaigns SET prompt_sha256=%s WHERE id=%s",
+                ("a" * 64, draft_pre12["id"]),
+            )
+
+    command.upgrade(config, "head")
+    with psycopg.connect(url, row_factory=dict_row) as connection:
+        reupgraded_rows = connection.execute(
+            """
+            SELECT id,configuration_id,prediction_task,annotation_schema_slug,
+                   annotation_schema_version,record_set_id,approved_record_set_sha256
+            FROM ai_annotation_campaigns ORDER BY id
+            """
+        ).fetchall()
+        assert len(reupgraded_rows) == 3
+        for row in reupgraded_rows:
+            assert row["configuration_id"] == "policy-v2"
+            assert row["prediction_task"] == "policy"
+            assert row["annotation_schema_slug"] == "australian_policy_annotation"
+            assert row["annotation_schema_version"] == "0.2.0"
+            assert row["record_set_id"] is None
+            assert row["approved_record_set_sha256"] is None
 
 
 def test_phase3_authentication_lockout_sessions_and_disable(

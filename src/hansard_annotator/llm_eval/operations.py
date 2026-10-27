@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from hansard_annotator.llm_eval.hostility import validate_prediction_with_diagnostics
 from hansard_annotator.llm_eval.prompt import build_system_prompt, build_user_prompt
 from hansard_annotator.llm_eval.validation import InvalidPrediction, validate_prediction
 
@@ -21,6 +22,22 @@ PREDICTION_FIELDS = {
     "is_non_policy",
     "primary_australian_domain",
     "secondary_australian_domains",
+    "reasoning",
+}
+FROZEN_HOSTILITY_PROMPT_VERSION = "hostility-prompt-v2"
+FROZEN_HOSTILITY_PROMPT_SHA256 = (
+    "185f5162348ae3b3d735ea43247da18cf6b3c1bb12f8a72cad57e38ce31cb1a8"
+)
+FROZEN_HOSTILITY_CANONICAL_SCHEMA_SHA256 = (
+    "959a51a987e0777cb72dc7ad12cd5b896429bef400b79f386764a20ddc3d5669"
+)
+FROZEN_HOSTILITY_CONTRACT_SHA256 = (
+    "dc716b49e0759ba7063973038b234f6696e778c4d90ee4a405d9600a2435b11d"
+)
+HOSTILITY_PREDICTION_FIELDS = {
+    "hostility_present",
+    "target",
+    "evidence_spans",
     "reasoning",
 }
 
@@ -142,6 +159,30 @@ def project_production_cost(
 def gemini_batch_schema(schema: dict[str, Any]) -> dict[str, Any]:
     """Derive Gemini Batch's supported Schema form from the canonical prediction contract."""
     properties = schema["properties"]
+    if set(properties) == {"hostility_present", "target", "evidence_spans", "reasoning"}:
+        evidence = properties["evidence_spans"]["items"]
+        return {
+            "type": "OBJECT",
+            "properties": {
+                "hostility_present": {
+                    "type": "STRING",
+                    "enum": properties["hostility_present"]["enum"],
+                },
+                "target": {"type": "STRING", "enum": properties["target"]["enum"]},
+                "evidence_spans": {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {"text": {"type": "STRING"}},
+                        "required": evidence["required"],
+                        "propertyOrdering": evidence["required"],
+                    },
+                },
+                "reasoning": {"type": "STRING"},
+            },
+            "required": schema["required"],
+            "propertyOrdering": schema["required"],
+        }
     primary = properties["primary_australian_domain"]
     secondary = properties["secondary_australian_domains"]
     return {
@@ -191,22 +232,37 @@ def gemini_generation_config(
 
 
 def validate_production_plan(plan: dict[str, Any]) -> None:
-    """Fail closed before any paid Batch submission of the frozen configuration."""
+    """Fail closed before any paid Batch submission of an approved frozen configuration."""
     provenance = plan.get("provenance")
     if not isinstance(provenance, dict):
         raise ValueError("Batch plan has no provenance")
     model = provenance.get("model")
-    supported_generation = {
-        FROZEN_MODEL: {"thinking_budget": 0},
-        APPROVED_PRODUCTION_MODEL: APPROVED_PRODUCTION_GENERATION,
-    }
+    prompt_version = provenance.get("prompt_version")
+    if prompt_version == FROZEN_HOSTILITY_PROMPT_VERSION:
+        supported_generation: dict[str, dict[str, Any]] = {
+            FROZEN_MODEL: {"thinking_budget": 0},
+        }
+        expected = {
+            "prompt_version": FROZEN_HOSTILITY_PROMPT_VERSION,
+            "assembled_prompt_sha256": FROZEN_HOSTILITY_PROMPT_SHA256,
+            "canonical_schema_sha256": FROZEN_HOSTILITY_CANONICAL_SCHEMA_SHA256,
+        }
+        if "prediction_contract_sha256" in provenance:
+            expected["prediction_contract_sha256"] = FROZEN_HOSTILITY_CONTRACT_SHA256
+        expected_fields = HOSTILITY_PREDICTION_FIELDS
+    else:
+        supported_generation = {
+            FROZEN_MODEL: {"thinking_budget": 0},
+            APPROVED_PRODUCTION_MODEL: APPROVED_PRODUCTION_GENERATION,
+        }
+        expected = {
+            "prompt_version": FROZEN_PROMPT_VERSION,
+            "assembled_prompt_sha256": FROZEN_PROMPT_SHA256,
+            "canonical_schema_sha256": FROZEN_CANONICAL_SCHEMA_SHA256,
+        }
+        expected_fields = PREDICTION_FIELDS
     if not isinstance(model, str) or model not in supported_generation:
         raise ValueError("paid Batch submission blocked: unexpected model")
-    expected = {
-        "prompt_version": FROZEN_PROMPT_VERSION,
-        "assembled_prompt_sha256": FROZEN_PROMPT_SHA256,
-        "canonical_schema_sha256": FROZEN_CANONICAL_SCHEMA_SHA256,
-    }
     for key, value in expected.items():
         if provenance.get(key) != value:
             raise ValueError(f"paid Batch submission blocked: unexpected {key}")
@@ -245,7 +301,7 @@ def validate_production_plan(plan: dict[str, Any]) -> None:
         )
         schema = config.get("responseSchema") if isinstance(config, dict) else None
         properties = schema.get("properties") if isinstance(schema, dict) else None
-        if not isinstance(properties, dict) or set(properties) != PREDICTION_FIELDS:
+        if not isinstance(properties, dict) or set(properties) != expected_fields:
             raise ValueError("paid Batch submission blocked: unexpected prediction field set")
         if provenance.get("provider_schema_sha256") != canonical_hash(schema):
             raise ValueError("paid Batch submission blocked: provider schema hash mismatch")
@@ -420,7 +476,8 @@ def _gemini_text(response: dict[str, Any]) -> object:
 
 
 def collect_inline_batch(
-    *, batch_value: dict[str, Any], plan: dict[str, Any], domain_codes: tuple[str, ...]
+    *, batch_value: dict[str, Any], plan: dict[str, Any], domain_codes: tuple[str, ...],
+    prediction_task: str = "policy", records_by_id: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     status = parse_batch_status(batch_value)
     if not status["terminal"]:
@@ -488,7 +545,21 @@ def collect_inline_batch(
         validation_error: str | None = None
         try:
             parsed = json.loads(raw_text) if isinstance(raw_text, str) else raw_text
-            prediction = validate_prediction(parsed, domain_codes).to_dict()
+            if prediction_task == "hostility":
+                record = (records_by_id or {}).get(key)
+                if record is None:
+                    raise InvalidPrediction("hostility validation has no canonical speech record")
+                validated, diagnostics = validate_prediction_with_diagnostics(
+                    parsed, str(record["speech"]["text"]), "hostility-prompt-v2"
+                )
+                if diagnostics["evidence_valid"] is not True:
+                    raise InvalidPrediction(
+                        "hostility evidence must resolve uniquely to canonical text"
+                    )
+                validated.to_dict()
+                prediction = parsed
+            else:
+                prediction = validate_prediction(parsed, domain_codes).to_dict()
             result_status = "success"
         except (json.JSONDecodeError, InvalidPrediction, TypeError) as error_value:
             result_status = "invalid"

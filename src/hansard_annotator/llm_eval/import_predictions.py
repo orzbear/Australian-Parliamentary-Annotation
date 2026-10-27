@@ -23,6 +23,7 @@ from hansard_annotator.llm_eval.operations import (
     FROZEN_PROMPT_SHA256,
     FROZEN_PROMPT_VERSION,
 )
+from hansard_annotator.llm_eval.prediction_tasks import adapt_hostility_prediction
 from hansard_annotator.llm_eval.validation import validate_prediction
 
 INVALID_ARTIFACT_DIRECTORY = "batch_pilot_500_results"
@@ -59,7 +60,9 @@ def _artifact_hash(directory: Path) -> str:
     return digest.hexdigest()
 
 
-def _prediction_artifact_summary(directory: Path) -> dict[str, Any]:
+def _prediction_artifact_summary(
+    directory: Path, expected_configuration: dict[str, Any] | None = None
+) -> dict[str, Any]:
     if (
         directory.name == INVALID_ARTIFACT_DIRECTORY
         or (directory / "schema_regression.md").exists()
@@ -69,7 +72,7 @@ def _prediction_artifact_summary(directory: Path) -> dict[str, Any]:
     if not isinstance(summary, dict):
         raise ValueError("artifact operational summary is not an object")
     provenance = summary.get("provenance", {})
-    expected = {
+    expected = expected_configuration or {
         "provider": "gemini",
         "prompt_version": FROZEN_PROMPT_VERSION,
         "assembled_prompt_sha256": FROZEN_PROMPT_SHA256,
@@ -143,7 +146,9 @@ def _validate_refusal_response(response: object) -> None:
         raise ValueError("provider-refusal evidence is not a prohibited-content abstention")
 
 
-def iter_prediction_artifact(directory: Path) -> Iterator[dict[str, Any]]:
+def iter_prediction_artifact(
+    directory: Path, *, prediction_task: str = "policy"
+) -> Iterator[dict[str, Any]]:
     with (directory / "predictions.jsonl").open(encoding="utf-8") as source:
         for number, line in enumerate(source, 1):
             value = json.loads(line)
@@ -162,7 +167,10 @@ def iter_prediction_artifact(directory: Path) -> Iterator[dict[str, Any]]:
             prediction = value.get("prediction")
             if not isinstance(prediction, dict):
                 raise ValueError(f"prediction line {number} has no prediction object")
-            validate_prediction(prediction, DOMAIN_CODES)
+            if prediction_task == "policy":
+                validate_prediction(prediction, DOMAIN_CODES)
+            elif prediction_task != "hostility":
+                raise ValueError("unsupported prediction task")
             record_id = value.get("record_id")
             if not isinstance(record_id, str) or not record_id.startswith("turn:"):
                 raise ValueError(
@@ -212,27 +220,41 @@ def iter_provider_refusal_artifact(directory: Path) -> Iterator[dict[str, Any]]:
         raise ValueError("provider refusal rows do not match operational summary")
 
 
-def load_prediction_artifact(directory: Path) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+def load_prediction_artifact(
+    directory: Path,
+    *,
+    prediction_task: str = "policy",
+    expected_configuration: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
     """Compatibility loader for small historical artifacts; scalable import streams."""
-    summary = _prediction_artifact_summary(directory)
-    rows = list(iter_prediction_artifact(directory))
+    summary = _prediction_artifact_summary(directory, expected_configuration)
+    rows = list(iter_prediction_artifact(directory, prediction_task=prediction_task))
     if len(rows) != int(summary["coverage"].get("valid_structured_predictions", -1)):
         raise ValueError("artifact row count does not match operational summary")
     return summary, rows, _artifact_hash(directory)
 
 
-def inspect_prediction_artifact(directory: Path) -> tuple[dict[str, Any], int, str]:
+def inspect_prediction_artifact(
+    directory: Path,
+    *,
+    prediction_task: str = "policy",
+    expected_configuration: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], int, str]:
     """Validate and count a large artifact without retaining its prediction rows."""
-    summary = _prediction_artifact_summary(directory)
-    row_count = sum(1 for _row in iter_prediction_artifact(directory))
+    summary = _prediction_artifact_summary(directory, expected_configuration)
+    row_count = sum(
+        1 for _row in iter_prediction_artifact(directory, prediction_task=prediction_task)
+    )
     if row_count != int(summary["coverage"].get("valid_structured_predictions", -1)):
         raise ValueError("artifact row count does not match operational summary")
     return summary, row_count, _artifact_hash(directory)
 
 
-def _batched_rows(directory: Path) -> Iterator[list[dict[str, Any]]]:
+def _batched_rows(
+    directory: Path, *, prediction_task: str = "policy"
+) -> Iterator[list[dict[str, Any]]]:
     batch: list[dict[str, Any]] = []
-    for value in iter_prediction_artifact(directory):
+    for value in iter_prediction_artifact(directory, prediction_task=prediction_task):
         batch.append(value)
         if len(batch) == IMPORT_BATCH_SIZE:
             yield batch
@@ -252,18 +274,20 @@ def _batched_refusals(directory: Path) -> Iterator[list[dict[str, Any]]]:
         yield batch
 
 
-def _turn_ids_for_rows(
+def _turns_for_rows(
     connection: psycopg.Connection[dict[str, Any]], rows: list[dict[str, Any]]
-) -> dict[str, int]:
+) -> dict[str, dict[str, Any]]:
     turn_keys = [str(row["record_id"]).removeprefix("turn:") for row in rows]
     turns = connection.execute(
-        "SELECT id,turn_key FROM speaker_turns WHERE turn_key=ANY(%s)", (turn_keys,)
+        "SELECT id,turn_key,text_clean,text_raw FROM speaker_turns WHERE turn_key=ANY(%s)",
+        (turn_keys,),
     ).fetchall()
-    return {str(row["turn_key"]): int(row["id"]) for row in turns}
+    return {str(row["turn_key"]): dict(row) for row in turns}
 
 
 def _prediction_insert_values(
-    *, run_id: int, directory: Path, rows: list[dict[str, Any]], turn_ids: dict[str, int]
+    *, run_id: int, directory: Path, rows: list[dict[str, Any]],
+    turns: dict[str, dict[str, Any]], prediction_task: str
 ) -> list[tuple[object, ...]]:
     values: list[tuple[object, ...]] = []
     for row in rows:
@@ -272,15 +296,27 @@ def _prediction_insert_values(
         response_id = response.get("responseId") if isinstance(response, dict) else None
         usage = row.get("usage", {})
         turn_key = str(row["record_id"]).removeprefix("turn:")
+        if prediction_task == "hostility":
+            text = str(turns[turn_key].get("text_clean") or turns[turn_key].get("text_raw") or "")
+            adapted = adapt_hostility_prediction(prediction, text)
+            policy_values: tuple[object, object, object] = (None, None, None)
+            canonical_values = adapted.values
+            reasoning = adapted.reasoning
+        else:
+            policy_values = (
+                prediction["is_non_policy"], prediction["primary_australian_domain"],
+                prediction["secondary_australian_domains"],
+            )
+            canonical_values = {
+                "is_non_policy": prediction["is_non_policy"],
+                "primary_australian_domain": prediction["primary_australian_domain"],
+                "secondary_australian_domains": prediction["secondary_australian_domains"],
+            }
+            reasoning = prediction["reasoning"]
         values.append(
             (
-                run_id, turn_ids[turn_key], row["record_id"], prediction["is_non_policy"],
-                prediction["primary_australian_domain"],
-                prediction["secondary_australian_domains"], Jsonb({
-                    "is_non_policy": prediction["is_non_policy"],
-                    "primary_australian_domain": prediction["primary_australian_domain"],
-                    "secondary_australian_domains": prediction["secondary_australian_domains"],
-                }), prediction["reasoning"],
+                run_id, turns[turn_key]["id"], row["record_id"], prediction_task,
+                *policy_values, Jsonb(canonical_values), reasoning,
                 Jsonb(response) if response is not None else None,
                 f"{directory}/predictions.jsonl#{row.get('request_index')}", response_id,
                 usage.get("input_tokens", 0), usage.get("cached_input_tokens", 0),
@@ -292,9 +328,13 @@ def _prediction_insert_values(
 
 
 def import_predictions(
-    directory: Path, settings: DatabaseSettings, *, dry_run: bool
+    directory: Path, settings: DatabaseSettings, *, dry_run: bool,
+    prediction_task: str = "policy",
+    annotation_schema_slug: str = "australian_policy_annotation",
+    annotation_schema_version: str = "0.2.0",
+    expected_configuration: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    summary = _prediction_artifact_summary(directory)
+    summary = _prediction_artifact_summary(directory, expected_configuration)
     artifact_sha256 = _artifact_hash(directory)
     with psycopg.connect(settings.psycopg_url, row_factory=dict_row) as connection:
         existing_run = connection.execute(
@@ -318,23 +358,23 @@ def import_predictions(
         matching_turns = 0
         unknown_count = 0
         unknown: list[str] = []
-        for batch in _batched_rows(directory):
+        for batch in _batched_rows(directory, prediction_task=prediction_task):
             artifact_records += len(batch)
-            turn_ids = _turn_ids_for_rows(connection, batch)
-            matching_turns += len(turn_ids)
+            turns = _turns_for_rows(connection, batch)
+            matching_turns += len(turns)
             for row in batch:
                 turn_key = str(row["record_id"]).removeprefix("turn:")
-                if turn_key not in turn_ids:
+                if turn_key not in turns:
                     unknown_count += 1
                     if len(unknown) < 100:
                         unknown.append(turn_key)
         for batch in _batched_refusals(directory):
             refusal_records += len(batch)
-            turn_ids = _turn_ids_for_rows(connection, batch)
-            matching_turns += len(turn_ids)
+            turns = _turns_for_rows(connection, batch)
+            matching_turns += len(turns)
             for row in batch:
                 turn_key = str(row["record_id"]).removeprefix("turn:")
-                if turn_key not in turn_ids:
+                if turn_key not in turns:
                     unknown_count += 1
                     if len(unknown) < 100:
                         unknown.append(turn_key)
@@ -389,9 +429,9 @@ def import_predictions(
             """,
             (
                 artifact_sha256,
-                "policy",
-                "australian_policy_annotation",
-                "0.2.0",
+                prediction_task,
+                annotation_schema_slug,
+                annotation_schema_version,
                 provenance["provider"],
                 provenance["model"],
                 status.get("model"),
@@ -433,20 +473,21 @@ def import_predictions(
         assert run is not None
         insert_cursor = connection.cursor()
         inserted = 0
-        for batch in _batched_rows(directory):
-            turn_ids = _turn_ids_for_rows(connection, batch)
+        for batch in _batched_rows(directory, prediction_task=prediction_task):
+            turns = _turns_for_rows(connection, batch)
             values = _prediction_insert_values(
-                run_id=int(run["id"]), directory=directory, rows=batch, turn_ids=turn_ids
+                run_id=int(run["id"]), directory=directory, rows=batch, turns=turns,
+                prediction_task=prediction_task,
             )
             insert_cursor.executemany(
                 """
                 INSERT INTO model_predictions
-                  (run_id,speaker_turn_id,record_id,is_non_policy,primary_australian_domain,
+                  (run_id,speaker_turn_id,record_id,prediction_task,is_non_policy,primary_australian_domain,
                    secondary_australian_domains,prediction_values,reasoning,validation_status,
                    raw_provider_response,artifact_reference,provider_response_id,input_tokens,
                    cached_input_tokens,output_tokens,reasoning_tokens,request_index,response_index,
                    returned_model)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'success',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'success',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """,
                 values,
             )
@@ -454,11 +495,11 @@ def import_predictions(
         inserted_refusals = 0
         refusal_cursor = connection.cursor()
         for batch in _batched_refusals(directory):
-            turn_ids = _turn_ids_for_rows(connection, batch)
+            turns = _turns_for_rows(connection, batch)
             values = [
                 (
                     int(run["id"]),
-                    turn_ids[str(row["record_id"]).removeprefix("turn:")],
+                    turns[str(row["record_id"]).removeprefix("turn:")]["id"],
                     row["record_id"],
                     row["reason"],
                     Jsonb(row),

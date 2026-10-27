@@ -20,6 +20,7 @@ from hansard_annotator.web.campaigns.phase4e import (
 from hansard_annotator.web.campaigns.service import (
     DEFAULT_EXCLUDE_HUMAN_ANNOTATED,
     CampaignError,
+    approved_campaign_configurations,
     collect_campaign,
     collect_recovery,
     create_campaign,
@@ -118,6 +119,7 @@ def campaign_new(
             "principal": principal,
             "corpora": list_corpora(settings),
             "configuration": production_configuration(),
+            "configurations": approved_campaign_configurations(),
             "credentials": credential_status(),
         },
     )
@@ -130,6 +132,7 @@ async def campaign_create(
     principal: Annotated[Principal, Depends(require_admin)],
     name: Annotated[str, Form()],
     corpus_id: Annotated[int, Form()],
+    configuration_id: Annotated[str, Form()] = "policy-v2",
 ) -> RedirectResponse:
     await enforce_csrf(request, principal, settings)
     try:
@@ -138,6 +141,7 @@ async def campaign_create(
             principal,
             name=name,
             corpus_id=corpus_id,
+            configuration_id=configuration_id,
         )
     except (CampaignError, LookupError, PermissionError) as error:
         raise _http_error(error) from error

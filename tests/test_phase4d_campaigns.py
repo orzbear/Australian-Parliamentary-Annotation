@@ -555,15 +555,15 @@ def test_navigation_and_templates_express_phase4d_information_architecture() -> 
         ROOT / "src/hansard_annotator/web/templates/campaigns/new.html"
     ).read_text(encoding="utf-8")
     for text in (
-        "Gemini",
-        "configuration.configured_model",
-        "configuration.prompt_version",
-        "Thinking",
-        "minimal",
-        "Gemini 3.1 Flash-Lite",
+        "AI annotation configuration",
+        "item.display_label",
+        "item.description",
+        "item.configured_model",
+        "item.prompt_version",
+        "Hostility held-out 100",
     ):
         assert text in new_campaign
-    assert "gemini-2.5-flash" in campaigns
+    assert "campaign.configured_model" in campaigns
     assert "Gemini 2.5 Flash" in campaigns
     assert "generation_config.get('thinking_budget'" in campaigns
     combined = "\n".join(
@@ -1053,6 +1053,7 @@ def test_invalid_collected_artifact_blocks_validation_and_import(
             "status": "COLLECTED",
             "artifact_reference": str(artifact),
             "planned_count": 1,
+                **production_configuration(),
         }
     )
     monkeypatch.setattr(
@@ -1072,6 +1073,7 @@ def test_import_links_existing_phase4c_run_and_repeated_import_is_idempotent(
         "status": "VALIDATED",
         "model_prediction_run_id": None,
         "artifact_reference": str(tmp_path / "artifact"),
+        **production_configuration(),
     }
 
     class ImportConnection(_Connection):
@@ -1090,7 +1092,9 @@ def test_import_links_existing_phase4c_run_and_repeated_import_is_idempotent(
         lambda *_args, **_kwargs: connection,
     )
 
-    def fake_import(path: Path, _settings: DatabaseSettings, *, dry_run: bool) -> dict[str, Any]:
+    def fake_import(
+        path: Path, _settings: DatabaseSettings, *, dry_run: bool, **_kwargs: object
+    ) -> dict[str, Any]:
         assert not dry_run
         imports.append(path)
         return {"artifact_sha256": "a" * 64}
