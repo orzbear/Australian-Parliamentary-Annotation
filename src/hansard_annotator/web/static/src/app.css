@@ -114,8 +114,10 @@
   .correction-toggle-input { @apply sr-only; }
   .correction-toggle-input:not(:checked) ~ [data-correction-form] { display: none; }
   .correction-toggle-input:checked + .correction-toggle-wrap .choice-card { @apply border-indigo-500 bg-indigo-50 ring-2 ring-indigo-100; }
-  .progress { @apply mt-2 h-2 overflow-hidden rounded-full bg-slate-200; }
-  .progress span { @apply block h-full rounded-full bg-brand; }
+  .progress { @apply mt-2 block h-2 w-full overflow-hidden rounded-full bg-slate-200; appearance: none; border: 0; }
+  .progress::-webkit-progress-bar { @apply rounded-full bg-slate-200; }
+  .progress::-webkit-progress-value { @apply rounded-full bg-brand; }
+  .progress::-moz-progress-bar { @apply rounded-full bg-brand; }
 }
 
 .htmx-indicator { opacity: 0; }

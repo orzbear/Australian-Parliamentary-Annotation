@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from fastapi import HTTPException
+from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from hansard_annotator.llm_eval.import_predictions import (
     iter_terminal_invalid_artifact,
@@ -405,6 +407,118 @@ def test_ai_queue_has_obvious_prediction_links_and_review_action() -> None:
     assert "row.reasoning" not in queue
 
 
+def test_ai_review_and_queue_render_without_inline_styles() -> None:
+    templates = Environment(
+        loader=FileSystemLoader(ROOT / "src/hansard_annotator/web/templates"),
+        autoescape=select_autoescape(["html"]),
+    )
+    principal = {
+        "csrf_token": "test-csrf",
+        "display_name": "Reviewer",
+        "is_admin": True,
+    }
+    request = type("Request", (), {"query_params": {}})()
+    base_prediction = SimpleNamespace(
+        **{
+            "speaker_name_raw": "Test Member",
+            "public_id": "prediction-id",
+            "chamber": "House",
+            "speech_date": "2026-10-27",
+            "major_heading_original": "Questions",
+            "minor_heading_original": "",
+            "business_type": "Debate",
+            "text_clean": "A representative speech.",
+            "prediction_task": "hostility",
+            "values": SimpleNamespace(
+                hostility_present="NO", target=None, evidence_spans=[]
+            ),
+            "reasoning": "No hostility detected.",
+            "configured_model": "model",
+            "prompt_version": "hostility-prompt-v2",
+            "run_public_id": "run-id",
+            "execution_mode": "batch",
+            "created_at": "2026-10-27",
+            "failure_message": "AI evidence was unresolved.",
+        }
+    )
+    context = {
+        "principal": principal,
+        "request": request,
+        "errors": {},
+        "human_annotation": None,
+        "codebook_flag": None,
+        "fields": [SimpleNamespace(
+            field_key="hostility_present",
+            label="Hostility present",
+            required=True,
+            help_text="Classify the speech.",
+            field_type="uncertainty",
+            ui_hints={},
+        )],
+        "labels": {},
+        "values": {},
+    }
+    valid_hostility = templates.get_template("annotations/ai_workspace.html").render(
+        **context,
+        prediction=base_prediction,
+        ai_unavailable=False,
+        effective_review=None,
+    )
+    terminal_invalid = templates.get_template("annotations/ai_workspace.html").render(
+        **context,
+        prediction=base_prediction,
+        ai_unavailable=True,
+        effective_review=None,
+    )
+    policy_prediction = {
+        **vars(base_prediction),
+        "prediction_task": "policy",
+        "is_non_policy": False,
+        "primary_domain_display": "AU04 — Education",
+        "secondary_domain_displays": [],
+    }
+    policy_prediction["values"] = SimpleNamespace(**vars(base_prediction.values))
+    policy_prediction = SimpleNamespace(**policy_prediction)
+    policy = templates.get_template("annotations/ai_workspace.html").render(
+        **context,
+        prediction=policy_prediction,
+        ai_unavailable=False,
+        effective_review=None,
+    )
+    queue = templates.get_template("annotations/ai_queue.html").render(
+        principal=principal,
+        runs=[{
+            "public_id": "run-id",
+            "display_name": "Hostility review",
+            "configured_model": "model",
+            "prompt_version": "hostility-prompt-v2",
+            "review_complete": False,
+            "reviewed_count": 1,
+            "prediction_count": 2,
+            "progress_percent": 50,
+            "remaining_count": 1,
+            "imported_at": "2026-10-27",
+            "campaign_status": "IMPORTED",
+            "provider": "gemini",
+        }],
+        rows=[],
+        active_run_id=None,
+        active_run_filter="all",
+        active_filter="unreviewed",
+    )
+    for rendered in (valid_hostility, terminal_invalid, policy, queue):
+        assert "style=" not in rendered
+        assert "<style" not in rendered
+    assert "Hostility: NO" in valid_hostility
+    assert "AI prediction unavailable" in terminal_invalid
+    assert "Annotate from scratch" in terminal_invalid
+    assert 'action="/ai-reviews/prediction-id/edit"' in terminal_invalid
+    assert 'name="hostility_present"' in terminal_invalid
+    assert "Save edited annotation &amp; next" in terminal_invalid
+    assert "AU04 — Education" in policy
+    assert '<progress class="progress"' in queue
+
+
 def test_domain_codes_are_displayed_with_human_readable_category_names() -> None:
     labels = {"AU04": "Education, science, technology and communications"}
     assert _domain_display("AU04", labels) == (
@@ -468,7 +582,7 @@ def test_correction_controls_are_opt_in_and_secondary_actions_precede_accept() -
     )
     asset_versions = re.findall(r"(?:app\.css|app\.js)\?v=([^\"']+)", base)
     assert asset_versions == [
-        "20261024-hostility-evidence-2",
+        "20261027-ai-review-csp-1",
         "20261024-hostility-evidence-2",
     ]
 

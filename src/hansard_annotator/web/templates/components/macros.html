@@ -10,9 +10,7 @@
 {% set percent = ((value / total * 100) if total else 0)|round|int %}
 <div class="progress-wrap">
   <div class="flex justify-between text-sm"><span>{{ label }}</span><span>{{ value }} / {{ total }}</span></div>
-  <div class="progress" role="progressbar" aria-label="{{ label }}" aria-valuenow="{{ percent }}" aria-valuemin="0" aria-valuemax="100">
-    <span style="width: {{ percent }}%"></span>
-  </div>
+  <progress class="progress" aria-label="{{ label }}" value="{{ percent }}" max="100">{{ percent }}%</progress>
 </div>
 {%- endmacro %}
 
