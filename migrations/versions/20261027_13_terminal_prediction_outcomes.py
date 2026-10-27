@@ -82,7 +82,11 @@ def downgrade() -> None:
           ADD CONSTRAINT model_prediction_abstentions_resolution_type_check
             CHECK (resolution_type='PROVIDER_REFUSAL'),
           ADD CONSTRAINT model_prediction_abstentions_resolution_reason_check
-            CHECK (resolution_reason='PROHIBITED_CONTENT'),
-          RENAME COLUMN outcome_provenance TO refusal_provenance;
+            CHECK (resolution_reason='PROHIBITED_CONTENT');
         """
+    )
+    op.alter_column(
+        "model_prediction_abstentions",
+        "outcome_provenance",
+        new_column_name="refusal_provenance",
     )
