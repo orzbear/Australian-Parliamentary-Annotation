@@ -19,6 +19,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from hansard_annotator.llm_eval.costs import load_pricing
+from hansard_annotator.llm_eval.hostility import prediction_json_schema as hostility_schema
 from hansard_annotator.llm_eval.import_predictions import (
     import_predictions,
     inspect_prediction_artifact,
@@ -27,8 +28,6 @@ from hansard_annotator.llm_eval.import_predictions import (
 from hansard_annotator.llm_eval.operations import (
     APPROVED_PRODUCTION_GENERATION,
     APPROVED_PRODUCTION_MODEL,
-    FROZEN_CANONICAL_SCHEMA_SHA256,
-    FROZEN_PROMPT_SHA256,
     FROZEN_PROMPT_VERSION,
     batch_resource,
     build_batch_create_request,
@@ -55,6 +54,13 @@ from hansard_annotator.llm_eval.prompt import (
 )
 from hansard_annotator.llm_eval.providers import _http_json
 from hansard_annotator.web.auth.models import Principal
+from hansard_annotator.web.campaigns.configurations import (
+    APPROVED_AI_CONFIGURATIONS,
+    POLICY_CONFIGURATION_ID,
+    ApprovedAIConfiguration,
+    approved_configuration,
+    configuration_for_campaign,
+)
 from hansard_annotator.web.campaigns.recovery import (
     RecoveryArtifactError,
     artifact_sha256,
@@ -71,6 +77,7 @@ from hansard_annotator.web.campaigns.recovery import (
 )
 from hansard_annotator.web.codebook.service import ROOT, production_codebook
 from hansard_annotator.web.config import WebSettings
+from hansard_annotator.web.tasks.frozen_samples import load_frozen_sample
 
 PREDICTION_CONTRACT_SHA256 = "99cafa6c473293dc076793ee6baeca44b6961d7cb11de8f9174517defc4a0879"
 GEMINI_BATCH_SCHEMA_SHA256 = "980b0ed6d6002a8eadd326f84942ba60dcdf8f2abd9e70ea6aaecf7d78de3c22"
@@ -159,25 +166,32 @@ def validate_transition(current: str, target: str) -> None:
 
 
 def production_configuration() -> dict[str, Any]:
+    configuration = approved_configuration(POLICY_CONFIGURATION_ID)
     return {
-        "provider": "gemini",
-        "configured_model": APPROVED_PRODUCTION_MODEL,
-        "prompt_version": FROZEN_PROMPT_VERSION,
-        "prompt_sha256": FROZEN_PROMPT_SHA256,
-        "canonical_schema_sha256": FROZEN_CANONICAL_SCHEMA_SHA256,
-        "prediction_contract_sha256": PREDICTION_CONTRACT_SHA256,
-        "provider_schema_sha256": GEMINI_BATCH_SCHEMA_SHA256,
-        "generation_config": dict(PRODUCTION_GENERATION_CONFIG),
-        "execution_mode": PRODUCTION_EXECUTION_MODE,
+        key: value
+        for key, value in configuration.persistence_values().items()
+        if key in {
+            "provider", "configured_model", "prompt_version", "prompt_sha256",
+            "canonical_schema_sha256", "prediction_contract_sha256",
+            "provider_schema_sha256", "generation_config", "execution_mode",
+        }
     }
 
 
+def approved_campaign_configurations() -> list[dict[str, Any]]:
+    return [value.persistence_values() for value in APPROVED_AI_CONFIGURATIONS.values()]
+
+
 def configuration_class(configuration: dict[str, Any]) -> str:
-    return (
-        "APPROVED_PRODUCTION"
-        if same_prediction_configuration(configuration, production_configuration())
-        else "RESEARCH"
-    )
+    try:
+        configuration_for_campaign(configuration)
+        return "APPROVED_PRODUCTION"
+    except ValueError:
+        return (
+            "APPROVED_PRODUCTION"
+            if same_prediction_configuration(configuration, production_configuration())
+            else "RESEARCH"
+        )
 
 
 def same_prediction_configuration(left: dict[str, Any], right: dict[str, Any]) -> bool:
@@ -200,12 +214,32 @@ def _cache_display_name(content_sha256: str) -> str:
     return f"phase4d-{FROZEN_PROMPT_VERSION}-{content_sha256[:16]}"
 
 
+def _configuration_context(configuration: ApprovedAIConfiguration) -> dict[str, Any]:
+    if configuration.prediction_task == "policy":
+        return cast(dict[str, Any], production_codebook()["context"])
+    path = ROOT / "config/llm_eval/hostility-v2-codebook-context.json"
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise CampaignError("frozen hostility codebook context is not an object")
+    assembled = build_system_prompt(value, configuration.prompt_version)
+    if prompt_hash(assembled) != configuration.prompt_sha256:
+        raise CampaignError("frozen hostility codebook context hash differs")
+    return value
+
+
+def _campaign_configuration(campaign: dict[str, Any]) -> ApprovedAIConfiguration:
+    try:
+        return configuration_for_campaign(campaign)
+    except ValueError as error:
+        raise CampaignError(str(error)) from error
+
+
 def _canonical_cache_plan(campaign: dict[str, Any]) -> dict[str, Any]:
-    codebook = production_codebook()
-    context = cast(dict[str, Any], codebook["context"])
+    configuration = _campaign_configuration(campaign)
+    context = _configuration_context(configuration)
     system_prompt = build_system_prompt(context, str(campaign["prompt_version"]))
     content_sha256 = prompt_hash(system_prompt)
-    if content_sha256 != FROZEN_PROMPT_SHA256 or content_sha256 != campaign["prompt_sha256"]:
+    if content_sha256 != configuration.prompt_sha256 or content_sha256 != campaign["prompt_sha256"]:
         raise CampaignError("canonical cache content does not match frozen prompt provenance")
     display_name = _cache_display_name(content_sha256)
     return {
@@ -277,10 +311,14 @@ def cache_plan_status(campaign: dict[str, Any], *, now: datetime | None = None) 
     if not campaign.get("cache_identifier"):
         return "REQUIRED"
     expires = campaign.get("cache_expires_at")
+    try:
+        configuration = _campaign_configuration(campaign)
+    except CampaignError:
+        return "UNAVAILABLE"
     compatible = (
-        campaign.get("cache_content_sha256") == FROZEN_PROMPT_SHA256
+        campaign.get("cache_content_sha256") == configuration.prompt_sha256
         and campaign.get("cache_model") == f"models/{campaign.get('configured_model')}"
-        and campaign.get("cache_display_name") == _cache_display_name(FROZEN_PROMPT_SHA256)
+        and campaign.get("cache_display_name") == _cache_display_name(configuration.prompt_sha256)
         and campaign.get("cache_verified_at") is not None
         and isinstance(expires, datetime)
         and expires.astimezone(UTC) > current + CACHE_REUSE_MINIMUM
@@ -355,9 +393,11 @@ def selection_breakdown(
     }
 
 
-def estimate_plan(records: int) -> dict[str, float | int]:
+def estimate_plan(
+    records: int, *, model: str = APPROVED_PRODUCTION_MODEL
+) -> dict[str, float | int]:
     pricing = load_pricing(ROOT / "config/llm_eval/pricing.yaml")
-    entry = pricing["models"][f"gemini:{APPROVED_PRODUCTION_MODEL}"]
+    entry = pricing["models"][f"gemini:{model}"]
     rates = entry["modes"]["batch"]
     estimate = simulate_costs(
         records=records,
@@ -690,11 +730,16 @@ def create_campaign(
     *,
     name: str,
     corpus_id: int,
+    configuration_id: str = POLICY_CONFIGURATION_ID,
 ) -> dict[str, Any]:
     _require_admin(principal)
     if not name.strip():
         raise CampaignError("campaign name is required")
-    configuration = production_configuration()
+    try:
+        approved = approved_configuration(configuration_id)
+    except ValueError as error:
+        raise CampaignError(str(error)) from error
+    configuration = approved.persistence_values()
     with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
         reusable = connection.execute(
             """
@@ -721,9 +766,9 @@ def create_campaign(
                 configuration["provider_schema_sha256"],
                 Jsonb(configuration["generation_config"]),
                 configuration["execution_mode"],
-                FROZEN_PROMPT_SHA256,
-                f"models/{APPROVED_PRODUCTION_MODEL}",
-                _cache_display_name(FROZEN_PROMPT_SHA256),
+                approved.prompt_sha256,
+                f"models/{approved.configured_model}",
+                _cache_display_name(approved.prompt_sha256),
                 int(CACHE_REUSE_MINIMUM.total_seconds()),
             ),
         ).fetchone()
@@ -731,19 +776,27 @@ def create_campaign(
         row = connection.execute(
             """
             INSERT INTO ai_annotation_campaigns
-              (name,corpus_id,created_by_user_id,provider,configured_model,prompt_version,
+              (name,corpus_id,created_by_user_id,configuration_id,prediction_task,
+               annotation_schema_slug,annotation_schema_version,record_set_id,
+               approved_record_set_sha256,provider,configured_model,prompt_version,
                prompt_sha256,canonical_schema_sha256,prediction_contract_sha256,
                provider_schema_sha256,generation_config,execution_mode,configuration_class,
                cache_status,cache_identifier,cache_content_sha256,cache_model,
                cache_display_name,cache_created_at,cache_expires_at,cache_verified_at,
                cache_metadata)
-            SELECT %s,c.id,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+            SELECT %s,c.id,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
             FROM corpora c WHERE c.id=%s AND c.is_active
             RETURNING *
             """,
             (
                 name.strip(),
                 principal.user_id,
+                approved.configuration_id,
+                approved.prediction_task,
+                approved.annotation_schema_slug,
+                approved.annotation_schema_version,
+                approved.record_set_id,
+                approved.record_set_sha256,
                 configuration["provider"],
                 configuration["configured_model"],
                 configuration["prompt_version"],
@@ -753,7 +806,7 @@ def create_campaign(
                 configuration["provider_schema_sha256"],
                 Jsonb(configuration["generation_config"]),
                 configuration["execution_mode"],
-                configuration_class(configuration),
+                "APPROVED_PRODUCTION",
                 "REUSABLE" if cache else "REQUIRED",
                 cache.get("cache_identifier"),
                 cache.get("cache_content_sha256"),
@@ -913,6 +966,20 @@ def get_campaign(
         if row is None:
             raise LookupError("AI annotation campaign not found")
         result = dict(row)
+        approved: ApprovedAIConfiguration | None = None
+        try:
+            approved = _campaign_configuration(result)
+            result["configuration_display_label"] = approved.display_label
+            result["record_set_mode"] = approved.record_set_mode
+            result["approved_record_set_size"] = approved.record_set_size
+        except CampaignError:
+            result["configuration_display_label"] = "Historical / research configuration"
+            result["record_set_mode"] = (
+                "frozen_sample"
+                if result.get("record_set_id")
+                else "deterministic_selection"
+            )
+            result["approved_record_set_size"] = result.get("planned_count")
         result["cache_plan_status"] = cache_plan_status(result)
         selection = cast(dict[str, Any], result.get("selection_definition") or {})
         other_reasons = selection.get("other_exclusion_reasons")
@@ -931,9 +998,17 @@ def get_campaign(
             for code, label in OTHER_EXCLUSION_LABELS.items()
             if code in other_reasons
         ]
-        result["selection_current"] = (
-            selection.get("eligibility_rule") == AI_ELIGIBILITY_RULE
-        )
+        if approved is not None and approved.record_set_mode == "frozen_sample":
+            result["selection_current"] = (
+                selection.get("mode") == "frozen_sample"
+                and selection.get("sample_id") == approved.record_set_id
+                and selection.get("sample_size") == approved.record_set_size
+                and selection.get("sample_sha256") == approved.record_set_sha256
+            )
+        else:
+            result["selection_current"] = (
+                selection.get("eligibility_rule") == AI_ELIGIBILITY_RULE
+            )
         result["preview"] = [
             dict(value)
             for value in connection.execute(
@@ -1030,7 +1105,11 @@ def get_campaign(
                     result["structural_repair_applied_count"] = int(
                         repair_metadata.get("repaired_count") or 0
                     )
-            elif result["status"] == "COLLECTED" and int(result["invalid_count"]) > 0:
+            elif (
+                result["status"] == "COLLECTED"
+                and int(result["invalid_count"]) > 0
+                and result.get("prediction_task", "policy") == "policy"
+            ):
                 result["structural_repair_available_count"] = structural_repair_count(
                     iter_jsonl(source_directory / "predictions.jsonl"),
                     _production_domain_codes(),
@@ -1102,6 +1181,11 @@ def plan_campaign(
             raise LookupError("AI annotation campaign not found")
         if campaign["status"] != "DRAFT":
             raise CampaignError("only a DRAFT campaign can be planned")
+        configuration = _campaign_configuration(dict(campaign))
+        if configuration.record_set_mode == "frozen_sample":
+            if limit != configuration.record_set_size:
+                raise CampaignError("frozen hostility sample requires planned_count=100")
+            return _plan_frozen_sample_campaign(connection, dict(campaign), configuration)
         breakdown = _planning_breakdown(
             connection,
             dict(campaign),
@@ -1216,6 +1300,111 @@ def plan_campaign(
         return PlanResult(dict(updated), preview)
 
 
+def _plan_frozen_sample_campaign(
+    connection: psycopg.Connection[dict[str, Any]],
+    campaign: dict[str, Any],
+    configuration: ApprovedAIConfiguration,
+) -> PlanResult:
+    if configuration.record_set_id != "hostility-heldout-100":
+        raise CampaignError("unsupported frozen hostility record set")
+    path = ROOT / "config/research_samples/hostility-heldout-100.json"
+    sample = load_frozen_sample(path, expected_sample_id=configuration.record_set_id)
+    if (
+        sample.sample_size != configuration.record_set_size
+        or sample.sample_sha256 != configuration.record_set_sha256
+        or len(sample.turns) != 100
+        or len({turn.turn_key for turn in sample.turns}) != 100
+    ):
+        raise CampaignError("frozen hostility sample identity, count, or membership differs")
+    development = load_frozen_sample(
+        ROOT / "config/research_samples/hostility-development-100.json",
+        expected_sample_id="hostility-development-100",
+    )
+    if {turn.turn_key for turn in sample.turns} & {
+        turn.turn_key for turn in development.turns
+    }:
+        raise CampaignError("frozen hostility validation sample overlaps development data")
+    turn_keys = [turn.turn_key for turn in sample.turns]
+    rows = connection.execute(
+        """
+        SELECT turn.id,turn.turn_key,turn.speech_date AS date,turn.chamber,
+               turn.speaker_name_raw,turn.major_heading_original,
+               turn.minor_heading_original,turn.business_type,turn.text_clean,turn.text_raw
+        FROM speaker_turns turn
+        JOIN reconstruction_runs reconstruction ON reconstruction.id=turn.reconstruction_run_id
+        JOIN corpora corpus ON corpus.current_preprocessing_run_id=reconstruction.preprocessing_run_id
+        WHERE corpus.id=%s AND turn.turn_key=ANY(%s)
+        """,
+        (campaign["corpus_id"], turn_keys),
+    ).fetchall()
+    by_key = {str(row["turn_key"]): dict(row) for row in rows}
+    if set(by_key) != set(turn_keys):
+        missing = len(set(turn_keys) - set(by_key))
+        raise CampaignError(f"frozen hostility sample has {missing} unresolved canonical turns")
+    record_set_hasher = _RecordSetHasher()
+    values: list[tuple[object, ...]] = []
+    preview: list[dict[str, Any]] = []
+    for index, frozen_turn in enumerate(sample.turns):
+        row = by_key[frozen_turn.turn_key]
+        record = production_record_from_turn(row)
+        record_id = str(record["record_id"])
+        record_set_hasher.add(record_id)
+        values.append(
+            (campaign["id"], row["id"], record_id, index, canonical_hash(record))
+        )
+        if len(preview) < 10:
+            preview.append(row)
+    connection.cursor().executemany(
+        """
+        INSERT INTO ai_annotation_campaign_records
+          (campaign_id,speaker_turn_id,record_id,selection_order,record_sha256)
+        VALUES (%s,%s,%s,%s,%s)
+        """,
+        values,
+    )
+    estimate = estimate_plan(len(values), model=configuration.configured_model)
+    selection = {
+        "mode": "frozen_sample",
+        "sample_id": sample.sample_id,
+        "sample_size": sample.sample_size,
+        "sample_sha256": sample.sample_sha256,
+        "sample_version": sample.effective_version,
+        "ordering": "frozen sample_order",
+    }
+    corpus_total_row = connection.execute(
+        """
+        SELECT count(*) AS count FROM speaker_turns turn
+        JOIN reconstruction_runs reconstruction ON reconstruction.id=turn.reconstruction_run_id
+        JOIN corpora corpus ON corpus.current_preprocessing_run_id=
+          reconstruction.preprocessing_run_id WHERE corpus.id=%s
+        """,
+        (campaign["corpus_id"],),
+    ).fetchone()
+    assert corpus_total_row is not None
+    updated = connection.execute(
+        """
+        UPDATE ai_annotation_campaigns SET status='PLANNED',selection_definition=%s,
+          record_set_sha256=%s,corpus_total_count=%s,eligible_count=100,
+          excluded_existing_prediction_count=0,excluded_other_count=0,planned_count=100,
+          estimated_input_tokens=%s,estimated_cached_input_tokens=%s,
+          estimated_uncached_input_tokens=%s,estimated_output_tokens=%s,
+          estimated_processing_cost_usd=%s,estimated_cache_storage_cost_usd=%s,
+          estimated_total_cost_usd=%s,planned_at=now()
+        WHERE id=%s RETURNING *
+        """,
+        (
+            Jsonb(selection), record_set_hasher.hexdigest(), corpus_total_row["count"],
+            estimate["input_tokens"], estimate["cached_input_tokens"],
+            estimate["uncached_input_tokens"], estimate["output_tokens"],
+            estimate["token_processing_cost_usd"],
+            estimate["explicit_cache_storage_cost_usd"],
+            estimate["estimated_total_cost_usd"], campaign["id"],
+        ),
+    ).fetchone()
+    assert updated is not None
+    return PlanResult(dict(updated), preview)
+
+
 def transition_campaign(
     settings: WebSettings,
     principal: Principal,
@@ -1264,13 +1453,23 @@ def _provider_plan(
     cache_identifier: str | None = None,
     display_name: str | None = None,
 ) -> dict[str, Any]:
-    codebook = production_codebook()
-    context = cast(dict[str, Any], codebook["context"])
+    configuration = _campaign_configuration(campaign)
+    if (
+        configuration.record_set_mode == "frozen_sample"
+        and expected_record_set_sha256 is None
+        and len(records) != configuration.record_set_size
+    ):
+        raise CampaignError("frozen hostility campaign requires exactly 100 records")
+    context = _configuration_context(configuration)
     system_prompt = build_system_prompt(context, str(campaign["prompt_version"]))
     if prompt_hash(system_prompt) != campaign["prompt_sha256"]:
         raise CampaignError("assembled prompt no longer matches frozen campaign provenance")
-    domain_codes = tuple(label.code for label in codebook["taxonomy"].labels)
-    schema = prediction_json_schema(domain_codes)
+    if configuration.prediction_task == "policy":
+        codebook = production_codebook()
+        domain_codes = tuple(label.code for label in codebook["taxonomy"].labels)
+        schema = prediction_json_schema(domain_codes)
+    else:
+        schema = hostility_schema(configuration.prompt_version)
     pricing = load_pricing(ROOT / "config/llm_eval/pricing.yaml")
     pricing_entry = pricing["models"][f"gemini:{campaign['configured_model']}"]
     request = build_batch_create_request(
@@ -1359,6 +1558,16 @@ def _mark_cache_unavailable(
 
 def require_current_ai_selection(campaign: dict[str, Any]) -> None:
     selection = campaign.get("selection_definition")
+    configuration = _campaign_configuration(campaign)
+    if configuration.record_set_mode == "frozen_sample":
+        if not isinstance(selection, dict) or (
+            selection.get("mode") != "frozen_sample"
+            or selection.get("sample_id") != configuration.record_set_id
+            or selection.get("sample_size") != configuration.record_set_size
+            or selection.get("sample_sha256") != configuration.record_set_sha256
+        ):
+            raise CampaignError("campaign frozen record-set identity differs")
+        return
     rule = selection.get("eligibility_rule") if isinstance(selection, dict) else None
     if rule != AI_ELIGIBILITY_RULE:
         raise CampaignError(
@@ -1597,11 +1806,18 @@ def collect_campaign(
         records = _records_for_campaign(connection, int(campaign["id"]))
         plan = _provider_plan(campaign, records)
         batch_value = provider.status(str(campaign["provider_job_id"]))
-        domain_codes = tuple(label.code for label in production_codebook()["taxonomy"].labels)
+        configuration = _campaign_configuration(campaign)
+        domain_codes = (
+            tuple(label.code for label in production_codebook()["taxonomy"].labels)
+            if configuration.prediction_task == "policy"
+            else ()
+        )
         results, coverage = collect_inline_batch(
             batch_value=batch_value,
             plan=plan,
             domain_codes=domain_codes,
+            prediction_task=configuration.prediction_task,
+            records_by_id={str(record["record_id"]): record for record in records},
         )
         for result in results:
             result.update(
@@ -2055,6 +2271,8 @@ def repair_campaign_results(
         if row is None:
             raise LookupError("AI annotation campaign not found")
         campaign = dict(row)
+        if _campaign_configuration(campaign).prediction_task != "policy":
+            raise CampaignError("structural repair is only supported for policy campaigns")
         if campaign["status"] != "COLLECTED" or campaign.get("model_prediction_run_id"):
             raise CampaignError("campaign is not eligible for structural repair")
         active = connection.execute(
@@ -2284,11 +2502,16 @@ def collect_recovery(
             display_name=f"phase4d-recovery-{public_id}-{int(combined['attempt_number']):03d}",
         )
         batch_value = provider.status(str(combined["recovery_provider_job_id"]))
-        domain_codes = tuple(
-            label.code for label in production_codebook()["taxonomy"].labels
+        configuration = _campaign_configuration(combined)
+        domain_codes = (
+            tuple(label.code for label in production_codebook()["taxonomy"].labels)
+            if configuration.prediction_task == "policy"
+            else ()
         )
         results, coverage = collect_inline_batch(
-            batch_value=batch_value, plan=plan, domain_codes=domain_codes
+            batch_value=batch_value, plan=plan, domain_codes=domain_codes,
+            prediction_task=configuration.prediction_task,
+            records_by_id={str(record["record_id"]): record for record in records},
         )
         lineage = {
             str(value["record_id"]): dict(value)
@@ -2448,10 +2671,27 @@ def validate_campaign(
         directory = _current_effective_artifact_directory(
             dict(campaign), _collected_recoveries(connection, int(campaign["id"]))
         )
+        configuration = _campaign_configuration(dict(campaign))
+        expected = {
+            "provider": configuration.provider,
+            "model": configuration.configured_model,
+            "prompt_version": configuration.prompt_version,
+            "assembled_prompt_sha256": configuration.prompt_sha256,
+            "canonical_schema_sha256": configuration.canonical_schema_sha256,
+            "prediction_contract_sha256": configuration.prediction_contract_sha256,
+            "provider_schema_sha256": configuration.provider_schema_sha256,
+            "execution_mode": configuration.execution_mode,
+        }
         if campaign.get("orchestration_mode") == "CHUNKED":
-            summary, row_count, _artifact_hash = inspect_prediction_artifact(directory)
+            summary, row_count, _artifact_hash = inspect_prediction_artifact(
+                directory, prediction_task=configuration.prediction_task,
+                expected_configuration=expected,
+            )
         else:
-            summary, rows, _artifact_hash = load_prediction_artifact(directory)
+            summary, rows, _artifact_hash = load_prediction_artifact(
+                directory, prediction_task=configuration.prediction_task,
+                expected_configuration=expected,
+            )
             row_count = len(rows)
         coverage = summary["coverage"]
         valid_count = int(coverage.get("valid_structured_predictions") or 0)
@@ -2500,7 +2740,24 @@ def import_campaign(
         artifact = _current_effective_artifact_directory(
             dict(campaign), _collected_recoveries(connection, int(campaign["id"]))
         )
-        result = import_predictions(artifact, settings.database, dry_run=False)
+        configuration = _campaign_configuration(dict(campaign))
+        expected = {
+            "provider": configuration.provider,
+            "model": configuration.configured_model,
+            "prompt_version": configuration.prompt_version,
+            "assembled_prompt_sha256": configuration.prompt_sha256,
+            "canonical_schema_sha256": configuration.canonical_schema_sha256,
+            "prediction_contract_sha256": configuration.prediction_contract_sha256,
+            "provider_schema_sha256": configuration.provider_schema_sha256,
+            "execution_mode": configuration.execution_mode,
+        }
+        result = import_predictions(
+            artifact, settings.database, dry_run=False,
+            prediction_task=configuration.prediction_task,
+            annotation_schema_slug=configuration.annotation_schema_slug,
+            annotation_schema_version=configuration.annotation_schema_version,
+            expected_configuration=expected,
+        )
         run = connection.execute(
             "SELECT id FROM model_prediction_runs WHERE artifact_sha256=%s",
             (result["artifact_sha256"],),

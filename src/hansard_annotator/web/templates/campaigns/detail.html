@@ -10,12 +10,15 @@
 {% if notice_message %}<div class="alert alert-success mt-5" role="status">{{ notice_message }}</div>{% endif %}
 
 <section class="surface mt-7 p-6">
-  <div class="flex flex-wrap items-start justify-between gap-4"><div><p class="eyebrow">Configuration</p><h2 class="mt-1 text-2xl font-semibold">{% if campaign.configured_model == 'gemini-3.1-flash-lite' %}Gemini 3.1 Flash-Lite{% elif campaign.configured_model == 'gemini-2.5-flash' %}Gemini 2.5 Flash{% else %}{{ campaign.configured_model }}{% endif %} · frozen V2</h2></div><span class="badge badge-active">{{ campaign.configuration_class|replace('_',' ') }}</span></div>
+  <div class="flex flex-wrap items-start justify-between gap-4"><div><p class="eyebrow">Configuration</p><h2 class="mt-1 text-2xl font-semibold">{{ campaign.configuration_display_label }}</h2></div><span class="badge badge-active">{{ campaign.configuration_class|replace('_',' ') }}</span></div>
   <dl class="metadata mt-5">
-    <div><dt>Provider / model</dt><dd>Gemini / {{ campaign.configured_model }}</dd></div>
+    <div><dt>Task</dt><dd>{{ campaign.prediction_task }}</dd></div>
+    <div><dt>Schema</dt><dd>{{ campaign.annotation_schema_slug }} {{ campaign.annotation_schema_version }}</dd></div>
+    <div><dt>Provider / model</dt><dd>{% if campaign.configured_model == 'gemini-3.1-flash-lite' %}Gemini 3.1 Flash-Lite{% elif campaign.configured_model == 'gemini-2.5-flash' %}Gemini 2.5 Flash{% else %}{{ campaign.configured_model }}{% endif %} (<code>{{ campaign.configured_model }}</code>)</dd></div>
     <div><dt>Prompt</dt><dd>{{ campaign.prompt_version }} (frozen)</dd></div>
     {% if campaign.generation_config.get('thinking_level') %}<div><dt>Thinking</dt><dd>{{ campaign.generation_config.get('thinking_level') }}</dd></div>{% else %}<div><dt>Thinking budget</dt><dd>{{ campaign.generation_config.get('thinking_budget', 'Provider default') }}</dd></div>{% endif %}
     <div><dt>Execution</dt><dd>Batch API with explicit Gemini cache</dd></div>
+    {% if campaign.record_set_id %}<div><dt>Record set</dt><dd>{{ campaign.record_set_id }}</dd></div><div><dt>Sample size</dt><dd>{{ campaign.approved_record_set_size }}</dd></div><div><dt>Selection SHA</dt><dd class="hash">{{ campaign.approved_record_set_sha256 }}</dd></div>{% endif %}
     <div><dt>Credential</dt><dd>{{ 'Configured' if credentials.gemini.configured else 'Not configured' }} via <code>GEMINI_API_KEY</code> or <code>GOOGLE_API_KEY</code></dd></div>
   </dl>
   <p class="mt-3 text-sm text-muted">Credential values stay in the server environment and are never rendered or stored with the campaign. Displaying this status makes no provider request.</p>
@@ -26,6 +29,10 @@
   <p class="eyebrow">Selection</p>
   {% if campaign.status == 'DRAFT' %}
   <h2 class="mt-1 text-2xl font-semibold">Choose records</h2>
+  {% if campaign.record_set_mode == 'frozen_sample' %}
+  <p class="mt-2 text-muted">This approved configuration is locked to <strong>{{ campaign.record_set_id }}</strong>: exactly {{ campaign.approved_record_set_size }} frozen validation records. Planning verifies its identity and membership locally.</p>
+  <form method="post" action="/ai-annotation/{{ campaign.public_id }}/plan" class="mt-5" data-progress-form>{{ csrf(principal) }}<input type="hidden" name="planned_count" value="100"><input type="hidden" name="seed" value="frozen"><input type="hidden" name="exclude_human_annotated" value="false"><button class="btn btn-primary" type="submit" data-progress-text="Planning...">Plan frozen hostility validation campaign — no provider call</button></form>
+  {% else %}
   <p class="mt-2 text-muted">Planning queries the local database, applies exclusions once, and creates a deterministic record set. It does not contact Gemini.</p>
   <form method="post" action="/ai-annotation/{{ campaign.public_id }}/plan" class="mt-5 grid gap-4 sm:grid-cols-2" data-progress-form>
     {{ csrf(principal) }}
@@ -42,6 +49,20 @@
     </label>
     <button class="btn btn-primary sm:col-span-2" type="submit" data-progress-text="Planning...">Plan campaign — no provider call</button>
   </form>
+  {% endif %}
+  {% elif campaign.record_set_mode == 'frozen_sample' %}
+  <h2 class="mt-1 text-2xl font-semibold">Frozen validation sample</h2>
+  {% set selection = campaign.selection_definition or {} %}
+  <div class="stats-grid mt-5">
+    <article class="stat"><span>Record set</span><strong>{{ selection.get('sample_id', campaign.record_set_id) }}</strong></article>
+    <article class="stat"><span>Sample size</span><strong>{{ selection.get('sample_size', campaign.planned_count) }}</strong></article>
+    <article class="stat"><span>Planned</span><strong>{{ campaign.planned_count }}</strong></article>
+    <article class="stat"><span>Corpus total</span><strong>{{ campaign.corpus_total_count }}</strong></article>
+  </div>
+  {% if not campaign.selection_current %}<div class="alert alert-error mt-4"><strong>Frozen sample mismatch.</strong> Stored sample identity or membership does not match the approved frozen validation sample and cannot be submitted.</div>{% endif %}
+  <dl class="metadata mt-4"><div><dt>Record set</dt><dd>{{ selection.get('sample_id', campaign.record_set_id) }}</dd></div><div><dt>Sample size</dt><dd>{{ selection.get('sample_size', campaign.planned_count) }}</dd></div><div><dt>Selection SHA</dt><dd class="hash">{{ selection.get('sample_sha256', campaign.approved_record_set_sha256) }}</dd></div><div><dt>Ordering</dt><dd>{{ selection.get('ordering', 'frozen sample_order') }}</dd></div></dl>
+  <h3 class="mt-6 font-semibold">Record preview</h3>
+  <div class="mt-3 divide-y">{% for row in campaign.preview %}<article class="py-3"><strong>{{ row.record_id }}</strong><p class="text-sm text-muted">{{ row.speaker_name_raw or 'Unknown speaker' }} · {{ row.speech_date }} · {{ row.major_heading_original }}</p><p class="mt-1 line-clamp-2">{{ row.text_clean }}</p></article>{% endfor %}</div>
   {% else %}
   <h2 class="mt-1 text-2xl font-semibold">Deterministic record plan</h2>
   {% set selection = campaign.selection_definition or {} %}
@@ -69,7 +90,7 @@
 </section>
 {% endif %}
 
-{% if campaign.status == 'PLANNED' or campaign.orchestration_mode == 'CHUNKED' %}
+{% if (campaign.status == 'PLANNED' or campaign.orchestration_mode == 'CHUNKED') and campaign.prediction_task == 'policy' %}
 <section class="surface mt-7 p-6">
   <p class="eyebrow">Full corpus</p><h2 class="mt-1 text-2xl font-semibold">Phase 4E child Batch orchestration</h2>
   {% if campaign.orchestration_mode != 'CHUNKED' %}
@@ -107,7 +128,7 @@
 <section class="surface mt-7 p-6">
   <p class="eyebrow">Validation and import</p><h2 class="mt-1 text-2xl font-semibold">Local integrity checks</h2>
   <div class="mt-5 flex flex-wrap gap-3">{% if campaign.status == 'COLLECTED' and campaign.invalid_count == 0 %}<form method="post" action="/ai-annotation/{{ campaign.public_id }}/validate" data-progress-form>{{ csrf(principal) }}<button class="btn btn-primary" data-progress-text="Validating...">Validate results locally</button></form>{% elif campaign.status == 'COLLECTED' and campaign.structural_repair_available_count > 0 and not campaign.active_recovery %}<form method="post" action="/ai-annotation/{{ campaign.public_id }}/repair-structural" class="grid gap-2" data-progress-form>{{ csrf(principal) }}<p class="text-sm text-muted">{{ campaign.structural_repair_available_count }} invalid result{% if campaign.structural_repair_available_count != 1 %}s are{% else %} is{% endif %} eligible for the approved <code>remove_primary_from_secondary_v1</code> local repair. Apply it before considering another paid provider retry.</p><button class="btn btn-primary" data-progress-text="Applying repair...">Apply deterministic structural repair — no provider call</button></form>{% elif campaign.status == 'COLLECTED' and campaign.provider_refusal_available_count > 0 and not campaign.active_recovery %}<form method="post" action="/ai-annotation/{{ campaign.public_id }}/resolve-provider-refusals" class="grid gap-2" data-progress-form>{{ csrf(principal) }}<p class="text-sm text-muted">{{ campaign.provider_refusal_available_count }} result{% if campaign.provider_refusal_available_count != 1 %}s are{% else %} is{% endif %} a confirmed Gemini prohibited-content refusal. Record terminal abstentions locally instead of purchasing another identical retry.</p><button class="btn btn-primary" data-progress-text="Recording refusals...">Record provider refusals — no provider call</button></form>{% elif campaign.status == 'COLLECTED' and campaign.invalid_count > 0 and not campaign.active_recovery %}<form method="post" action="/ai-annotation/{{ campaign.public_id }}/retry-invalid" class="grid gap-2" data-progress-form>{{ csrf(principal) }}<label for="recovery-confirmation">Type <strong>RETRY INVALID RECORDS</strong> to approve a paid {{ campaign.invalid_count }}-record Batch retry</label><input id="recovery-confirmation" name="confirmation" autocomplete="off" required><button class="btn btn-primary" data-progress-text="Submitting recovery...">Retry {{ campaign.invalid_count }} invalid record{% if campaign.invalid_count != 1 %}s{% endif %} — paid provider action</button></form>{% elif campaign.status == 'VALIDATED' %}<form method="post" action="/ai-annotation/{{ campaign.public_id }}/import" data-progress-form>{{ csrf(principal) }}<button class="btn btn-primary" data-progress-text="Importing...">Import immutable predictions</button></form>{% endif %}</div>
-  <dl class="metadata mt-5"><div><dt>Collected / validated / imported</dt><dd>{{ campaign.collected_at or 'Not yet' }} / {{ campaign.validated_at or 'Not yet' }} / {{ campaign.imported_at or 'Not yet' }}</dd></div><div><dt>Structured validation</dt><dd>{{ campaign.valid_count }} valid / {{ campaign.invalid_count }} invalid</dd></div><div><dt>Deterministic structural repairs</dt><dd>{{ campaign.structural_repair_applied_count }} applied{% if campaign.structural_repair_available_count %} / {{ campaign.structural_repair_available_count }} available{% endif %}</dd></div><div><dt>Provider refusals</dt><dd>{{ campaign.provider_refusal_applied_count }} terminal{% if campaign.provider_refusal_available_count %} / {{ campaign.provider_refusal_available_count }} available{% endif %}</dd></div><div><dt>Imported run</dt><dd>{{ campaign.run_public_id or 'Not imported' }}</dd></div><div><dt>Recovery / campaign total cost</dt><dd>USD {{ campaign.recovery_cost_usd }} / USD {{ campaign.campaign_total_cost_usd }}</dd></div></dl>
+  <dl class="metadata mt-5"><div><dt>Collected / validated / imported</dt><dd>{{ campaign.collected_at or 'Not yet' }} / {{ campaign.validated_at or 'Not yet' }} / {{ campaign.imported_at or 'Not yet' }}</dd></div><div><dt>Structured validation</dt><dd>{{ campaign.valid_count }} valid / {{ campaign.invalid_count }} invalid</dd></div>{% if campaign.prediction_task == 'policy' %}<div><dt>Deterministic structural repairs</dt><dd>{{ campaign.structural_repair_applied_count }} applied{% if campaign.structural_repair_available_count %} / {{ campaign.structural_repair_available_count }} available{% endif %}</dd></div>{% endif %}<div><dt>Provider refusals</dt><dd>{{ campaign.provider_refusal_applied_count }} terminal{% if campaign.provider_refusal_available_count %} / {{ campaign.provider_refusal_available_count }} available{% endif %}</dd></div><div><dt>Imported run</dt><dd>{{ campaign.run_public_id or 'Not imported' }}</dd></div><div><dt>Recovery / campaign total cost</dt><dd>USD {{ campaign.recovery_cost_usd }} / USD {{ campaign.campaign_total_cost_usd }}</dd></div></dl>
   {% set coverage = campaign.operational_metadata.get('coverage', {}) %}{% set tokens = campaign.operational_metadata.get('tokens', {}) %}{% set cost = campaign.operational_metadata.get('cost', {}) %}
   {% if coverage %}<h3 class="mt-6 font-semibold">Collected operational results</h3><dl class="metadata mt-3"><div><dt>Planned / returned</dt><dd>{{ coverage.get('planned_requests', 0) }} / {{ coverage.get('collected_responses', 0) }}</dd></div><div><dt>Missing / duplicate</dt><dd>{{ coverage.get('missing_responses', 0) }} / {{ coverage.get('duplicate_mappings', 0) }}</dd></div><div><dt>Actual input / cached / output / reasoning tokens</dt><dd>{{ tokens.get('input_tokens', 0) }} / {{ tokens.get('cached_input_tokens', 0) }} / {{ tokens.get('output_tokens', 0) }} / {{ tokens.get('reasoning_tokens', 0) }}</dd></div><div><dt>Actual processing / cache / total cost</dt><dd>USD {{ cost.get('token_processing_cost_usd', 0) }} / {{ cost.get('explicit_cache_storage_cost_usd', 0) }} / {{ cost.get('total_pilot_cost_usd', 0) }}</dd></div></dl>{% endif %}
 </section>

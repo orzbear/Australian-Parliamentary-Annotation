@@ -5,29 +5,17 @@
 <div class="mx-auto max-w-4xl">
   <p class="eyebrow">AI Annotation</p>
   <h1 class="mt-2 text-4xl font-semibold">Create campaign</h1>
-  <p class="mt-3 text-muted">Create a draft using the single approved production configuration. Draft creation and planning make no provider call.</p>
-
-  <section class="surface mt-7 p-7">
-    <div class="flex flex-wrap items-start justify-between gap-4">
-      <div><p class="eyebrow">Approved production configuration</p><h2 class="mt-1 text-2xl font-semibold">Gemini 3.1 Flash-Lite · frozen V2</h2></div>
-      <span class="badge badge-active">Approved production</span>
-    </div>
-    <dl class="metadata mt-5">
-      <div><dt>Provider</dt><dd>Gemini</dd></div>
-      <div><dt>Model</dt><dd>{{ configuration.configured_model }}</dd></div>
-      <div><dt>Prompt</dt><dd>{{ configuration.prompt_version }} (frozen)</dd></div>
-      <div><dt>Thinking</dt><dd>minimal</dd></div>
-      <div><dt>Execution</dt><dd>Batch API with explicit Gemini cache</dd></div>
-      <div><dt>Credential</dt><dd>{{ 'Configured' if credentials.gemini.configured else 'Not configured' }} via <code>GEMINI_API_KEY</code> or <code>GOOGLE_API_KEY</code></dd></div>
-    </dl>
-    <details class="provenance mt-5"><summary>Technical provenance and hashes</summary><dl class="metadata mt-3"><div><dt>Prompt SHA256</dt><dd class="hash">{{ configuration.prompt_sha256 }}</dd></div><div><dt>Schema SHA256</dt><dd class="hash">{{ configuration.canonical_schema_sha256 }}</dd></div><div><dt>Provider schema</dt><dd class="hash">{{ configuration.provider_schema_sha256 }}</dd></div><div><dt>Prediction contract</dt><dd class="hash">{{ configuration.prediction_contract_sha256 }}</dd></div></dl></details>
-  </section>
-
+  <p class="mt-3 text-muted">Choose an approved, frozen annotation configuration. Draft creation and planning make no provider call.</p>
   <form method="post" action="/ai-annotation" class="surface mt-7 grid gap-5 p-7">
     {{ csrf(principal) }}
+    <fieldset><legend>AI annotation configuration</legend><div class="choice-stack mt-3">
+    {% for item in configurations %}
+      <label class="choice-card"><input type="radio" name="configuration_id" value="{{ item.configuration_id }}" {% if loop.first %}checked{% endif %}><span><strong>{{ item.display_label }}</strong><small>{{ item.description }}</small><small>Task: {{ item.prediction_task }} · Schema: {{ item.annotation_schema_slug }} {{ item.annotation_schema_version }} · Prompt: {{ item.prompt_version }} · Model: {{ item.configured_model }}</small>{% if item.record_set_mode == 'frozen_sample' %}<small>Record set: Hostility held-out 100 · {{ item.record_set_size }} records · frozen validation sample</small>{% else %}<small>Record set: deterministic corpus selection configured after draft creation</small>{% endif %}</span></label>
+    {% endfor %}
+    </div></fieldset>
     <div><label for="name">Campaign name</label><input id="name" name="name" required></div>
     <div><label for="corpus">Corpus</label><select id="corpus" name="corpus_id">{% for corpus in corpora %}<option value="{{ corpus.id }}">{{ corpus.name }}</option>{% endfor %}</select></div>
-    <p class="help">After creating the draft, choose the record count and review the free deterministic plan before any paid submission. Never enter an API key here.</p>
+    <p class="help">The server freezes the selected configuration and its allowed record-set rules. Credential values and technical hashes are never editable here.</p>
     <button class="btn btn-primary" type="submit">Create draft campaign</button>
   </form>
 </div>
