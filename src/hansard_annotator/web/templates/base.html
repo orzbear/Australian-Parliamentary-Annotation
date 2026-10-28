@@ -23,7 +23,7 @@
         <a class="nav-link" href="/">Dashboard</a>
         <a class="nav-link" href="/projects">Human Annotation</a>
         {% if principal.is_admin %}<a class="nav-link" href="/ai-annotation">AI Annotation</a>{% endif %}
-        <a class="nav-link" href="/ai-reviews?status=unreviewed">AI Review</a>
+        <a class="nav-link" href="/ai-review">AI Review</a>
         <a class="nav-link" href="/codebook">Codebook &amp; Taxonomy</a>
         {% if principal.is_admin %}<a class="nav-link" href="/exports">Exports</a><a class="nav-link" href="/admin/users">Administration</a>{% endif %}
         <form method="post" action="/logout">

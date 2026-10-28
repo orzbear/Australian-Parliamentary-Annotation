@@ -27,62 +27,94 @@ RUN_FILTERS = {"needs_review", "completed", "all"}
 def ai_review_runs(
     settings: WebSettings, *, run_filter: str = "all"
 ) -> list[dict[str, object]]:
-    """Summarise immutable runs without collapsing their provenance."""
+    """Return compact run summaries using only terminal review events."""
     if run_filter not in RUN_FILTERS:
         raise ValueError("invalid AI review run filter")
-    having = {
-        "needs_review": "(count(prediction.id) FILTER (WHERE terminal.review_status IS NULL) "
-        "+ max(failures.unreviewed))>0",
-        "completed": "(count(prediction.id)+max(failures.total))>0 AND "
-        "(count(prediction.id) FILTER (WHERE terminal.review_status IS NULL) "
-        "+ max(failures.unreviewed))=0",
-        "all": "true",
-    }[run_filter]
     with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
-        rows = connection.execute(
-            f"""
-            SELECT run.public_id,run.provider,run.configured_model,run.prompt_version,
-                   run.imported_at,campaign.name AS campaign_name,campaign.status AS campaign_status,
-                   count(prediction.id)+max(failures.total) AS prediction_count,
-                   count(prediction.id) FILTER (WHERE terminal.review_status IS NOT NULL)
-                     + max(failures.reviewed) AS reviewed_count,
-                   count(prediction.id) FILTER (WHERE terminal.review_status IS NULL)
-                     + max(failures.unreviewed) AS unreviewed_count
-            FROM model_prediction_runs run
-            LEFT JOIN ai_annotation_campaigns campaign
-              ON campaign.model_prediction_run_id=run.id
-            LEFT JOIN model_predictions prediction ON prediction.run_id=run.id
-            LEFT JOIN LATERAL (
-              SELECT count(*) AS total,
-                     count(*) FILTER (WHERE latest.review_status IS NOT NULL) AS reviewed,
-                     count(*) FILTER (WHERE latest.review_status IS NULL) AS unreviewed
-              FROM model_prediction_abstentions outcome
-              LEFT JOIN LATERAL (
-                SELECT review_status FROM model_prediction_outcome_reviews review
-                WHERE review.abstention_id=outcome.id
-                ORDER BY reviewed_at DESC,id DESC LIMIT 1
-              ) latest ON true
-              WHERE outcome.run_id=run.id AND outcome.resolution_type='INVALID_OUTPUT'
-            ) failures ON true
-            LEFT JOIN LATERAL (
-              SELECT review_status FROM model_prediction_reviews review
-              WHERE review.model_prediction_id=prediction.id
-                AND review.review_status IN ('accepted','edited','skipped')
-              ORDER BY reviewed_at DESC,id DESC LIMIT 1
-            ) terminal ON true
-            GROUP BY run.id,campaign.id HAVING {having}
-            ORDER BY run.imported_at DESC NULLS LAST,run.id DESC
-            """
-        ).fetchall()
+        return _review_run_summaries(connection, run_filter=run_filter)
+
+
+def ai_review_run(settings: WebSettings, public_id: str) -> dict[str, object] | None:
+    """Load one run summary without aggregating unrelated projects."""
+    with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
+        rows = _review_run_summaries(connection, public_id=public_id)
+    return rows[0] if rows else None
+
+
+def _review_run_summaries(
+    connection: psycopg.Connection[dict[str, Any]],
+    *,
+    run_filter: str = "all",
+    public_id: str | None = None,
+) -> list[dict[str, object]]:
+    run_predicate = "WHERE run.public_id=%s::uuid" if public_id else ""
+    parameters: tuple[object, ...] = (public_id,) if public_id else ()
+    rows = connection.execute(
+        f"""
+        WITH selected_runs AS (
+          SELECT run.id,run.public_id,run.prediction_task,run.provider,
+                 run.configured_model,run.prompt_version,run.imported_at,
+                 run.valid_count
+          FROM model_prediction_runs run {run_predicate}
+        ), reviewed_prediction_ids AS MATERIALIZED (
+          SELECT DISTINCT prediction.run_id,review.model_prediction_id
+          FROM model_prediction_reviews review
+          JOIN model_predictions prediction ON prediction.id=review.model_prediction_id
+          JOIN selected_runs run ON run.id=prediction.run_id
+          WHERE review.review_status IN ('accepted','edited','skipped')
+        ), prediction_reviews AS (
+          SELECT run_id,count(*) AS reviewed
+          FROM reviewed_prediction_ids
+          GROUP BY run_id
+        ), invalid_outcomes AS (
+          SELECT outcome.run_id,count(*) AS terminal_invalid_count
+          FROM selected_runs run
+          JOIN model_prediction_abstentions outcome ON outcome.run_id=run.id
+          WHERE outcome.resolution_type='INVALID_OUTPUT'
+          GROUP BY outcome.run_id
+        ), reviewed_invalid_ids AS MATERIALIZED (
+          SELECT DISTINCT outcome.run_id,review.abstention_id
+          FROM model_prediction_outcome_reviews review
+          JOIN model_prediction_abstentions outcome ON outcome.id=review.abstention_id
+          JOIN selected_runs run ON run.id=outcome.run_id
+          WHERE outcome.resolution_type='INVALID_OUTPUT'
+        ), invalid_reviews AS (
+          SELECT run_id,count(*) AS reviewed
+          FROM reviewed_invalid_ids reviewed
+          GROUP BY run_id
+        )
+        SELECT run.id,run.public_id,run.prediction_task,run.provider,
+               run.configured_model,run.prompt_version,run.imported_at,
+               campaign.name AS campaign_name,campaign.status AS campaign_status,
+               run.valid_count AS valid_count,
+               coalesce(invalid.terminal_invalid_count,0) AS terminal_invalid_count,
+               run.valid_count+coalesce(invalid.terminal_invalid_count,0) AS prediction_count,
+               coalesce(prediction_reviews.reviewed,0)
+                 +coalesce(invalid_reviews.reviewed,0) AS reviewed_count
+        FROM selected_runs run
+        LEFT JOIN ai_annotation_campaigns campaign
+          ON campaign.model_prediction_run_id=run.id
+        LEFT JOIN prediction_reviews ON prediction_reviews.run_id=run.id
+        LEFT JOIN invalid_outcomes invalid ON invalid.run_id=run.id
+        LEFT JOIN invalid_reviews ON invalid_reviews.run_id=run.id
+        ORDER BY run.imported_at DESC NULLS LAST,run.id DESC
+        """,
+        parameters,
+    ).fetchall()
     output: list[dict[str, object]] = []
     for row in rows:
         value = dict(row)
         total = int(row["prediction_count"])
         reviewed = int(row["reviewed_count"])
+        remaining = max(total - reviewed, 0)
         value["display_name"] = row["campaign_name"] or "Imported prediction run"
-        value["remaining_count"] = int(row["unreviewed_count"])
+        value["remaining_count"] = remaining
         value["progress_percent"] = round(reviewed / total * 100) if total else 0
         value["review_complete"] = total > 0 and reviewed == total
+        if run_filter == "needs_review" and remaining == 0:
+            continue
+        if run_filter == "completed" and (total == 0 or remaining > 0):
+            continue
         output.append(value)
     return output
 
@@ -127,7 +159,7 @@ def record_ai_review(
             JOIN model_predictions mp ON mp.speaker_turn_id=t.speaker_turn_id
             JOIN model_prediction_runs run ON run.id=mp.run_id
             WHERE a.id=%s AND a.user_id=%s
-              AND (%s IS NULL OR mp.public_id::text=%s)
+              AND (%s::uuid IS NULL OR mp.public_id=%s::uuid)
             ORDER BY run.imported_at DESC,mp.id DESC LIMIT 1
             """,
             (assignment_id, principal.user_id, prediction_public_id, prediction_public_id),
@@ -189,7 +221,7 @@ def record_prediction_review(
         raise ValueError("accepted or edited review requires a human annotation version")
     with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
         prediction = connection.execute(
-            "SELECT id,speaker_turn_id FROM model_predictions WHERE public_id::text=%s",
+            "SELECT id,speaker_turn_id FROM model_predictions WHERE public_id=%s::uuid",
             (prediction_public_id,),
         ).fetchone()
         if prediction is None:
@@ -251,7 +283,7 @@ def record_outcome_review(
     with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
         outcome = connection.execute(
             "SELECT id,speaker_turn_id FROM model_prediction_abstentions "
-            "WHERE public_id::text=%s AND resolution_type='INVALID_OUTPUT'",
+            "WHERE public_id=%s::uuid AND resolution_type='INVALID_OUTPUT'",
             (outcome_public_id,),
         ).fetchone()
         if outcome is None:
@@ -312,6 +344,7 @@ def _terminal_failure_workspace(
     connection: psycopg.Connection[dict[str, Any]],
     principal: Principal,
     outcome_public_id: str,
+    expected_run_public_id: str | None = None,
 ) -> dict[str, object]:
     outcome = connection.execute(
         """SELECT outcome.id,outcome.public_id,outcome.speaker_turn_id,
@@ -324,8 +357,9 @@ def _terminal_failure_workspace(
            FROM model_prediction_abstentions outcome
            JOIN model_prediction_runs run ON run.id=outcome.run_id
            JOIN speaker_turns st ON st.id=outcome.speaker_turn_id
-           WHERE outcome.public_id::text=%s AND outcome.resolution_type='INVALID_OUTPUT'""",
-        (outcome_public_id,),
+           WHERE outcome.public_id=%s::uuid AND outcome.resolution_type='INVALID_OUTPUT'
+             AND (%s::uuid IS NULL OR run.public_id=%s::uuid)""",
+        (outcome_public_id, expected_run_public_id, expected_run_public_id),
     ).fetchone()
     if outcome is None:
         raise LookupError("model prediction or terminal outcome not found")
@@ -396,6 +430,7 @@ def prediction_review_workspace(
     settings: WebSettings,
     principal: Principal,
     prediction_public_id: str,
+    expected_run_public_id: str | None = None,
 ) -> dict[str, object]:
     """Load speech, prediction, effective review, human result, and form metadata."""
     with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
@@ -413,13 +448,14 @@ def prediction_review_workspace(
             FROM model_predictions mp
             JOIN model_prediction_runs mpr ON mpr.id=mp.run_id
             JOIN speaker_turns st ON st.id=mp.speaker_turn_id
-            WHERE mp.public_id::text=%s
+            WHERE mp.public_id=%s::uuid
+              AND (%s::uuid IS NULL OR mpr.public_id=%s::uuid)
             """,
-            (prediction_public_id,),
+            (prediction_public_id, expected_run_public_id, expected_run_public_id),
         ).fetchone()
         if prediction is None:
             return _terminal_failure_workspace(
-                connection, principal, prediction_public_id
+                connection, principal, prediction_public_id, expected_run_public_id
             )
         project = _compatible_review_project(connection, principal, int(prediction["id"]))
         fields, labels = load_schema(connection, int(project["annotation_schema_version_id"]))
@@ -511,7 +547,7 @@ def ensure_prediction_assignment(
     """Create/reuse standard Phase 3 batch, task, and assignment rows on submission."""
     with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
         prediction = connection.execute(
-            "SELECT id,speaker_turn_id FROM model_predictions WHERE public_id::text=%s FOR SHARE",
+            "SELECT id,speaker_turn_id FROM model_predictions WHERE public_id=%s::uuid FOR SHARE",
             (prediction_public_id,),
         ).fetchone()
         if prediction is None:
@@ -521,7 +557,7 @@ def ensure_prediction_assignment(
                           run.annotation_schema_slug,run.annotation_schema_version
                    FROM model_prediction_abstentions outcome
                    JOIN model_prediction_runs run ON run.id=outcome.run_id
-                   WHERE outcome.public_id::text=%s AND outcome.resolution_type='INVALID_OUTPUT'""",
+                   WHERE outcome.public_id=%s::uuid AND outcome.resolution_type='INVALID_OUTPUT'""",
                 (prediction_public_id,),
             ).fetchone()
             if outcome is None:
@@ -625,9 +661,9 @@ def next_unreviewed_prediction(
     with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
         current_run = (
             connection.execute(
-                """SELECT run_id FROM model_predictions WHERE public_id::text=%s
+                """SELECT run_id FROM model_predictions WHERE public_id=%s::uuid
                    UNION ALL SELECT run_id FROM model_prediction_abstentions
-                   WHERE public_id::text=%s AND resolution_type='INVALID_OUTPUT' LIMIT 1""",
+                   WHERE public_id=%s::uuid AND resolution_type='INVALID_OUTPUT' LIMIT 1""",
                 (current_prediction_public_id, current_prediction_public_id),
             ).fetchone()
             if current_prediction_public_id
@@ -710,6 +746,7 @@ def ai_review_queue(
     *,
     review_filter: str = "unreviewed",
     run_id: str | None = None,
+    prediction_task: str | None = None,
     primary_domain: str | None = None,
     is_non_policy: bool | None = None,
 ) -> list[dict[str, object]]:
@@ -718,6 +755,7 @@ def ai_review_queue(
         principal.user_id,
         review_filter=review_filter,
         run_id=run_id,
+        prediction_task=prediction_task,
         primary_domain=primary_domain,
         is_non_policy=is_non_policy,
     )
@@ -752,14 +790,15 @@ def ai_review_queue(
                 "reviewed": "latest.review_status IS NOT NULL",
                 "skipped": "latest.review_status='skipped'",
             }[review_filter]
-            filter_run = "AND run.public_id::text=%s" if run_id else ""
+            filter_run = "AND run.public_id=%s::uuid" if run_id else ""
             failure_parameters: tuple[object, ...] = (
                 (principal.user_id, run_id) if run_id else (principal.user_id,)
             )
             failure_rows = connection.execute(
-                f"""SELECT assignment.id AS assignment_id,assignment.status AS assignment_status,
+                    f"""SELECT assignment.id AS assignment_id,assignment.status AS assignment_status,
                            st.speaker_name_raw,st.speech_date,st.major_heading_original,
-                           outcome.public_id::text AS prediction_id,'hostility'::text AS prediction_task,
+                           outcome.public_id::text AS prediction_id,outcome.record_id,
+                           'hostility'::text AS prediction_task,
                            NULL::jsonb AS prediction_values,NULL::boolean AS is_non_policy,
                            NULL::text AS primary_australian_domain,NULL::text[] AS secondary_australian_domains,
                            run.public_id::text AS run_id,run.configured_model,run.prompt_version,
@@ -777,11 +816,12 @@ def ai_review_queue(
                       ORDER BY a.updated_at DESC,a.id DESC LIMIT 1
                     ) assignment ON true
                     WHERE outcome.resolution_type='INVALID_OUTPUT' AND {status_sql} {filter_run}
-                    ORDER BY st.speech_date,st.id,outcome.id LIMIT 500""",
+                    ORDER BY outcome.record_id LIMIT 101""",
                 failure_parameters,
             ).fetchall()
             output.extend(dict(row) for row in failure_rows)
-        return output
+        output.sort(key=lambda value: str(value.get("record_id") or ""))
+        return output[:100]
 
 
 def _ai_review_queue_query(
@@ -789,6 +829,7 @@ def _ai_review_queue_query(
     *,
     review_filter: str,
     run_id: str | None = None,
+    prediction_task: str | None = None,
     primary_domain: str | None = None,
     is_non_policy: bool | None = None,
 ) -> tuple[str, tuple[object, ...]]:
@@ -811,8 +852,11 @@ def _ai_review_queue_query(
         conditions.append("latest_review.review_status=%s")
         parameters.append(review_filter)
     if run_id:
-        conditions.append("mpr.public_id::text=%s")
+        conditions.append("mpr.public_id=%s::uuid")
         parameters.append(run_id)
+    if prediction_task:
+        conditions.append("mp.prediction_task=%s")
+        parameters.append(prediction_task)
     if primary_domain:
         conditions.append("mp.primary_australian_domain=%s")
         parameters.append(primary_domain)
@@ -825,7 +869,8 @@ def _ai_review_queue_query(
             SELECT current_assignment.id AS assignment_id,
                    current_assignment.status AS assignment_status,
                    st.speaker_name_raw,st.speech_date,st.major_heading_original,
-                   mp.public_id AS prediction_id,mp.prediction_task,mp.prediction_values,
+                   mp.public_id AS prediction_id,mp.record_id,mp.prediction_task,
+                   mp.prediction_values->>'hostility_present' AS hostility_present,
                    mp.is_non_policy,
                    mp.primary_australian_domain,mp.secondary_australian_domains,
                    mpr.public_id AS run_id,
@@ -851,8 +896,8 @@ def _ai_review_queue_query(
               LIMIT 1
             ) current_assignment ON true
             WHERE {where}
-            ORDER BY st.speech_date,st.id,mp.id
-            LIMIT 500
+            ORDER BY mp.record_id
+            LIMIT 101
             """,
         tuple(parameters),
     )
