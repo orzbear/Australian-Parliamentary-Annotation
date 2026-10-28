@@ -27,7 +27,12 @@ def load_pricing(path: Path) -> dict[str, Any]:
 
 
 def aggregate_costs(
-    results: list[dict[str, Any]], provider: str, model: str, pricing: dict[str, Any]
+    results: list[dict[str, Any]],
+    provider: str,
+    model: str,
+    pricing: dict[str, Any],
+    *,
+    mode: str = "standard",
 ) -> dict[str, Any]:
     fields = (
         "input_tokens",
@@ -46,14 +51,24 @@ def aggregate_costs(
     estimated: float | None = None
     billable_output_tokens = tokens["output_tokens"]
     if isinstance(entry, dict):
+        modes = entry.get("modes", {})
+        rates = modes.get(mode) if isinstance(modes, dict) else None
+        if mode != "standard" and not isinstance(rates, dict):
+            raise ValueError(f"pricing mode {mode!r} is not defined for {provider}:{model}")
+        if not isinstance(rates, dict):
+            rates = entry
         if entry.get("reasoning_billed_as_output") is True:
             billable_output_tokens += tokens["reasoning_tokens"]
         input_uncached = max(0, tokens["input_tokens"] - tokens["cached_input_tokens"])
         estimated = (
-            input_uncached * _price(entry, "input_per_million_usd")
+            input_uncached * _price(rates, "input_per_million_usd")
             + tokens["cached_input_tokens"]
-            * _price(entry, "cached_input_per_million_usd", _price(entry, "input_per_million_usd"))
-            + billable_output_tokens * _price(entry, "output_per_million_usd")
+            * _price(
+                rates,
+                "cached_input_per_million_usd",
+                _price(rates, "input_per_million_usd"),
+            )
+            + billable_output_tokens * _price(rates, "output_per_million_usd")
         ) / 1_000_000
     per_attempt = estimated / attempts if estimated is not None and attempts else None
     per_valid = estimated / successful if estimated is not None and successful else None
@@ -70,6 +85,7 @@ def aggregate_costs(
             else pricing.get("source")
         ),
         "pricing_model_key": f"{provider}:{model}",
+        "pricing_mode": mode,
         "pricing_found": entry is not None,
         "tokens": tokens,
         "billable_tokens": {

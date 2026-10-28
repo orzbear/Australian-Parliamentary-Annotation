@@ -168,23 +168,20 @@ def analyse_review_rows(
         if row.get("ai_valid_prediction") is False:
             ai_label = "INVALID_OUTPUT"
             human_label = (
-                f"{human.get('hostility_present')}:{human.get('target') or 'N/A'}"
-                if human else ""
+                f"{human.get('hostility_present')}:{human.get('target') or 'N/A'}" if human else ""
             )
         elif row.get("prediction_task") == "hostility":
             ai_values = row["ai_prediction_values"]
             ai_label = f"{ai_values.get('hostility_present')}:{ai_values.get('target')}"
             human_label = (
-                f"{human.get('hostility_present')}:{human.get('target') or 'N/A'}"
-                if human
-                else ""
+                f"{human.get('hostility_present')}:{human.get('target') or 'N/A'}" if human else ""
             )
         else:
             ai_label = _label(bool(row["ai_is_non_policy"]), row["ai_primary_domain"])
             human_label = (
-            _label(bool(human.get("is_non_policy")), human.get("primary_australian_domain"))
-            if human
-            else ""
+                _label(bool(human.get("is_non_policy")), human.get("primary_australian_domain"))
+                if human
+                else ""
             )
         base = {
             "prediction_id": str(row["prediction_id"]),
@@ -199,7 +196,8 @@ def analyse_review_rows(
             "business_type": row.get("business_type"),
             "speech_text": row.get("speech_text"),
             "ai_is_non_policy": bool(row["ai_is_non_policy"])
-            if row.get("ai_valid_prediction") is not False else None,
+            if row.get("ai_valid_prediction") is not False
+            else None,
             "ai_primary_domain": row["ai_primary_domain"],
             "ai_secondary_domains": _normalise_domains(row["ai_secondary_domains"]),
             "ai_reasoning": row.get("ai_reasoning"),
@@ -264,6 +262,9 @@ def analyse_review_rows(
             for key in (
                 "id",
                 "public_id",
+                "prediction_task",
+                "annotation_schema_slug",
+                "annotation_schema_version",
                 "provider",
                 "configured_model",
                 "returned_model",
@@ -278,7 +279,18 @@ def analyse_review_rows(
                 "artifact_sha256",
                 "record_set_sha256",
                 "imported_at",
+                "requested_count",
+                "provider_success_count",
+                "provider_failure_count",
                 "valid_count",
+                "invalid_count",
+                "input_tokens",
+                "cached_input_tokens",
+                "output_tokens",
+                "reasoning_tokens",
+                "token_processing_cost_usd",
+                "cache_storage_cost_usd",
+                "total_cost_usd",
             )
         },
         "counts": {
@@ -345,6 +357,7 @@ def full_review_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "speaker_turn_id": int(row["speaker_turn_id"]),
                 "record_id": str(row["record_id"]),
                 "turn_key": str(row["turn_key"]),
+                "canonical_record_sha256": row.get("canonical_record_sha256"),
                 "speaker": row.get("speaker"),
                 "sitting_date": row.get("sitting_date"),
                 "chamber": row.get("chamber"),
@@ -358,30 +371,36 @@ def full_review_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "ai_failure_reason": row.get("ai_failure_reason"),
                 "ai_failure_diagnostic": (
                     row["outcome_provenance"].get("final_validation_error")
-                    if isinstance(row.get("outcome_provenance"), dict) else None
+                    if isinstance(row.get("outcome_provenance"), dict)
+                    else None
                 ),
                 "ai_valid_prediction": row.get("ai_valid_prediction", True),
                 "recovery_attempt_count": (
                     len(row.get("outcome_provenance", {}).get("recovery_attempt_history", []))
-                    if isinstance(row.get("outcome_provenance"), dict) else None
+                    if isinstance(row.get("outcome_provenance"), dict)
+                    else None
                 ),
                 "ai_hostility_present": (
                     row["ai_prediction_values"].get("hostility_present")
-                    if isinstance(row.get("ai_prediction_values"), dict) else None
+                    if isinstance(row.get("ai_prediction_values"), dict)
+                    else None
                 ),
                 "ai_target": (
                     row["ai_prediction_values"].get("target")
-                    if isinstance(row.get("ai_prediction_values"), dict) else None
+                    if isinstance(row.get("ai_prediction_values"), dict)
+                    else None
                 ),
                 "ai_evidence": (
                     row["ai_prediction_values"].get("evidence_spans")
-                    if isinstance(row.get("ai_prediction_values"), dict) else None
+                    if isinstance(row.get("ai_prediction_values"), dict)
+                    else None
                 ),
                 "reviewed_hostility": human.get("hostility_present"),
                 "reviewed_target": human.get("target"),
                 "reviewed_evidence": human.get("evidence_span"),
                 "ai_is_non_policy": bool(row["ai_is_non_policy"])
-                if row.get("ai_valid_prediction") is not False else None,
+                if row.get("ai_valid_prediction") is not False
+                else None,
                 "ai_primary_domain": row.get("ai_primary_domain"),
                 "ai_secondary_domains": _normalise_domains(row.get("ai_secondary_domains")),
                 "ai_reasoning": row.get("ai_reasoning"),
@@ -392,9 +411,7 @@ def full_review_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "reviewed_at": row.get("terminal_reviewed_at"),
                 "annotation_version_id": row.get("annotation_version_id"),
                 "human_is_non_policy": human.get("is_non_policy") if human else None,
-                "human_primary_domain": human.get("primary_australian_domain")
-                if human
-                else None,
+                "human_primary_domain": human.get("primary_australian_domain") if human else None,
                 "human_secondary_domains": _normalise_domains(
                     human.get("secondary_australian_domains")
                 )
@@ -481,8 +498,7 @@ def render_markdown(summary: dict[str, Any]) -> str:
     largest_flag_label = largest(flags["by_ai_primary_label"])
     patterns = [
         (
-            f"{largest_edit[1]} of {counts['edited']} edited cases were "
-            f"{largest_edit[0]}."
+            f"{largest_edit[1]} of {counts['edited']} edited cases were {largest_edit[0]}."
             if largest_edit
             else "No edited cases were recorded."
         ),
@@ -598,7 +614,10 @@ def _load_runs(connection: psycopg.Connection[Any]) -> list[dict[str, Any]]:
                    annotation_schema_version,provider,configured_model,returned_model,prompt_version,
                    prompt_sha256,canonical_schema_sha256,prediction_contract_sha256,
                    provider_schema_sha256,generation_config,execution_mode,
-                   provider_job_id,artifact_sha256,record_set_sha256,imported_at,valid_count,invalid_count
+                   provider_job_id,artifact_sha256,record_set_sha256,imported_at,
+                   requested_count,provider_success_count,provider_failure_count,
+                   valid_count,invalid_count,input_tokens,cached_input_tokens,output_tokens,
+                   reasoning_tokens,token_processing_cost_usd,cache_storage_cost_usd,total_cost_usd
             FROM model_prediction_runs ORDER BY imported_at,id
             """
         ).fetchall()
@@ -612,6 +631,7 @@ def _load_rows(connection: psycopg.Connection[Any], run_id: int) -> list[dict[st
             """
             SELECT mp.id,mp.public_id AS prediction_id,mp.run_id,run.public_id AS run_public_id,
                    mp.record_id,mp.speaker_turn_id,mp.prediction_task,
+                   campaign_record.record_sha256 AS canonical_record_sha256,
                    mp.prediction_values AS ai_prediction_values,
                    'PREDICTION'::text AS ai_outcome_status,NULL::text AS ai_failure_reason,
                    true AS ai_valid_prediction,
@@ -633,6 +653,11 @@ def _load_rows(connection: psycopg.Connection[Any], run_id: int) -> list[dict[st
                    COALESCE(flags.notes,'[]'::jsonb) AS codebook_flag_notes
             FROM model_predictions mp
             JOIN model_prediction_runs run ON run.id=mp.run_id
+            LEFT JOIN ai_annotation_campaigns campaign
+              ON campaign.model_prediction_run_id=run.id
+            LEFT JOIN ai_annotation_campaign_records campaign_record
+              ON campaign_record.campaign_id=campaign.id
+             AND campaign_record.speaker_turn_id=mp.speaker_turn_id
             JOIN speaker_turns st ON st.id=mp.speaker_turn_id
             LEFT JOIN LATERAL (
               SELECT review_status,note,annotation_version_id,reviewer_user_id,reviewed_at,id
@@ -668,6 +693,7 @@ def _load_rows(connection: psycopg.Connection[Any], run_id: int) -> list[dict[st
             """
             SELECT outcome.id,outcome.public_id AS prediction_id,outcome.run_id,
                    run.public_id AS run_public_id,outcome.record_id,outcome.speaker_turn_id,
+                   campaign_record.record_sha256 AS canonical_record_sha256,
                    'hostility'::text AS prediction_task,NULL::jsonb AS ai_prediction_values,
                    'INVALID_OUTPUT'::text AS ai_outcome_status,
                    outcome.resolution_reason AS ai_failure_reason,
@@ -686,6 +712,11 @@ def _load_rows(connection: psycopg.Connection[Any], run_id: int) -> list[dict[st
                    0::bigint AS codebook_flag_count,'[]'::jsonb AS codebook_flag_notes
             FROM model_prediction_abstentions outcome
             JOIN model_prediction_runs run ON run.id=outcome.run_id
+            LEFT JOIN ai_annotation_campaigns campaign
+              ON campaign.model_prediction_run_id=run.id
+            LEFT JOIN ai_annotation_campaign_records campaign_record
+              ON campaign_record.campaign_id=campaign.id
+             AND campaign_record.speaker_turn_id=outcome.speaker_turn_id
             JOIN speaker_turns st ON st.id=outcome.speaker_turn_id
             LEFT JOIN LATERAL (
               SELECT review_status,note,annotation_version_id,reviewer_user_id,reviewed_at,id
@@ -735,6 +766,7 @@ def create_review_audit(
         "run_id",
         "record_id",
         "turn_key",
+        "canonical_record_sha256",
         "speaker",
         "sitting_date",
         "chamber",
@@ -787,6 +819,7 @@ def create_review_audit(
             "speaker_turn_id",
             "record_id",
             "turn_key",
+            "canonical_record_sha256",
             "speaker",
             "sitting_date",
             "chamber",
