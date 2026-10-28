@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from html import unescape
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -10,6 +11,7 @@ import pytest
 from fastapi import HTTPException
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
+from hansard_annotator.llm_eval.hostility import partisan_hostility
 from hansard_annotator.llm_eval.import_predictions import (
     iter_terminal_invalid_artifact,
     load_prediction_artifact,
@@ -22,6 +24,7 @@ from hansard_annotator.llm_eval.operations import (
     FROZEN_PROMPT_SHA256,
     FROZEN_PROMPT_VERSION,
 )
+from hansard_annotator.llm_eval.prediction_tasks import human_suggestion
 from hansard_annotator.web.annotations.ai_review import (
     _ai_review_queue_query,
     _domain_display,
@@ -483,8 +486,7 @@ def test_ai_review_and_queue_render_without_inline_styles() -> None:
         "is_admin": True,
     }
     request = type("Request", (), {"query_params": {}})()
-    base_prediction = SimpleNamespace(
-        **{
+    base_prediction = {
             "speaker_name_raw": "Test Member",
             "public_id": "prediction-id",
             "chamber": "House",
@@ -494,9 +496,10 @@ def test_ai_review_and_queue_render_without_inline_styles() -> None:
             "business_type": "Debate",
             "text_clean": "A representative speech.",
             "prediction_task": "hostility",
-            "values": SimpleNamespace(
-                hostility_present="NO", target=None, evidence_spans=[]
-            ),
+            "values": {
+                "hostility_present": "NO", "target": "N/A", "evidence_spans": []
+            },
+            "partisan_hostility": False,
             "reasoning": "No hostility detected.",
             "configured_model": "model",
             "prompt_version": "hostility-prompt-v2",
@@ -505,7 +508,6 @@ def test_ai_review_and_queue_render_without_inline_styles() -> None:
             "created_at": "2026-10-27",
             "failure_message": "AI evidence was unresolved.",
         }
-    )
     context = {
         "principal": principal,
         "request": request,
@@ -526,6 +528,7 @@ def test_ai_review_and_queue_render_without_inline_styles() -> None:
     valid_hostility = templates.get_template("annotations/ai_workspace.html").render(
         **context,
         prediction=base_prediction,
+        suggested_values={"hostility_present": "NO", "target": None, "evidence_span": []},
         ai_unavailable=False,
         effective_review=None,
     )
@@ -536,14 +539,12 @@ def test_ai_review_and_queue_render_without_inline_styles() -> None:
         effective_review=None,
     )
     policy_prediction = {
-        **vars(base_prediction),
+        **base_prediction,
         "prediction_task": "policy",
         "is_non_policy": False,
         "primary_domain_display": "AU04 — Education",
         "secondary_domain_displays": [],
     }
-    policy_prediction["values"] = SimpleNamespace(**vars(base_prediction.values))
-    policy_prediction = SimpleNamespace(**policy_prediction)
     policy = templates.get_template("annotations/ai_workspace.html").render(
         **context,
         prediction=policy_prediction,
@@ -578,7 +579,16 @@ def test_ai_review_and_queue_render_without_inline_styles() -> None:
         assert "style=" not in rendered
         assert "<style" not in rendered
     assert "Hostility: NO" in valid_hostility
+    assert "Hostility target" in valid_hostility
+    assert "Partisan hostility" in valid_hostility
+    assert "Evidence</dt><dd>None" in valid_hostility
+    assert "Optional: note a hostility or target boundary issue" in valid_hostility
+    assert "AU07/AU08 boundary unclear" in policy
+    assert "AI SUGGESTION" in valid_hostility
+    assert valid_hostility.index("Hostility: NO") < valid_hostility.index("Model reasoning")
+    assert valid_hostility.index("Model reasoning") < valid_hostility.index("Model provenance")
     assert "AI prediction unavailable" in terminal_invalid
+    assert "<dt>Evidence</dt>" not in terminal_invalid
     assert "Annotate from scratch" in terminal_invalid
     assert 'action="/ai-reviews/prediction-id/edit"' in terminal_invalid
     assert 'name="hostility_present"' in terminal_invalid
@@ -587,6 +597,118 @@ def test_ai_review_and_queue_render_without_inline_styles() -> None:
     assert '<progress class="progress"' in queue
     assert "Continue review" in selector
     assert "/ai-review/run-id" in selector
+
+
+def test_hostility_ai_suggestion_uses_stored_structured_fields_and_evidence() -> None:
+    templates = Environment(
+        loader=FileSystemLoader(ROOT / "src/hansard_annotator/web/templates"),
+        autoescape=select_autoescape(["html"]),
+    )
+    template = templates.get_template("annotations/ai_workspace.html")
+    speech = "Members should condemn this disgraceful conduct and restore trust."
+    # Use exact canonical offsets/text so this fixture mirrors validated stored evidence.
+    spans = [
+        {"start_offset": 15, "end_offset": 22, "text": "condemn"},
+        {"start_offset": 28, "end_offset": 47, "text": "disgraceful conduct"},
+    ]
+    principal = {"csrf_token": "csrf", "display_name": "Reviewer", "is_admin": True}
+    fields = [
+        SimpleNamespace(
+            field_key="evidence_span",
+            label="Evidence",
+            required=False,
+            help_text="Stored evidence.",
+            field_type="evidence_span",
+            ui_hints={},
+        )
+    ]
+    base = {
+        "speaker_name_raw": "Member",
+        "public_id": "prediction-id",
+        "chamber": "House",
+        "speech_date": "2026-10-27",
+        "major_heading_original": "Debate",
+        "minor_heading_original": "",
+        "business_type": "Debate",
+        "text_clean": speech,
+        "prediction_task": "hostility",
+        "reasoning": "Reasoning appears only after the result.",
+        "configured_model": "model",
+        "prompt_version": "hostility-prompt-v2",
+        "run_public_id": "run-id",
+        "execution_mode": "batch",
+        "created_at": "2026-10-27",
+        "failure_message": "AI evidence was unresolved.",
+    }
+    cases = [
+        ("YES", "OPPOSING_PARTISAN_TARGET", "YES", spans),
+        ("YES", "OTHER_POLITICAL_TARGET", "NO", spans),
+        ("NO", "N/A", "NO", []),
+        ("UNSURE", "UNSURE", "NO", spans[:1]),
+    ]
+    rendered_cases: list[str] = []
+    for presence, target, partisan, evidence in cases:
+        ai_values = {
+            "hostility_present": presence,
+            "target": target,
+            "evidence_spans": evidence,
+        }
+        form_values = human_suggestion("hostility", ai_values)
+        prediction = {
+            **base,
+            "values": ai_values,
+            "partisan_hostility": partisan_hostility(ai_values),
+        }
+        rendered = template.render(
+            principal=principal,
+            request=type("Request", (), {"query_params": {}})(),
+            errors={},
+            human_annotation=None,
+            codebook_flag=None,
+            fields=fields,
+            labels={},
+            prediction=prediction,
+            values=form_values,
+            suggested_values=form_values,
+            ai_unavailable=False,
+            effective_review=None,
+        )
+        rendered_cases.append(rendered)
+        assert f"Hostility: {presence}" in rendered
+        assert f"<dd>{partisan}</dd>" in rendered
+        assert "Target relationship" not in rendered
+        if target == "N/A":
+            assert "<dd>—</dd>" in rendered
+        else:
+            assert f"<dd>{target}</dd>" in rendered
+        for span in evidence:
+            assert f"<q>{span['text']}</q>" in rendered
+        if evidence:
+            # The sidebar reads immutable prediction values; the hidden input that
+            # initializes speech highlighting receives the same evidence objects.
+            input_match = re.search(
+                r"name=\"evidence_span\" value='([^']*)' data-evidence-input", rendered
+            )
+            assert input_match is not None
+            assert json.loads(unescape(input_match.group(1))) == evidence
+        else:
+            assert "Evidence</dt><dd>None" in rendered
+
+    assert "Hostility: YES" in rendered_cases[0]
+    assert "<dd>YES</dd>" in rendered_cases[0]
+    assert "<dd>NO</dd>" in rendered_cases[1]
+    assert "Hostility: NO" in rendered_cases[2]
+    assert "Hostility: UNSURE" in rendered_cases[3]
+
+    middleware = (ROOT / "src/hansard_annotator/web/middleware.py").read_text(
+        encoding="utf-8"
+    )
+    assert "style-src 'self'" in middleware
+    assert "script-src 'self'" in middleware
+    assert "unsafe-inline" not in middleware
+    for rendered in rendered_cases:
+        assert "style=" not in rendered
+        assert "<style" not in rendered
 
 
 def test_domain_codes_are_displayed_with_human_readable_category_names() -> None:
@@ -611,7 +733,7 @@ def test_individual_workspace_renders_prediction_actions_and_comparison() -> Non
         ROOT / "src/hansard_annotator/web/templates/annotations/ai_workspace.html"
     ).read_text(encoding="utf-8")
     for text in (
-        "AI suggestion — not yet human approved",
+        "AI SUGGESTION",
         "prediction.text_clean",
         "prediction.reasoning",
         "Accept AI &amp; next",

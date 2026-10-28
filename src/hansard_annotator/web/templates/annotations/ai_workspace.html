@@ -28,14 +28,18 @@
       <p class="mt-3">{{ prediction.failure_message }}</p>
       <p class="mt-2 text-sm text-muted">Evidence could not be resolved uniquely to the source speech. Review the speech and annotate from scratch.</p>
       {% else %}
-      <p class="eyebrow">AI suggestion — not yet human approved</p>
       {% if prediction.prediction_task == 'hostility' %}
-      <h2 id="ai-heading" class="mt-1 text-2xl font-semibold">Hostility: {{ prediction.values.hostility_present }}</h2>
+      <p class="eyebrow">AI SUGGESTION — NOT YET HUMAN APPROVED</p>
+      {% set ai_values = prediction["values"] %}
+      {% set ai_target = ai_values.get('target') %}
+      <h2 id="ai-heading" class="mt-1 text-2xl font-semibold">Hostility: {{ ai_values.get('hostility_present') }}</h2>
       <dl class="metadata mt-3">
-        <div><dt>Target relationship</dt><dd>{{ prediction.values.target }}</dd></div>
-        <div><dt>Evidence passages</dt><dd>{% for span in prediction.values.evidence_spans %}<q>{{ span.text }}</q>{% if not loop.last %}<br>{% endif %}{% else %}None{% endfor %}</dd></div>
+        <div><dt>Hostility target</dt><dd>{{ ai_target if ai_target and ai_target != 'N/A' else '—' }}</dd></div>
+        <div><dt>Partisan hostility</dt><dd>{{ 'YES' if prediction.partisan_hostility else 'NO' }}</dd></div>
+        <div><dt>Evidence</dt><dd>{% if ai_values.get('evidence_spans') %}<ul class="space-y-2">{% for span in ai_values.get('evidence_spans') %}<li class="rounded-xl border p-3"><q>{{ span.text }}</q></li>{% endfor %}</ul>{% else %}None{% endif %}</dd></div>
       </dl>
       {% else %}
+      <p class="eyebrow">AI suggestion — not yet human approved</p>
       <h2 id="ai-heading" class="mt-1 text-2xl font-semibold">{{ 'Non-Policy' if prediction.is_non_policy else 'Policy' }}</h2>
       <dl class="metadata mt-3">
         <div><dt>Primary domain</dt><dd>{{ prediction.primary_domain_display }}</dd></div>
@@ -64,8 +68,8 @@
       <p class="mt-3 text-sm text-muted">Human annotation recorded after AI failure.</p>
       {% elif prediction.prediction_task == 'hostility' %}
       <div class="comparison-grid mt-3">
-        <div><span>Hostility</span><strong>AI: {{ prediction.values.hostility_present }}</strong><strong>Human: {{ human_annotation.values.hostility_present }}</strong></div>
-        <div><span>Target</span><strong>AI: {{ prediction.values.target }}</strong><strong>Human: {{ human_annotation.values.target or 'N/A' }}</strong></div>
+        <div><span>Hostility</span><strong>AI: {{ prediction["values"].get('hostility_present') }}</strong><strong>Human: {{ human_annotation["values"].get('hostility_present') }}</strong></div>
+        <div><span>Target</span><strong>AI: {{ prediction["values"].get('target') }}</strong><strong>Human: {{ human_annotation["values"].get('target') or 'N/A' }}</strong></div>
         <div><span>Changed</span><strong>{{ human_annotation.changed_fields|join(', ') or 'None' }}</strong></div>
       </div>
       {% else %}
@@ -90,7 +94,7 @@
     <section class="human-review-panel" aria-labelledby="human-form-heading">
       <div class="annotation-title"><p class="eyebrow">Human review</p><h2 id="human-form-heading" class="mt-1 text-2xl font-semibold">{% if ai_unavailable %}Annotate from scratch{% else %}Confirm or correct{% endif %}</h2><p class="mt-2 text-sm text-muted">{% if ai_unavailable %}No AI values are prefilled. Your submission becomes a normal human annotation revision linked to the terminal AI failure.{% else %}Controls begin with the AI suggestion. Submitted values become a normal human annotation revision.{% endif %}</p></div>
       <div class="secondary-actions">
-        {% if not ai_unavailable %}<form method="post" action="/ai-reviews/{{ prediction.public_id }}/flag">{{ csrf(principal) }}<label for="flag-note">Codebook issue note</label><textarea id="flag-note" name="note" rows="2" maxlength="2000" placeholder="AU07/AU08 boundary unclear" required></textarea><button class="btn btn-danger mt-2" type="submit">Flag codebook issue</button></form>{% endif %}
+        {% if not ai_unavailable %}<form method="post" action="/ai-reviews/{{ prediction.public_id }}/flag">{{ csrf(principal) }}<label for="flag-note">Codebook issue note</label><textarea id="flag-note" name="note" rows="2" maxlength="2000" placeholder="{% if prediction.prediction_task == 'hostility' %}Optional: note a hostility or target boundary issue{% else %}AU07/AU08 boundary unclear{% endif %}" required></textarea><button class="btn btn-danger mt-2" type="submit">Flag codebook issue</button></form>{% endif %}
         <div class="flex flex-wrap gap-2">
           <form method="post" action="/ai-reviews/{{ prediction.public_id }}/skip">{{ csrf(principal) }}<button class="btn btn-quiet" type="submit">Skip &amp; next</button></form>
           <a class="btn btn-quiet" href="/ai-reviews?status=unreviewed">Back to queue</a>
