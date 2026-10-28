@@ -199,10 +199,12 @@ that could close the current session.
 
 ## 10. Backups and monitoring
 
-Run `sh deploy/scripts/backup.sh` daily using a root-owned systemd timer or cron entry. The
-script creates a custom-format dump, checksum and mode-600 files without overwriting. It does
-not delete old backups. Add retention only after the owner approves daily/weekly/monthly
-periods and off-VPS copies are demonstrably working.
+Run `sh deploy/scripts/backup.sh` daily using the root-owned systemd timer. The script creates
+a custom-format dump and checksum with mode 600, then retains every timestamped dump for 0–3
+days, the newest per UTC day for days 4–14, and the newest per ISO week for days 15–56. Older
+timestamped dumps are removed with their matching checksums. Specially named dumps and other
+files are not retention candidates. Continue copying backups to approved encrypted off-VPS
+storage.
 
 Install the reviewed daily timer (03:17 UTC plus up to 15 minutes of randomized delay):
 
