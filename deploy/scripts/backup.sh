@@ -33,3 +33,4 @@ trap - EXIT HUP INT TERM
 
 echo "Created $target"
 echo "Copy this dump and checksum to approved encrypted off-VPS storage."
+python3 "$SCRIPT_DIR/prune_backups.py" "$HANSARD_BACKUP_DIR"
