@@ -339,7 +339,12 @@ def disagreements(
 
 
 def write_reports(
-    output: Path, metrics: dict[str, Any], costs: dict[str, Any], rows: list[dict[str, Any]]
+    output: Path,
+    metrics: dict[str, Any],
+    costs: dict[str, Any],
+    rows: list[dict[str, Any]],
+    *,
+    comparative_benchmark: bool = False,
 ) -> None:
     for name, value in (("metrics.json", metrics), ("cost_report.json", costs)):
         (output / name).write_text(
@@ -366,9 +371,20 @@ def write_reports(
     identification, target = metrics["hostility_identification"], metrics["target_classification"]
     partisan = metrics["partisan_hostility"]
     evidence = metrics["evidence_quality"]
+    title = (
+        "# Frozen comparative hostility candidate report"
+        if comparative_benchmark
+        else "# Hostility development evaluation report"
+    )
+    description = (
+        "Frozen comparative benchmark set; reference labels are final human-reviewed annotations. "
+        "This is not a new untouched held-out set.\n\n"
+        if comparative_benchmark
+        else "Development data used for prompt refinement; these are not final or held-out results.\n\n"
+    )
     (output / "report.md").write_text(
-        "# Hostility development evaluation report\n\n"
-        "Development data used for prompt refinement; these are not final or held-out results.\n\n"
+        f"{title}\n\n"
+        f"{description}"
         f"- Valid predictions: {metrics['evaluated_records']} / {metrics['total_records']}\n"
         f"- Hostility YES precision/recall/F1: {identification['precision']:.2%} / "
         f"{identification['recall']:.2%} / {identification['f1']:.2%}\n"

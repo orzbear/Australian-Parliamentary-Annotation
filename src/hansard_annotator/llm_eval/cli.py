@@ -249,7 +249,20 @@ def main(argv: list[str] | None = None) -> int:
                 run_identity=configuration.identity(),
                 configured_model=arguments.model,
             )
-            write_hostility_reports(arguments.output, metric_values, cost_values, mismatch_values)
+            benchmark = package.manifest.get("benchmark")
+            comparative_benchmark = (
+                isinstance(benchmark, dict)
+                and benchmark.get("set_id") == "hostility-heldout-100"
+                and benchmark.get("set_sha256")
+                == "f3d9451b3352025b769d263fc896f57683a741ea6fd9af0b6477651707cf3b36"
+            )
+            write_hostility_reports(
+                arguments.output,
+                metric_values,
+                cost_values,
+                mismatch_values,
+                comparative_benchmark=comparative_benchmark,
+            )
         else:
             mismatch_values = mismatches(
                 records,

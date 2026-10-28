@@ -23,6 +23,7 @@ def _run(count: int) -> dict[str, Any]:
     return {
         "id": 7,
         "public_id": UUID("00000000-0000-0000-0000-000000000007"),
+        "prediction_task": "policy",
         "provider": "gemini",
         "configured_model": "gemini-2.5-flash",
         "returned_model": "gemini-2.5-flash",
@@ -70,6 +71,7 @@ def _row(
         "prediction_id": f"prediction-{number}",
         "run_id": 7,
         "run_public_id": "00000000-0000-0000-0000-000000000007",
+        "prediction_task": "policy",
         "record_id": f"turn:record-{number}",
         "speaker_turn_id": number,
         "ai_is_non_policy": ai_non_policy,
@@ -98,6 +100,7 @@ def _row(
 
 def test_accepted_only_review_is_counted_without_an_edit() -> None:
     summary, edited, flagged = analyse_review_rows(_run(1), [_row(1)])
+    assert summary["run"]["prediction_task"] == "policy"
     assert summary["counts"]["accepted"] == 1
     assert summary["counts"]["edited"] == 0
     assert edited == []
@@ -189,6 +192,36 @@ def test_terminal_hostility_failure_stays_distinct_in_review_audit() -> None:
     assert exported["ai_hostility_present"] is None
     assert exported["reviewed_hostility"] == "YES"
     assert exported["terminal_review_action"] == "human_annotated_after_ai_failure"
+    assert summary["run"]["prediction_task"] == "hostility"
+
+
+def test_prediction_task_can_be_derived_from_one_consistent_row_task() -> None:
+    run = _run(1)
+    run.pop("prediction_task")
+    summary, _, _ = analyse_review_rows(run, [_row(1)])
+    assert summary["run"]["prediction_task"] == "policy"
+
+
+def test_missing_prediction_task_in_run_and_rows_fails_explicitly() -> None:
+    run = _run(1)
+    run.pop("prediction_task")
+    row = _row(1)
+    row.pop("prediction_task")
+    with pytest.raises(ReviewAuditError, match="exported prediction rows have a missing prediction task"):
+        analyse_review_rows(run, [row])
+
+
+def test_mixed_or_inconsistent_prediction_tasks_fail() -> None:
+    mixed = [_row(1), _row(2)]
+    mixed[1]["prediction_task"] = "hostility"
+    run = _run(2)
+    with pytest.raises(ReviewAuditError, match="multiple prediction tasks"):
+        analyse_review_rows(run, mixed)
+
+    inconsistent = _row(1)
+    inconsistent["prediction_task"] = "hostility"
+    with pytest.raises(ReviewAuditError, match="conflicts"):
+        analyse_review_rows(_run(1), [inconsistent])
 
 
 def test_flag_without_terminal_decision_is_still_exported() -> None:
