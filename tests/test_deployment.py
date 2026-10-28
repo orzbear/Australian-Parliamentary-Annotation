@@ -256,3 +256,27 @@ def test_restricted_release_command_backs_up_before_migration() -> None:
     assert "hansard-postgres-data" not in release
     assert "NOPASSWD: %s" in bootstrap
     assert "restrict %s" in bootstrap
+
+
+def test_release_refreshes_stable_backup_scripts_from_activated_current_release() -> None:
+    release = (ROOT / "deploy/host/hansard-release").read_text(encoding="utf-8")
+    service = (
+        ROOT / "deploy/systemd/hansard-annotator-backup.service"
+    ).read_text(encoding="utf-8")
+    timer = (
+        ROOT / "deploy/systemd/hansard-annotator-backup.timer"
+    ).read_text(encoding="utf-8")
+
+    for script in ("backup.sh", "common.sh", "prune_backups.py"):
+        assert f"deploy/scripts/{script}" in release
+        assert "$APP_DIR/current/deploy/scripts/$script" in release
+        assert '"$source" "$operational_stage/$script"' in release
+        assert '"$operational_stage/$script" "$operational_dir/$script"' in release
+
+    activation = release.index('mv -Tf "$next_link" "$APP_DIR/current"')
+    environment_activation = release.index('mv "$temporary_env" "$ENV_FILE"')
+    staging = release.index("operational_stage=$(mktemp -d")
+    archive_removal = release.index('rm -f "$archive"')
+    assert activation < environment_activation < staging < archive_removal
+    assert "ExecStart=/bin/sh /opt/hansard-annotator/deploy/scripts/backup.sh" in service
+    assert "OnCalendar=*-*-* 03:17:00 UTC" in timer

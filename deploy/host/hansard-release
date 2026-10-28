@@ -63,7 +63,7 @@ trap 'rm -rf "$release_dir"' EXIT HUP INT TERM
 tar --extract --gzip --file "$archive" --directory "$release_dir" \
   --no-same-owner --no-same-permissions
 
-for required in Dockerfile compose.production.yaml deploy/scripts/backup.sh deploy/scripts/migrate.sh deploy/scripts/verify.sh; do
+for required in Dockerfile compose.production.yaml deploy/scripts/backup.sh deploy/scripts/common.sh deploy/scripts/prune_backups.py deploy/scripts/migrate.sh deploy/scripts/verify.sh; do
   [ -f "$release_dir/$required" ] || fail "release is missing $required"
 done
 codebook_context=scripts/conference-codebook-pilot-01-ai-codebook-input-d1d13e895705/CODEBOOK_CONTEXT.json
@@ -100,8 +100,31 @@ chmod 600 "$temporary_env"
 chown --reference="$ENV_FILE" "$temporary_env"
 mv "$temporary_env" "$ENV_FILE"
 
-rm -f "$archive"
+operational_scripts='backup.sh common.sh prune_backups.py'
+operational_dir=$APP_DIR/deploy/scripts
+operational_stage=$(mktemp -d "$APP_DIR/.backup-operations.XXXXXX")
+trap 'rm -rf "$operational_stage"' EXIT HUP INT TERM
+for script in $operational_scripts; do
+  source=$APP_DIR/current/deploy/scripts/$script
+  destination=$operational_dir/$script
+  [ -f "$source" ] && [ ! -L "$source" ] || \
+    fail "current release is missing operational backup script $script"
+  [ ! -L "$destination" ] || \
+    fail "stable operational backup path must not be a symlink: $destination"
+  if [ -e "$destination" ]; then
+    mode=$(stat -c '%a' "$destination")
+  else
+    mode=644
+  fi
+  install -o root -g root -m "$mode" "$source" "$operational_stage/$script"
+done
+for script in $operational_scripts; do
+  mv -f "$operational_stage/$script" "$operational_dir/$script"
+done
+rmdir "$operational_stage"
 trap - EXIT HUP INT TERM
+
+rm -f "$archive"
 printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$commit_sha" \
   >> /var/log/hansard-annotator-deployments.log
 echo "Production deployment completed for $commit_sha"
