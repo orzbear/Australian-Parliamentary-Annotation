@@ -74,18 +74,32 @@ def test_simplified_v02_schema_loads_and_removes_old_fields() -> None:
     assert removed.isdisjoint(field.field_key for field in schema.fields)
 
 
-def test_no_clears_downstream_while_yes_and_unsure_require_evidence() -> None:
+def test_human_no_normalizes_stale_ai_yes_target_and_evidence() -> None:
     assert _validate(
         {"hostility_present": "NO", "target": None, "evidence_span": []}
     ).valid
+    ai_values = {
+        "hostility_present": "YES",
+        "target": "OPPOSING_PARTISAN_TARGET",
+        "evidence_spans": [_span(0, 14)],
+    }
     stale = _validate(
         {
             "hostility_present": "NO",
-            "target": "NON_POLITICAL_TARGET",
-            "evidence_span": [_span(0, 14)],
+            "target": ai_values["target"],
+            "evidence_span": ai_values["evidence_spans"],
         }
     )
-    assert "_form" in stale.errors
+    assert stale.valid
+    assert stale.values == {
+        "hostility_present": "NO",
+        "target": None,
+        "evidence_span": [],
+    }
+    assert _derived_annotation_values(stale.values) == {"partisan_hostility": False}
+    assert ai_values["hostility_present"] == "YES"
+    assert ai_values["target"] == "OPPOSING_PARTISAN_TARGET"
+    assert ai_values["evidence_spans"] == [_span(0, 14)]
 
     for presence in ("YES", "UNSURE"):
         missing = _validate(
@@ -101,6 +115,29 @@ def test_no_clears_downstream_while_yes_and_unsure_require_evidence() -> None:
                 "evidence_span": [_span(0, 47)],
             }
         ).valid
+
+
+def test_ai_review_hostility_controls_clear_and_follow_no_visibility() -> None:
+    template = (
+        ROOT / "src/hansard_annotator/web/templates/annotations/ai_workspace.html"
+    ).read_text(encoding="utf-8")
+    script = (ROOT / "src/hansard_annotator/web/static/src/app.js").read_text(
+        encoding="utf-8"
+    )
+    schema = SCHEMA.read_text(encoding="utf-8")
+
+    assert "field.visibility_rules.get('allowed_when')" in template
+    assert "values.get('hostility_present') == 'NO' %} hidden disabled" in template
+    assert "Not applicable when Hostility is NO." in template
+    assert "data-hostility-not-applicable" in template
+    assert "field_not_equals: {field: hostility_present, value: \"NO\"}" in schema
+    assert 'form.querySelectorAll("[data-hostility-not-applicable]")' in script
+    assert "wrapper.disabled = !visible" in script
+    assert 'control.checked = false' in script
+    assert 'control.value = ""' in script
+    assert 'evidenceSpans = []' in script
+    assert "setVisible(wrapper.dataset.field, conditionMatches" in script
+    assert "data-visible-when" in template
 
 
 def test_evidence_is_authoritative_ordered_and_supports_multiple_spans() -> None:
@@ -138,7 +175,7 @@ def test_workspace_supports_highlight_restore_removal_and_exact_copy() -> None:
     assert "legacyCopy(canonicalSpeech)" in script
     assert 'document.execCommand("copy")' in script
     assert "Copy failed" in script
-    assert "v=20261024-hostility-evidence-2" in base
+    assert "v=20261028-hostility-no-clear-1" in base
     assert script.index('copyButton?.addEventListener("click", copySpeech)') < script.index("if (!form) return")
     assert "innerHTML" not in script
 

@@ -91,6 +91,16 @@ def validate_annotation(
             if any(item is not None and item not in allowed for item in candidates):
                 errors.setdefault(key, []).append("Contains an invalid taxonomy code")
 
+    # A human NO decision makes the hostility target and evidence inapplicable.
+    # Normalize valid stale form values before conditional and evidence validation,
+    # so they cannot be persisted even if the browser controls were not cleared.
+    if values.get("hostility_present") == "NO":
+        if "target" in definitions:
+            values["target"] = None
+        evidence_field = definitions.get("evidence_span")
+        if evidence_field and evidence_field.get("field_type") == "evidence_span":
+            values["evidence_span"] = []
+
     for key, field in definitions.items():
         rule_value = values.get(key)
         validation_rules = field.get("validation_rules") or {}

@@ -113,7 +113,8 @@
         <div class="annotation-fields">
         {% for field in fields %}
           {% set current = values.get(field.field_key) %}
-          <fieldset class="field-wrap {% if errors.get(field.field_key) %}field-error{% endif %}" data-field="{{ field.field_key }}">
+          {% if field.field_key in ['target', 'evidence_span'] %}<p class="help" data-hostility-not-applicable {% if values.get('hostility_present') != 'NO' %}hidden{% endif %}>Not applicable when Hostility is NO.</p>{% endif %}
+          <fieldset class="field-wrap {% if errors.get(field.field_key) %}field-error{% endif %}" data-field="{{ field.field_key }}"{% if field.visibility_rules.get('allowed_when') %} data-visible-when='{{ field.visibility_rules.get("allowed_when") | tojson }}'{% endif %}{% if field.field_key in ['target', 'evidence_span'] and values.get('hostility_present') == 'NO' %} hidden disabled{% endif %}>
             <legend>{{ field.label }}{% if field.required %}<span aria-hidden="true"> *</span>{% endif %}</legend>
             <p class="help">{{ field.help_text }}</p>
             {% if field.field_type == 'single_taxonomy' %}

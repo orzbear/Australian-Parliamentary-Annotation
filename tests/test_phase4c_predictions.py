@@ -520,6 +520,7 @@ def test_ai_review_and_queue_render_without_inline_styles() -> None:
             required=True,
             help_text="Classify the speech.",
             field_type="uncertainty",
+            visibility_rules={},
             ui_hints={},
         )],
         "labels": {},
@@ -619,6 +620,11 @@ def test_hostility_ai_suggestion_uses_stored_structured_fields_and_evidence() ->
             required=False,
             help_text="Stored evidence.",
             field_type="evidence_span",
+            visibility_rules={
+                "allowed_when": {
+                    "field_not_equals": {"field": "hostility_present", "value": "NO"}
+                }
+            },
             ui_hints={},
         )
     ]
@@ -775,7 +781,7 @@ def test_correction_controls_are_opt_in_and_secondary_actions_precede_accept() -
     asset_versions = re.findall(r"(?:app\.css|app\.js)\?v=([^\"']+)", base)
     assert asset_versions == [
         "20261027-ai-review-csp-1",
-        "20261024-hostility-evidence-2",
+        "20261028-hostility-no-clear-1",
     ]
 
 
