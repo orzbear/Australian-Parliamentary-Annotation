@@ -206,6 +206,22 @@ def test_prepare_rejects_text_that_differs_from_immutable_campaign_input(
         )
 
 
+def test_prepare_rejects_a_genuinely_wrong_run_task(tmp_path: Path) -> None:
+    audit_csv, audit_summary, _ = _write_audit(tmp_path)
+    summary = json.loads(audit_summary.read_text(encoding="utf-8"))
+    summary["run"]["prediction_task"] = "policy"
+    audit_summary.write_text(json.dumps(summary), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="baseline run provenance mismatch: prediction_task"):
+        prepare_package(
+            audit_csv,
+            audit_summary,
+            ROOT / "config/research_samples/hostility-heldout-100.json",
+            ROOT / "config/llm_eval/hostility-v2-codebook-context.json",
+            tmp_path / "wrong-task-input",
+        )
+
+
 def test_compare_reports_metrics_transitions_and_actual_baseline_cost(tmp_path: Path) -> None:
     audit_csv, audit_summary, rows = _write_audit(tmp_path)
     package_path = tmp_path / "benchmark-input"

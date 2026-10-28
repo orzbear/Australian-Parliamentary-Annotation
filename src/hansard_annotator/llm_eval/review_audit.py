@@ -28,6 +28,25 @@ class ReviewAuditError(ValueError):
     """Review data is incomplete, ambiguous, or internally inconsistent."""
 
 
+def _resolve_prediction_task(run: dict[str, Any], rows: list[dict[str, Any]]) -> str:
+    run_task = run.get("prediction_task")
+    if run_task is not None and (not isinstance(run_task, str) or not run_task.strip()):
+        raise ReviewAuditError("selected run has an invalid prediction task")
+    row_tasks = [row.get("prediction_task") for row in rows]
+    if any(not isinstance(task, str) or not task.strip() for task in row_tasks):
+        raise ReviewAuditError("exported prediction rows have a missing prediction task")
+    unique_row_tasks = set(row_tasks)
+    if len(unique_row_tasks) > 1:
+        raise ReviewAuditError("exported prediction rows contain multiple prediction tasks")
+    row_task = next(iter(unique_row_tasks), None)
+    if run_task is not None and row_task is not None and run_task != row_task:
+        raise ReviewAuditError("selected run prediction task conflicts with exported prediction rows")
+    task = run_task or row_task
+    if task not in {"policy", "hostility"}:
+        raise ReviewAuditError("prediction task cannot be determined from the selected run")
+    return task
+
+
 def choose_run(runs: list[dict[str, Any]], *, run_id: str | None, latest: bool) -> dict[str, Any]:
     if bool(run_id) == latest:
         raise ReviewAuditError("select exactly one of --run-id or --latest")
@@ -106,6 +125,7 @@ def _flag_notes(row: dict[str, Any]) -> list[str]:
 def analyse_review_rows(
     run: dict[str, Any], rows: list[dict[str, Any]]
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    run = {**run, "prediction_task": _resolve_prediction_task(run, rows)}
     prediction_ids = [str(row["prediction_id"]) for row in rows]
     if len(prediction_ids) != len(set(prediction_ids)):
         raise ReviewAuditError("selected run produced duplicate prediction rows")
@@ -694,7 +714,7 @@ def _load_rows(connection: psycopg.Connection[Any], run_id: int) -> list[dict[st
             SELECT outcome.id,outcome.public_id AS prediction_id,outcome.run_id,
                    run.public_id AS run_public_id,outcome.record_id,outcome.speaker_turn_id,
                    campaign_record.record_sha256 AS canonical_record_sha256,
-                   'hostility'::text AS prediction_task,NULL::jsonb AS ai_prediction_values,
+                   run.prediction_task,NULL::jsonb AS ai_prediction_values,
                    'INVALID_OUTPUT'::text AS ai_outcome_status,
                    outcome.resolution_reason AS ai_failure_reason,
                    outcome.outcome_provenance,false AS ai_valid_prediction,
