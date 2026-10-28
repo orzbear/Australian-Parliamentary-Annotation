@@ -30,6 +30,7 @@ from hansard_annotator.llm_eval.prompt import (
     build_system_prompt,
     prompt_hash,
 )
+from hansard_annotator.llm_eval.providers import OpenAIProvider
 from hansard_annotator.llm_eval.runner import evaluate, make_configuration
 from hansard_annotator.llm_eval.validation import InvalidPrediction
 
@@ -412,3 +413,67 @@ def test_runner_separates_evidence_failure_from_classification_failure(tmp_path:
     assert results[0]["diagnostics"]["classification_valid"] is True
     assert results[0]["diagnostics"]["evidence_valid"] is False
     assert results[0]["diagnostics"]["evidence_unmatched"] == ["not copied from speech"]
+
+
+def test_gpt6_luna_responses_schema_and_low_reasoning_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-secret")
+    captured: dict[str, Any] = {}
+    response_prediction = {
+        "hostility_present": "YES",
+        "target": "OPPOSING_PARTISAN_TARGET",
+        "evidence_spans": [{"text": "attacked"}],
+        "reasoning": "Explicitly hostile language.",
+    }
+
+    def transport(
+        url: str, headers: dict[str, str], payload: dict[str, Any], _: float
+    ) -> dict[str, Any]:
+        captured.update({"url": url, "headers": headers, "payload": payload})
+        return {
+            "model": "gpt-6-luna-2026-10-29",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {"type": "output_text", "text": json.dumps(response_prediction)}
+                    ],
+                }
+            ],
+            "usage": {
+                "input_tokens": 40,
+                "output_tokens": 12,
+                "total_tokens": 52,
+                "input_tokens_details": {"cached_tokens": 4},
+                "output_tokens_details": {"reasoning_tokens": 3},
+            },
+        }
+
+    response = OpenAIProvider(transport=transport).generate(
+        model="gpt-6-luna",
+        system_prompt="hostility system prompt",
+        user_prompt="METADATA: {}\n\nSPEECH:\nThey attacked our party.",
+        schema=prediction_json_schema("hostility-prompt-v2"),
+        generation={"max_output_tokens": 1000, "reasoning_effort": "low"},
+    )
+    request = captured["payload"]
+    assert captured["url"] == "https://api.openai.com/v1/responses"
+    assert request["model"] == "gpt-6-luna"
+    assert request["reasoning"] == {"effort": "low"}
+    assert request["max_output_tokens"] == 1000
+    assert "temperature" not in request
+    assert request["text"]["format"]["type"] == "json_schema"
+    assert request["text"]["format"]["strict"] is True
+    assert request["text"]["format"]["schema"] == prediction_json_schema("hostility-prompt-v2")
+    assert "test-secret" not in json.dumps(request)
+    assert response.returned_model == "gpt-6-luna-2026-10-29"
+    assert response.usage.cached_input_tokens == 4
+    assert response.usage.reasoning_tokens == 3
+    parsed, diagnostics = validate_prediction_with_diagnostics(
+        response.raw_prediction, "They attacked our party.", "hostility-prompt-v2"
+    )
+    assert parsed.hostility_present == "YES"
+    assert parsed.evidence_spans[0]["text"] == "attacked"
+    assert diagnostics["evidence_valid"] is True

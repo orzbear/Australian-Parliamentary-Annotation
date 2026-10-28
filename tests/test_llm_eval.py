@@ -332,6 +332,28 @@ def test_final_candidate_pricing_is_recognized(provider: str, model: str, expect
     assert report["estimated_cost_usd"] == expected
 
 
+def test_gpt6_luna_standard_and_batch_costs_use_central_pricing_metadata() -> None:
+    pricing = load_pricing(Path("config/llm_eval/pricing.yaml"))
+    usage = [
+        {
+            "status": "success",
+            "usage": {
+                "input_tokens": 1_000_000,
+                "cached_input_tokens": 100_000,
+                "output_tokens": 100_000,
+                "reasoning_tokens": 20_000,
+            },
+        }
+    ]
+    standard = aggregate_costs(usage, "openai", "gpt-6-luna", pricing)
+    batch = aggregate_costs(usage, "openai", "gpt-6-luna", pricing, mode="batch")
+
+    assert standard["estimated_cost_usd"] == pytest.approx(0.151)
+    assert batch["estimated_cost_usd"] == pytest.approx(0.0755)
+    assert standard["estimated_cost_usd"] == 2 * batch["estimated_cost_usd"]
+    assert standard["pricing_effective_date"] == "2026-10-29"
+
+
 class FakeProvider:
     name = "fake"
 
