@@ -109,6 +109,7 @@
     const wrapper = form.querySelector(`[data-field="${key}"]`);
     if (!wrapper) return;
     wrapper.hidden = !visible;
+    wrapper.disabled = !visible;
     wrapper.querySelectorAll("input,textarea,select").forEach((control) => {
       control.disabled = !visible;
       if (!visible && (control.type === "checkbox" || control.type === "radio")) control.checked = false;
@@ -220,6 +221,10 @@
   }
   function updateConditionalFields() {
     updateDeclarativeVisibility();
+    const hostilityIsNo = selected("hostility_present") === "NO";
+    form.querySelectorAll("[data-hostility-not-applicable]").forEach((message) => {
+      message.hidden = !hostilityIsNo;
+    });
     if (form.querySelector('input[name="is_non_policy"]')) {
       const nonPolicy = selected("is_non_policy") === "true";
       const submit = form.querySelector("[data-submit-next]");
