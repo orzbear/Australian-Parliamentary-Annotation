@@ -4,7 +4,7 @@
 {% block main_class %}workspace-shell{% endblock %}
 {% block content %}
 <header class="workspace-header">
-  <div><a class="text-sm font-medium text-brand" href="/ai-reviews?status=unreviewed">← Back to queue</a><h1 class="mt-1 text-xl font-semibold">AI-assisted review</h1></div>
+  <div><a class="text-sm font-medium text-brand" href="/ai-review/{{ prediction.run_public_id }}">← Back to project queue</a><h1 class="mt-1 text-xl font-semibold">AI-assisted review</h1></div>
   <div>{{ badge(effective_review.review_status if effective_review else 'unreviewed') }}</div>
 </header>
 {% if request.query_params.get('flagged') %}<div class="alert alert-success mb-4">Codebook issue recorded. You may still save a human annotation.</div>{% endif %}

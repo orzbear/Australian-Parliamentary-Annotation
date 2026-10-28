@@ -1,43 +1,24 @@
 {% extends "base.html" %}
 {% from "components/macros.html" import badge, progress %}
-{% block title %}AI review queue{% endblock %}
+{% block title %}Review {{ selected_run.display_name }}{% endblock %}
 {% block content %}
 <header class="page-header">
-  <div><p class="eyebrow">Human review</p><h1>AI prediction runs</h1><p class="mt-2 text-muted">Each AI campaign imports as a separate immutable prediction run so its model configuration, record set, cost, and review history remain reproducible.</p></div>
+  <div><a class="text-sm font-medium text-brand" href="/ai-review">← All review projects</a><p class="eyebrow mt-3">{{ selected_run.prediction_task|title }} review</p><h1 class="mt-1 text-3xl font-semibold">{{ selected_run.display_name }}</h1><p class="mt-2 text-muted">{{ selected_run.configured_model|replace('-',' ')|title }} · {{ selected_run.prompt_version }}</p></div>
+  <div class="surface min-w-64 p-4"><div class="flex justify-between text-sm"><span>Reviewed</span><strong>{{ selected_run.reviewed_count }} / {{ selected_run.prediction_count }}</strong></div>{{ progress(selected_run.reviewed_count, selected_run.prediction_count, 'Progress') }}<p class="mt-2 text-sm text-muted">{{ selected_run.remaining_count }} remaining · {{ selected_run.valid_count }} AI valid{% if selected_run.prediction_task == 'hostility' %} · {{ selected_run.terminal_invalid_count }} terminal invalid{% endif %}</p></div>
 </header>
 
-<nav class="mt-5 flex flex-wrap gap-2" aria-label="Prediction run filters">
-  {% for value, label in [('needs_review','Needs review'),('completed','Completed'),('all','All runs')] %}
-  <a class="btn {{ 'btn-primary' if active_run_filter == value else 'btn-quiet' }}" href="/ai-reviews?status={{ active_filter }}&runs={{ value }}">{{ label }}</a>
+<nav class="mt-5 flex flex-wrap gap-2" aria-label="Review status filters">
+  {% for value, label in [('unreviewed','Needs review'),('reviewed','Reviewed'),('accepted','Accepted'),('edited','Edited'),('flagged_codebook','Codebook flagged'),('skipped','Skipped')] %}
+    <a class="btn {{ 'btn-primary' if active_filter == value else 'btn-quiet' }}" href="/ai-review/{{ selected_run.public_id }}?status={{ value }}">{{ label }}</a>
   {% endfor %}
 </nav>
 
-<div class="mt-5 grid gap-4 lg:grid-cols-2">
-  {% for run in runs %}
-  <article class="surface p-5 {% if active_run_id == run.public_id|string %}border-indigo-400 ring-4 ring-indigo-100{% endif %}">
-    <div class="flex items-start justify-between gap-3"><div><h2 class="text-xl font-semibold">{{ run.display_name }}</h2><p class="mt-1 text-sm text-muted">{{ run.configured_model|replace('-',' ')|title }} · {{ run.prompt_version }}</p></div>{% if run.review_complete %}<span class="badge badge-active">Review complete</span>{% else %}<span class="badge badge-development">Needs review</span>{% endif %}</div>
-    <div class="mt-4">{{ progress(run.reviewed_count, run.prediction_count, 'Reviewed') }}</div>
-    <p class="mt-2 text-sm text-muted">Remaining: {{ run.remaining_count }} · {{ run.progress_percent }}% complete</p>
-    <p class="mt-2 text-sm text-muted">Imported {{ run.imported_at }}</p>
-    <div class="mt-4 flex flex-wrap gap-2">{% if not run.review_complete %}<a class="btn btn-primary" href="/ai-reviews?status=unreviewed&run_id={{ run.public_id }}&runs={{ active_run_filter }}">Continue reviewing</a>{% else %}<a class="btn btn-secondary" href="/exports#run-{{ run.public_id }}">Finalized audit exports</a>{% endif %}<a class="btn btn-quiet" href="/ai-reviews?status=reviewed&run_id={{ run.public_id }}&runs={{ active_run_filter }}">View reviewed</a></div>
-    <details class="provenance mt-4"><summary>Technical run details</summary><dl class="metadata mt-2"><div><dt>Immutable run UUID</dt><dd class="hash">{{ run.public_id }}</dd></div><div><dt>Provider</dt><dd>{{ run.provider }}</dd></div><div><dt>Configured model</dt><dd>{{ run.configured_model }}</dd></div><div><dt>Campaign status</dt><dd>{{ run.campaign_status or 'Not linked to a campaign' }}</dd></div></dl></details>
-  </article>
-  {% else %}<div class="empty-state lg:col-span-2"><p>No prediction runs match this filter.</p></div>{% endfor %}
-</div>
-
-{% if principal.is_admin %}<section class="surface mt-6 p-4" aria-labelledby="review-exports-heading"><div class="flex flex-wrap items-center justify-between gap-3"><div><p class="eyebrow">Research outputs</p><h2 id="review-exports-heading" class="font-semibold">Exports</h2><p class="text-sm text-muted">Partial CSV snapshots are available during review. Final audit artifacts require every prediction to have a terminal decision.</p></div><a class="btn btn-secondary" href="/exports#ai-review">Open AI Review exports</a></div></section>{% endif %}
-
-<section class="mt-7">
-  <div class="flex flex-wrap items-end justify-between gap-3"><div><p class="eyebrow">Predictions</p><h2 class="mt-1 text-2xl font-semibold">{{ rows|length }} matching prediction{{ '' if rows|length == 1 else 's' }}</h2></div></div>
-  <nav class="flex flex-wrap gap-2 my-4" aria-label="Review filters">
-    {% for value, label in [('unreviewed','Unreviewed'),('reviewed','Reviewed'),('accepted','Accepted'),('edited','Edited'),('flagged_codebook','Codebook flagged'),('skipped','Skipped')] %}
-      <a class="btn {{ 'btn-primary' if active_filter == value else 'btn-quiet' }}" href="/ai-reviews?status={{ value }}{% if active_run_id %}&run_id={{ active_run_id }}{% endif %}&runs={{ active_run_filter }}">{{ label }}</a>
-    {% endfor %}
-  </nav>
-  <div class="surface overflow-x-auto">
-    {% if rows %}<table><thead><tr><th>Speech</th><th>Policy status</th><th>Domains</th><th>Run</th><th>Review</th><th></th></tr></thead><tbody>
-    {% for row in rows %}<tr class="review-table-row"><td><a class="font-semibold text-brand" href="/ai-reviews/{{ row.prediction_id }}">{{ row.speaker_name_raw or 'Unknown speaker' }}</a><br><small>{{ row.speech_date }} · {{ row.major_heading_original }}</small></td><td>{% if row.ai_unavailable %}Hostility · AI unavailable{% else %}{{ 'Hostility' if row.prediction_task == 'hostility' else ('Non-Policy' if row.is_non_policy else 'Policy') }}{% endif %}</td><td>{% if row.ai_unavailable %}—{% elif row.prediction_task == 'hostility' %}Hostility prediction{% else %}<strong>{{ row.primary_domain_display }}</strong>{% if row.secondary_domain_displays %}<br><small>{{ row.secondary_domain_displays|join(', ') }}</small>{% endif %}{% endif %}</td><td>{{ row.configured_model }}<br><small>{{ row.prompt_version }}</small></td><td>{{ badge(row.review_status or 'unreviewed') }}</td><td><a class="btn btn-primary" href="/ai-reviews/{{ row.prediction_id }}">Review</a></td></tr>{% endfor %}
-    </tbody></table>{% else %}<div class="empty-state m-6"><p>No predictions match this queue.</p></div>{% endif %}
+<section class="mt-6" aria-labelledby="review-queue-heading">
+  <div class="flex flex-wrap items-end justify-between gap-3"><div><p class="eyebrow">Selected project queue</p><h2 id="review-queue-heading" class="mt-1 text-2xl font-semibold">{{ rows|length }} records loaded</h2><p class="mt-1 text-sm text-muted">The queue loads up to 100 records at a time. Use Submit &amp; next to continue through the selected run.</p></div>{% if principal.is_admin %}<a class="btn btn-secondary" href="/exports#run-{{ selected_run.public_id }}">Review exports</a>{% endif %}</div>
+  <div class="surface mt-4 overflow-x-auto">
+    {% if rows %}<table><thead><tr><th>Speech</th><th>Prediction</th><th>Run</th><th>Review</th><th></th></tr></thead><tbody>
+    {% for row in rows %}<tr class="review-table-row"><td><a class="font-semibold text-brand" href="/ai-review/{{ selected_run.public_id }}/{{ row.prediction_id }}">{{ row.speaker_name_raw or 'Unknown speaker' }}</a><br><small>{{ row.speech_date }} · {{ row.major_heading_original }}</small></td><td>{% if row.ai_unavailable %}Hostility · AI unavailable{% elif row.prediction_task == 'hostility' %}Hostility · {{ row.hostility_present }}{% else %}{{ 'Non-Policy' if row.is_non_policy else 'Policy' }}{% if row.primary_domain_display %}<br><small>{{ row.primary_domain_display }}</small>{% endif %}{% endif %}</td><td><small>{{ row.run_id }}</small></td><td>{{ badge(row.review_status or 'unreviewed') }}</td><td><a class="btn btn-primary" href="/ai-review/{{ selected_run.public_id }}/{{ row.prediction_id }}">Review</a></td></tr>{% endfor %}
+    </tbody></table>{% else %}<div class="empty-state m-6"><p>No records match this review filter.</p></div>{% endif %}
   </div>
 </section>
 {% endblock %}

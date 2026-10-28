@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from typing import Annotated, Any, cast
+from urllib.parse import quote, urlencode
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import RedirectResponse
@@ -11,8 +12,8 @@ from fastapi.templating import Jinja2Templates
 
 from hansard_annotator.web.annotations.ai_review import (
     REVIEW_FILTERS,
-    RUN_FILTERS,
     ai_review_queue,
+    ai_review_run,
     ai_review_runs,
     ensure_prediction_assignment,
     next_unreviewed_prediction,
@@ -401,26 +402,43 @@ async def flag(
     return RedirectResponse("/", status_code=303)
 
 
-@router.get("/ai-reviews")
-def review_queue(
+@router.get("/ai-review")
+def review_projects(
     request: Request,
     settings: Annotated[WebSettings, Depends(get_settings)],
     principal: Annotated[Principal, Depends(require_principal)],
     status: str = "unreviewed",
-    run_id: str | None = None,
-    primary_domain: str | None = None,
-    is_non_policy: bool | None = None,
-    runs: str = "all",
 ) -> object:
     if status not in REVIEW_FILTERS:
         status = "unreviewed"
-    if runs not in RUN_FILTERS:
-        runs = "all"
+    return _templates(request).TemplateResponse(
+        request,
+        "annotations/ai_review_projects.html",
+        {"principal": principal, "runs": ai_review_runs(settings), "status": status},
+    )
+
+
+@router.get("/ai-review/{run_id}")
+def review_project(
+    request: Request,
+    settings: Annotated[WebSettings, Depends(get_settings)],
+    principal: Annotated[Principal, Depends(require_principal)],
+    run_id: str,
+    status: str = "unreviewed",
+    primary_domain: str | None = None,
+    is_non_policy: bool | None = None,
+) -> object:
+    if status not in REVIEW_FILTERS:
+        status = "unreviewed"
+    run = ai_review_run(settings, run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="AI review project not found")
     rows = ai_review_queue(
         settings,
         principal,
         review_filter=status,
         run_id=run_id,
+        prediction_task=str(run["prediction_task"]),
         primary_domain=primary_domain,
         is_non_policy=is_non_policy,
     )
@@ -429,20 +447,51 @@ def review_queue(
         "annotations/ai_queue.html",
         {
             "principal": principal,
+            "selected_run": run,
             "rows": rows,
             "active_filter": status,
-            "runs": ai_review_runs(settings, run_filter=runs),
-            "active_run_filter": runs,
             "active_run_id": run_id,
+            "primary_domain": primary_domain or "",
+            "is_non_policy": is_non_policy,
         },
     )
 
 
+@router.get("/ai-reviews")
+def legacy_review_queue(
+    status: str = "unreviewed",
+    run_id: str | None = None,
+    primary_domain: str | None = None,
+    is_non_policy: bool | None = None,
+) -> RedirectResponse:
+    """Keep old links usable while moving review navigation to the project selector."""
+    if run_id:
+        if status not in REVIEW_FILTERS:
+            status = "unreviewed"
+        query_values: dict[str, str] = {"status": status}
+        if primary_domain:
+            query_values["primary_domain"] = primary_domain
+        if is_non_policy is not None:
+            query_values["is_non_policy"] = str(is_non_policy).lower()
+        query = urlencode(query_values)
+        return RedirectResponse(
+            f"/ai-review/{quote(run_id, safe='')}?{query}", status_code=303
+        )
+    if status not in REVIEW_FILTERS:
+        status = "unreviewed"
+    return RedirectResponse(f"/ai-review?status={status}", status_code=303)
+
+
 def _review_workspace_or_http(
-    settings: WebSettings, principal: Principal, prediction_id: str
+    settings: WebSettings,
+    principal: Principal,
+    prediction_id: str,
+    run_id: str | None = None,
 ) -> dict[str, object]:
     try:
-        return prediction_review_workspace(settings, principal, prediction_id)
+        return prediction_review_workspace(
+            settings, principal, prediction_id, expected_run_public_id=run_id
+        )
     except LookupError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
     except PermissionError as error:
@@ -451,9 +500,20 @@ def _review_workspace_or_http(
         raise HTTPException(status_code=409, detail=str(error)) from error
 
 
-def _next_review_destination(settings: WebSettings, prediction_id: str) -> str:
+def _next_review_destination(
+    settings: WebSettings, prediction_id: str, run_id: str
+) -> str:
     next_id = next_unreviewed_prediction(settings, prediction_id)
-    return f"/ai-reviews/{next_id}" if next_id else "/ai-reviews?status=unreviewed"
+    return (
+        f"/ai-review/{run_id}/{next_id}"
+        if next_id
+        else f"/ai-review/{run_id}?status=unreviewed"
+    )
+
+
+def _workspace_run_id(workspace: dict[str, object]) -> str:
+    prediction = cast(dict[str, object], workspace["prediction"])
+    return str(prediction["run_public_id"])
 
 
 def _prediction_decision_status(payload: dict[str, object], suggested_values: object) -> str:
@@ -470,8 +530,22 @@ def individual_ai_review(
     principal: Annotated[Principal, Depends(require_principal)],
 ) -> object:
     workspace = _review_workspace_or_http(settings, principal, prediction_id)
-    if workspace.get("ai_unavailable"):
-        raise HTTPException(status_code=409, detail="no valid AI prediction is available to accept")
+    return _templates(request).TemplateResponse(
+        request,
+        "annotations/ai_workspace.html",
+        {"principal": principal, **workspace, "errors": {}},
+    )
+
+
+@router.get("/ai-review/{run_id}/{prediction_id}")
+def project_ai_review(
+    request: Request,
+    run_id: str,
+    prediction_id: str,
+    settings: Annotated[WebSettings, Depends(get_settings)],
+    principal: Annotated[Principal, Depends(require_principal)],
+) -> object:
+    workspace = _review_workspace_or_http(settings, principal, prediction_id, run_id)
     return _templates(request).TemplateResponse(
         request,
         "annotations/ai_workspace.html",
@@ -505,7 +579,10 @@ async def accept_prediction(
         assignment_id=assignment_id,
         annotation_version_id=cast(int, result["annotation_version_id"]),
     )
-    return RedirectResponse(_next_review_destination(settings, prediction_id), status_code=303)
+    return RedirectResponse(
+        _next_review_destination(settings, prediction_id, _workspace_run_id(workspace)),
+        status_code=303,
+    )
 
 
 @router.post("/ai-reviews/{prediction_id}/edit")
@@ -547,7 +624,10 @@ async def edit_prediction(
             assignment_id=assignment_id,
             annotation_version_id=cast(int, result["annotation_version_id"]),
         )
-    return RedirectResponse(_next_review_destination(settings, prediction_id), status_code=303)
+    return RedirectResponse(
+        _next_review_destination(settings, prediction_id, _workspace_run_id(workspace)),
+        status_code=303,
+    )
 
 
 @router.post("/ai-reviews/{prediction_id}/flag")
@@ -581,7 +661,10 @@ async def skip_prediction(
         record_outcome_review(settings, principal, prediction_id, "skipped")
     else:
         record_prediction_review(settings, principal, prediction_id, "skipped")
-    return RedirectResponse(_next_review_destination(settings, prediction_id), status_code=303)
+    return RedirectResponse(
+        _next_review_destination(settings, prediction_id, _workspace_run_id(workspace)),
+        status_code=303,
+    )
 
 
 @router.get("/assignments/{assignment_id}/history")

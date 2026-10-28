@@ -25,6 +25,8 @@ from hansard_annotator.llm_eval.operations import (
 from hansard_annotator.web.annotations.ai_review import (
     _ai_review_queue_query,
     _domain_display,
+    ai_review_run,
+    ai_review_runs,
 )
 from hansard_annotator.web.tasks.routes import (
     _accepted_ai_payload,
@@ -369,20 +371,83 @@ def test_queue_filters_remain_bound_and_composable() -> None:
         42,
         review_filter="unreviewed",
         run_id="run-id",
+        prediction_task="hostility",
         primary_domain="AU06",
         is_non_policy=False,
     )
-    assert "mpr.public_id::text=%s" in query
+    assert "mpr.public_id=%s::uuid" in query
+    assert "mp.prediction_task=%s" in query
     assert "mp.primary_australian_domain=%s" in query
     assert "mp.is_non_policy=%s" in query
-    assert parameters == (42, "run-id", "AU06", False)
+    assert parameters == (42, "run-id", "hostility", "AU06", False)
 
 
 def test_one_hundred_zero_review_predictions_are_not_limited_below_one_hundred() -> None:
     query, _ = _ai_review_queue_query(42, review_filter="unreviewed")
     simulated_predictions = [{"prediction_id": number} for number in range(100)]
     assert len(simulated_predictions) == 100
-    assert "LIMIT 500" in query
+    assert "LIMIT 101" in query
+
+
+def test_review_run_summaries_use_one_lightweight_query_and_scope_selected_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, object]] = []
+    row = {
+        "id": 7,
+        "public_id": "run-public-id",
+        "prediction_task": "hostility",
+        "provider": "gemini",
+        "configured_model": "model",
+        "prompt_version": "hostility-prompt-v2",
+        "imported_at": "2026-10-27",
+        "campaign_name": "Hostility held-out 100",
+        "campaign_status": "IMPORTED",
+        "valid_count": 98,
+        "terminal_invalid_count": 2,
+        "prediction_count": 100,
+        "reviewed_count": 10,
+    }
+
+    class _Result:
+        def fetchall(self) -> list[dict[str, object]]:
+            return [row]
+
+    class _Connection:
+        def __enter__(self) -> _Connection:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def execute(self, query: str, parameters: object = None) -> _Result:
+            calls.append((query, parameters))
+            return _Result()
+
+    monkeypatch.setattr(
+        "hansard_annotator.web.annotations.ai_review.psycopg.connect",
+        lambda *_args, **_kwargs: _Connection(),
+    )
+    settings = SimpleNamespace(database=SimpleNamespace(psycopg_url="postgresql://local/test"))
+    summaries = ai_review_runs(settings)  # type: ignore[arg-type]
+    assert len(calls) == 1
+    query, _parameters = calls[-1]
+    assert "raw_provider_response" not in query
+    assert "prediction_values" not in query
+    assert "LEFT JOIN LATERAL" not in query
+    assert summaries[0]["prediction_count"] == 100
+    assert summaries[0]["reviewed_count"] == 10
+    assert summaries[0]["remaining_count"] == 90
+    assert summaries[0]["valid_count"] == 98
+    assert summaries[0]["terminal_invalid_count"] == 2
+
+    calls.clear()
+    selected = ai_review_run(settings, "run-public-id")  # type: ignore[arg-type]
+    assert selected is not None
+    assert len(calls) == 1
+    selected_query, parameters = calls[0]
+    assert "WHERE run.public_id=%s::uuid" in selected_query
+    assert parameters == ("run-public-id",)
 
 
 def test_prediction_decision_detects_accept_and_edit_without_mutating_ai() -> None:
@@ -401,9 +466,9 @@ def test_ai_queue_has_obvious_prediction_links_and_review_action() -> None:
     queue = (ROOT / "src/hansard_annotator/web/templates/annotations/ai_queue.html").read_text(
         encoding="utf-8"
     )
-    assert queue.count("/ai-reviews/{{ row.prediction_id }}") >= 2
+    assert queue.count("/ai-review/{{ selected_run.public_id }}/{{ row.prediction_id }}") >= 2
     assert ">Review</a>" in queue
-    assert "row.secondary_domain_displays" in queue
+    assert "row.hostility_present" in queue
     assert "row.reasoning" not in queue
 
 
@@ -485,28 +550,31 @@ def test_ai_review_and_queue_render_without_inline_styles() -> None:
         ai_unavailable=False,
         effective_review=None,
     )
-    queue = templates.get_template("annotations/ai_queue.html").render(
-        principal=principal,
-        runs=[{
+    selected_run = {
             "public_id": "run-id",
             "display_name": "Hostility review",
+            "prediction_task": "hostility",
             "configured_model": "model",
             "prompt_version": "hostility-prompt-v2",
             "review_complete": False,
             "reviewed_count": 1,
             "prediction_count": 2,
-            "progress_percent": 50,
             "remaining_count": 1,
+            "valid_count": 1,
+            "terminal_invalid_count": 1,
             "imported_at": "2026-10-27",
-            "campaign_status": "IMPORTED",
-            "provider": "gemini",
-        }],
+        }
+    queue = templates.get_template("annotations/ai_queue.html").render(
+        principal=principal,
+        selected_run=selected_run,
         rows=[],
-        active_run_id=None,
-        active_run_filter="all",
         active_filter="unreviewed",
     )
-    for rendered in (valid_hostility, terminal_invalid, policy, queue):
+    selector = templates.get_template("annotations/ai_review_projects.html").render(
+        principal=principal,
+        runs=[selected_run],
+    )
+    for rendered in (valid_hostility, terminal_invalid, policy, queue, selector):
         assert "style=" not in rendered
         assert "<style" not in rendered
     assert "Hostility: NO" in valid_hostility
@@ -517,6 +585,8 @@ def test_ai_review_and_queue_render_without_inline_styles() -> None:
     assert "Save edited annotation &amp; next" in terminal_invalid
     assert "AU04 — Education" in policy
     assert '<progress class="progress"' in queue
+    assert "Continue review" in selector
+    assert "/ai-review/run-id" in selector
 
 
 def test_domain_codes_are_displayed_with_human_readable_category_names() -> None:
@@ -548,7 +618,7 @@ def test_individual_workspace_renders_prediction_actions_and_comparison() -> Non
         "Save edited annotation &amp; next",
         "Flag codebook issue",
         "Skip &amp; next",
-        "Back to queue",
+        "Back to project queue",
         "AI versus human",
         "Codebook issue recorded",
     ):
@@ -587,30 +657,31 @@ def test_correction_controls_are_opt_in_and_secondary_actions_precede_accept() -
     ]
 
 
-def test_ai_review_run_cards_are_human_readable_and_keep_technical_identity() -> None:
-    queue = (ROOT / "src/hansard_annotator/web/templates/annotations/ai_queue.html").read_text(
+def test_ai_review_project_cards_are_compact_and_keep_technical_identity() -> None:
+    selector = (ROOT / "src/hansard_annotator/web/templates/annotations/ai_review_projects.html").read_text(
         encoding="utf-8"
     )
     for text in (
         "run.display_name",
+        "run.prediction_task",
+        "run.prediction_count",
+        "run.reviewed_count",
+        "run.remaining_count",
+        "run.valid_count",
+        "run.terminal_invalid_count",
         "run.configured_model",
         "run.prompt_version",
-        "Continue reviewing",
-        "Review complete",
-        "Remaining:",
-        "progress_percent",
-        "Immutable run UUID",
-        "run.public_id",
-        "Each AI campaign imports as a separate immutable prediction run",
+        "Continue review",
+        "Open review",
     ):
-        assert text in queue
-    assert "active_run_id == run.public_id|string" in queue
+        assert text in selector
     service = (
         ROOT / "src/hansard_annotator/web/annotations/ai_review.py"
     ).read_text(encoding="utf-8")
     assert "campaign.name AS campaign_name" in service
     assert 'row["campaign_name"] or "Imported prediction run"' in service
     assert "ORDER BY run.imported_at DESC NULLS LAST,run.id DESC" in service
+    assert "reviewed_prediction_ids AS MATERIALIZED" in service
 
 
 def test_dashboard_and_navigation_make_ai_review_first_class() -> None:
@@ -628,6 +699,9 @@ def test_routes_include_individual_actions_and_next_redirect() -> None:
     routes = (ROOT / "src/hansard_annotator/web/tasks/routes.py").read_text(encoding="utf-8")
     for suffix in ('"/ai-reviews/{prediction_id}"', "/accept", "/edit", "/flag", "/skip"):
         assert suffix in routes
+    assert '"/ai-review"' in routes
+    assert '"/ai-review/{run_id}"' in routes
+    assert '"/ai-review/{run_id}/{prediction_id}"' in routes
     assert "_next_review_destination" in routes
     service = (ROOT / "src/hansard_annotator/web/annotations/ai_review.py").read_text(
         encoding="utf-8"
