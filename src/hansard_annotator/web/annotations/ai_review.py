@@ -8,6 +8,7 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from hansard_annotator.llm_eval.hostility import partisan_hostility
 from hansard_annotator.llm_eval.prediction_tasks import changed_fields, human_suggestion
 from hansard_annotator.web.annotations.renderer import load_schema
 from hansard_annotator.web.auth.models import Principal
@@ -507,6 +508,8 @@ def prediction_review_workspace(
         values = dict(human["values"]) if human else suggested_values
         prediction_data = dict(prediction)
         prediction_data["values"] = prediction_values
+        if task == "hostility":
+            prediction_data["partisan_hostility"] = partisan_hostility(prediction_values)
         prediction_data["primary_domain_display"] = _domain_display(
             prediction["primary_australian_domain"], domain_labels
         )
