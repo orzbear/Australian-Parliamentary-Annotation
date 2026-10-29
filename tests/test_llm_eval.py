@@ -738,7 +738,26 @@ def test_prompt_versions_coexist_with_distinct_hashes_and_run_identities(tmp_pat
         "hostility-prompt-v1",
         "hostility-prompt-v1.1",
         "hostility-prompt-v2",
+        "hostility-prompt-v2-production-no-reasoning",
+        "hostility-prompt-luna-v1",
     )
+    hostility_context = json.loads(
+        (Path(__file__).parents[1] / "config/llm_eval/hostility-v2-codebook-context.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    hostility_versions = (
+        "hostility-prompt-v2",
+        "hostility-prompt-v2-production-no-reasoning",
+        "hostility-prompt-luna-v1",
+    )
+    hostility_hashes = tuple(
+        prompt_hash(build_system_prompt(hostility_context, version))
+        for version in hostility_versions
+    )
+    assert len(set(hostility_hashes)) == len(hostility_versions)
+    assert hostility_hashes[0] == "185f5162348ae3b3d735ea43247da18cf6b3c1bb12f8a72cad57e38ce31cb1a8"
+    assert hostility_hashes[2] == "daeb12f872bb908112fc449ba5a0b0a444fa8624dcc9f805555e3e9a73bcc964"
     v1 = build_system_prompt(package.context, "phase4a-policy-v1")
     v2 = build_system_prompt(package.context, "phase4a-policy-v2")
     assert v1.startswith("You classify quoted Australian parliamentary speech.")

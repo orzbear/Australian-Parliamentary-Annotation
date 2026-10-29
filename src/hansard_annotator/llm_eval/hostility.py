@@ -8,6 +8,10 @@ from pathlib import Path
 from typing import Any
 
 from hansard_annotator.llm_eval.models import HostilityPrediction
+from hansard_annotator.llm_eval.prompt import (
+    HOSTILITY_LUNA_PROMPT_VERSION,
+    HOSTILITY_PRODUCTION_PROMPT_VERSION,
+)
 from hansard_annotator.llm_eval.validation import InvalidPrediction
 
 PRESENCE_CODES = ("YES", "NO", "UNSURE")
@@ -18,6 +22,7 @@ TARGET_CODES = (
     "UNSURE",
 )
 MODEL_TARGET_CODES = (*TARGET_CODES, "N/A")
+HOSTILITY_PRODUCTION_CONTRACT_VERSION = "hostility-output-v2-production-no-reasoning"
 ISSUE_TYPES = (
     "ACCOUNTABILITY_FALSE_POSITIVE",
     "POLICY_ACTOR_CONFUSION",
@@ -33,6 +38,10 @@ MAX_REASONING_LENGTH = 4000
 
 
 def prediction_json_schema(prompt_version: str = "hostility-prompt-v1.1") -> dict[str, Any]:
+    no_reasoning = prompt_version in {
+        HOSTILITY_PRODUCTION_PROMPT_VERSION,
+        HOSTILITY_LUNA_PROMPT_VERSION,
+    }
     evidence_properties: dict[str, Any] = {
         "text": {"type": "string", "minLength": 1},
     }
@@ -44,27 +53,35 @@ def prediction_json_schema(prompt_version: str = "hostility-prompt-v1.1") -> dic
             **evidence_properties,
         }
         evidence_required = ["start_offset", "end_offset", "text"]
+    properties: dict[str, Any] = {
+        "hostility_present": {"type": "string", "enum": list(PRESENCE_CODES)},
+        "target": {"type": "string", "enum": list(MODEL_TARGET_CODES)},
+        "evidence_spans": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": evidence_properties,
+                "required": evidence_required,
+            },
+        },
+    }
+    required = ["hostility_present", "target", "evidence_spans"]
+    if not no_reasoning:
+        properties["reasoning"] = {
+            "type": "string",
+            "maxLength": (
+                1000
+                if prompt_version in {"hostility-prompt-v1", "hostility-prompt-v1.1"}
+                else MAX_REASONING_LENGTH
+            ),
+        }
+        required.append("reasoning")
     return {
         "type": "object",
         "additionalProperties": False,
-        "properties": {
-            "hostility_present": {"type": "string", "enum": list(PRESENCE_CODES)},
-            "target": {"type": "string", "enum": list(MODEL_TARGET_CODES)},
-            "evidence_spans": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": evidence_properties,
-                    "required": evidence_required,
-                },
-            },
-            "reasoning": {
-                "type": "string",
-                "maxLength": 1000 if prompt_version in {"hostility-prompt-v1", "hostility-prompt-v1.1"} else MAX_REASONING_LENGTH,
-            },
-        },
-        "required": ["hostility_present", "target", "evidence_spans", "reasoning"],
+        "properties": properties,
+        "required": required,
     }
 
 
@@ -78,15 +95,17 @@ def validate_prediction(
 def validate_prediction_with_diagnostics(
     raw: object, text: str, prompt_version: str = "hostility-prompt-v1.1"
 ) -> tuple[HostilityPrediction, dict[str, object]]:
-    if not isinstance(raw, dict) or set(raw) != {
-        "hostility_present",
-        "target",
-        "evidence_spans",
-        "reasoning",
+    expected_fields = {"hostility_present", "target", "evidence_spans"}
+    if prompt_version not in {
+        HOSTILITY_PRODUCTION_PROMPT_VERSION,
+        HOSTILITY_LUNA_PROMPT_VERSION,
     }:
+        expected_fields.add("reasoning")
+    if not isinstance(raw, dict) or set(raw) != expected_fields:
         raise InvalidPrediction("response fields do not match the hostility schema")
     presence, target = raw["hostility_present"], raw["target"]
-    spans, reasoning = raw["evidence_spans"], raw["reasoning"]
+    spans = raw["evidence_spans"]
+    reasoning = raw.get("reasoning", "")
     if presence not in PRESENCE_CODES:
         raise InvalidPrediction("hostility_present is unknown")
     if target not in MODEL_TARGET_CODES:

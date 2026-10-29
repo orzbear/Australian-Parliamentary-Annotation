@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from hansard_annotator.llm_eval.cli import _validate_luna_output_limit
 from hansard_annotator.llm_eval.hostility import (
     MAX_REASONING_LENGTH,
     compute_metrics,
@@ -25,9 +26,13 @@ from hansard_annotator.llm_eval.hostility_comparison import (
 from hansard_annotator.llm_eval.models import ProviderResponse
 from hansard_annotator.llm_eval.package import load_evaluation_package
 from hansard_annotator.llm_eval.prompt import (
+    HOSTILITY_LUNA_CONTRACT_VERSION,
+    HOSTILITY_LUNA_PROMPT_VERSION,
+    HOSTILITY_PRODUCTION_PROMPT_VERSION,
     HOSTILITY_PROMPT_V1_1,
     HOSTILITY_PROMPT_V2,
     build_system_prompt,
+    build_user_prompt,
     prompt_hash,
 )
 from hansard_annotator.llm_eval.providers import OpenAIProvider
@@ -147,6 +152,201 @@ def test_hostility_package_dispatch_prompt_contract_and_run_identity(tmp_path: P
     assert first.identity() == second.identity()
     with pytest.raises(ValueError, match="policy prompts cannot"):
         build_system_prompt(package.context, "phase4a-policy-v1")
+
+
+def test_production_no_reasoning_contract_preserves_rules_and_evidence_resolution() -> None:
+    schema = prediction_json_schema(HOSTILITY_PRODUCTION_PROMPT_VERSION)
+    context = json.loads(
+        Path("config/llm_eval/hostility-v2-codebook-context.json").read_text(encoding="utf-8")
+    )
+    prompt = build_system_prompt(context, HOSTILITY_PRODUCTION_PROMPT_VERSION)
+    assert set(schema["properties"]) == {"hostility_present", "target", "evidence_spans"}
+    assert schema["required"] == ["hostility_present", "target", "evidence_spans"]
+    assert "MANDATORY ACCOUNTABILITY BOUNDARY" in prompt
+    assert "TARGET (classify only after YES or UNSURE)" in prompt
+    assert "EVIDENCE:" in prompt
+    assert "reasoning" not in prompt.lower()
+    assert prompt_hash(prompt) == "42cea86b33e561b2ed8bec4ac57740e6132b614d577896e9b6ea8a0d92fc83b8"
+    contract = json.dumps(schema, sort_keys=True, separators=(",", ":"))
+    assert hashlib.sha256(contract.encode()).hexdigest() == (
+        "c4f52db4fddb092a0f51fa949fa0ccc9b730ae11e2bedf42d27f5933eecd21e4"
+    )
+    raw = {
+        "hostility_present": "YES",
+        "target": "OPPOSING_PARTISAN_TARGET",
+        "evidence_spans": [{"text": "government is incompetent"}],
+    }
+    prediction, diagnostics = validate_prediction_with_diagnostics(
+        raw,
+        "The government is incompetent.",
+        HOSTILITY_PRODUCTION_PROMPT_VERSION,
+    )
+    assert prediction.hostility_present == "YES"
+    assert prediction.target == "OPPOSING_PARTISAN_TARGET"
+    assert prediction.evidence_spans[0]["start_offset"] == 4
+    assert diagnostics["evidence_valid"] is True
+    with pytest.raises(InvalidPrediction, match="response fields"):
+        validate_prediction_with_diagnostics(
+            {**raw, "reasoning": "unexpected"},
+            "The government is incompetent.",
+            HOSTILITY_PRODUCTION_PROMPT_VERSION,
+        )
+
+
+def test_luna_prompt_v1_is_distinct_and_uses_reasoning_free_structured_contract(
+    tmp_path: Path,
+) -> None:
+    package = load_evaluation_package(_package(tmp_path))
+    context = json.loads(
+        Path("config/llm_eval/hostility-v2-codebook-context.json").read_text(encoding="utf-8")
+    )
+    prompt = build_system_prompt(context, HOSTILITY_LUNA_PROMPT_VERSION)
+    schema = prediction_json_schema(HOSTILITY_LUNA_PROMPT_VERSION)
+    assert HOSTILITY_LUNA_PROMPT_VERSION == "hostility-prompt-luna-v1"
+    assert "DECISION PROCEDURE — FOLLOW IN ORDER" in prompt
+    for required in (
+        "Routine adversarial parliamentary criticism",
+        "ordinary partisan contrast",
+        "An opposing party is not hostile merely because it is the opposing party",
+        "smallest exact verbatim",
+        "target must be N/A",
+    ):
+        assert required in prompt
+    assert set(schema["properties"]) == {"hostility_present", "target", "evidence_spans"}
+    rendered = json.dumps(schema, sort_keys=True, separators=(",", ":"))
+    assert hashlib.sha256(rendered.encode()).hexdigest() == (
+        "c4f52db4fddb092a0f51fa949fa0ccc9b730ae11e2bedf42d27f5933eecd21e4"
+    )
+    assert prompt_hash(prompt) == "daeb12f872bb908112fc449ba5a0b0a444fa8624dcc9f805555e3e9a73bcc964"
+    config, _ = make_configuration(
+        package,
+        "openai",
+        "gpt-6-luna",
+        {"max_output_tokens": 500, "reasoning_effort": "medium"},
+        HOSTILITY_LUNA_PROMPT_VERSION,
+    )
+    production_config, _ = make_configuration(
+        package,
+        "openai",
+        "gpt-6-luna",
+        {"max_output_tokens": 500, "reasoning_effort": "medium"},
+        HOSTILITY_PRODUCTION_PROMPT_VERSION,
+    )
+    assert config.prediction_contract_version == HOSTILITY_LUNA_CONTRACT_VERSION
+    assert config.identity() != production_config.identity()
+    assert config.prediction_contract_sha256 == (
+        "c4f52db4fddb092a0f51fa949fa0ccc9b730ae11e2bedf42d27f5933eecd21e4"
+    )
+
+
+@pytest.mark.parametrize("max_output_tokens", [500, 1000])
+def test_luna_prompt_v1_accepts_controlled_output_limits(max_output_tokens: int) -> None:
+    _validate_luna_output_limit(max_output_tokens)
+
+
+@pytest.mark.parametrize("max_output_tokens", [750, 1500])
+def test_luna_prompt_v1_rejects_unapproved_output_limits(max_output_tokens: int) -> None:
+    with pytest.raises(ValueError, match="supports max_output_tokens=500 or 1000"):
+        _validate_luna_output_limit(max_output_tokens)
+
+
+def test_production_cache_prefix_and_variable_record_serialization_are_stable(
+    tmp_path: Path,
+) -> None:
+    package = load_evaluation_package(_package(tmp_path))
+    first = build_system_prompt(package.context, HOSTILITY_PRODUCTION_PROMPT_VERSION)
+    second = build_system_prompt(package.context, HOSTILITY_PRODUCTION_PROMPT_VERSION)
+    users = [build_user_prompt(record) for record in package.records]
+    from hansard_annotator.llm_eval.operations import (
+        build_batch_create_request,
+        build_cache_create_request,
+    )
+
+    cache_request = build_cache_create_request(
+        model="gemini-2.5-flash",
+        system_prompt=first,
+        ttl_seconds=3600,
+        display_name="hostility-prefix-test",
+    )
+    batch_request = build_batch_create_request(
+        model="gemini-2.5-flash",
+        system_prompt=second,
+        records=package.records,
+        schema=prediction_json_schema(HOSTILITY_PRODUCTION_PROMPT_VERSION),
+        display_name="hostility-prefix-test",
+        cached_content="cachedContents/test",
+        max_output_tokens=500,
+    )["batch"]["input_config"]["requests"]["requests"][0]["request"]
+    assert first.encode("utf-8") == second.encode("utf-8")
+    assert all("SPEECH:" not in first for _ in package.records)
+    assert all(user.startswith("METADATA:\n") and "\n\nSPEECH:\n" in user for user in users)
+    assert len(set(users)) == len(users)
+    assert cache_request["systemInstruction"]["parts"][0]["text"] == first
+    assert batch_request["cachedContent"] == "cachedContents/test"
+    assert "systemInstruction" not in batch_request
+
+
+@pytest.mark.parametrize("max_output_tokens", [1000, 500])
+def test_production_output_ceiling_is_applied_to_gemini_schema_request(
+    tmp_path: Path, max_output_tokens: int
+) -> None:
+    from hansard_annotator.llm_eval.operations import build_batch_create_request
+
+    package = load_evaluation_package(_package(tmp_path))
+    schema = prediction_json_schema(HOSTILITY_PRODUCTION_PROMPT_VERSION)
+    request = build_batch_create_request(
+        model="gemini-2.5-flash",
+        system_prompt=build_system_prompt(package.context, HOSTILITY_PRODUCTION_PROMPT_VERSION),
+        records=package.records,
+        schema=schema,
+        display_name="hostility-format-test",
+        max_output_tokens=max_output_tokens,
+        generation={"thinking_budget": 0},
+    )["batch"]["input_config"]["requests"]["requests"][0]["request"]
+    assert request["generationConfig"]["maxOutputTokens"] == max_output_tokens
+    assert set(request["generationConfig"]["responseSchema"]["properties"]) == {
+        "hostility_present",
+        "target",
+        "evidence_spans",
+    }
+    assert request["generationConfig"]["responseSchema"]["required"] == [
+        "hostility_present",
+        "target",
+        "evidence_spans",
+    ]
+
+
+def test_production_no_reasoning_run_artifact_keeps_only_three_prediction_fields(
+    tmp_path: Path,
+) -> None:
+    package = load_evaluation_package(_package(tmp_path))
+
+    class Provider:
+        name = "gemini"
+
+        def generate(self, **kwargs: Any) -> ProviderResponse:
+            assert "reasoning" not in kwargs["schema"]["properties"]
+            return ProviderResponse(
+                {
+                    "hostility_present": "YES",
+                    "target": "OPPOSING_PARTISAN_TARGET",
+                    "evidence_spans": [{"text": "government is incompetent"}],
+                }
+            )
+
+    evaluate(
+        package,
+        (package.records[1],),
+        Provider(),  # type: ignore[arg-type]
+        "gemini-2.5-flash",
+        tmp_path / "no-reasoning-run",
+        {"temperature": 0.0, "thinking_budget": 0, "max_output_tokens": 1000},
+        prompt_version=HOSTILITY_PRODUCTION_PROMPT_VERSION,
+    )
+    result = json.loads(
+        (tmp_path / "no-reasoning-run" / "predictions.jsonl").read_text(encoding="utf-8")
+    )
+    assert set(result["prediction"]) == {"hostility_present", "target", "evidence_spans"}
 
 
 def test_corrected_hostility_package_validates_when_local_export_is_present() -> None:
@@ -476,4 +676,50 @@ def test_gpt6_luna_responses_schema_and_low_reasoning_configuration(
     )
     assert parsed.hostility_present == "YES"
     assert parsed.evidence_spans[0]["text"] == "attacked"
+    assert diagnostics["evidence_valid"] is True
+
+
+def test_luna_openai_request_omits_reasoning_from_structured_response_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-secret")
+    captured: dict[str, Any] = {}
+    raw = {
+        "hostility_present": "YES",
+        "target": "OPPOSING_PARTISAN_TARGET",
+        "evidence_spans": [{"text": "is incompetent"}],
+    }
+
+    def transport(
+        url: str, headers: dict[str, str], payload: dict[str, Any], _: float
+    ) -> dict[str, Any]:
+        captured.update(payload)
+        return {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": json.dumps(raw)}],
+                }
+            ],
+            "usage": {"input_tokens": 40, "output_tokens": 8, "total_tokens": 48},
+        }
+
+    response = OpenAIProvider(transport=transport).generate(
+        model="gpt-6-luna",
+        system_prompt="Luna prompt v1",
+        user_prompt="METADATA: {}\n\nSPEECH:\nThe minister is incompetent.",
+        schema=prediction_json_schema(HOSTILITY_LUNA_PROMPT_VERSION),
+        generation={"max_output_tokens": 500, "reasoning_effort": "medium"},
+    )
+    request_schema = captured["text"]["format"]["schema"]
+    assert set(request_schema["properties"]) == {"hostility_present", "target", "evidence_spans"}
+    assert "reasoning" not in request_schema["required"]
+    assert captured["reasoning"] == {"effort": "medium"}
+    assert captured["max_output_tokens"] == 500
+    prediction, diagnostics = validate_prediction_with_diagnostics(
+        response.raw_prediction,
+        "The minister is incompetent.",
+        HOSTILITY_LUNA_PROMPT_VERSION,
+    )
+    assert prediction.reasoning == ""
     assert diagnostics["evidence_valid"] is True

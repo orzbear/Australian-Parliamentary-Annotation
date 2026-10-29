@@ -19,13 +19,78 @@ from hansard_annotator.llm_eval.hostility import (
 from hansard_annotator.llm_eval.hostility import (
     write_reports as write_hostility_reports,
 )
+from hansard_annotator.llm_eval.hostility_validation import (
+    CONTRACT_SHA256 as HOSTILITY_V2_CONTRACT_SHA256,
+)
+from hansard_annotator.llm_eval.hostility_validation import (
+    HELDOUT_SAMPLE_SHA256,
+    LUNA_CONFIRMATION_CONTRACT_SHA256,
+    LUNA_CONFIRMATION_PROMPT_SHA256,
+    LUNA_CONFIRMATION_SAMPLE_ID,
+    LUNA_CONFIRMATION_SAMPLE_SHA256,
+)
+from hansard_annotator.llm_eval.hostility_validation import (
+    PROMPT_SHA256 as HOSTILITY_V2_PROMPT_SHA256,
+)
 from hansard_annotator.llm_eval.metrics import compute_metrics
 from hansard_annotator.llm_eval.package import load_evaluation_package
-from hansard_annotator.llm_eval.prompt import DEFAULT_PROMPT_VERSION, available_prompt_versions
+from hansard_annotator.llm_eval.prompt import (
+    DEFAULT_PROMPT_VERSION,
+    HOSTILITY_LUNA_CONTRACT_VERSION,
+    HOSTILITY_LUNA_PROMPT_VERSION,
+    available_prompt_versions,
+)
 from hansard_annotator.llm_eval.providers import provider_for
 from hansard_annotator.llm_eval.reporting import mismatches, write_reports
 from hansard_annotator.llm_eval.runner import evaluate, make_configuration
 from hansard_annotator.llm_eval.selection import ExclusionSet, load_exclusion_set
+from hansard_annotator.web.tasks.frozen_samples import load_frozen_sample
+
+
+def _validate_luna_output_limit(max_output_tokens: int) -> None:
+    if max_output_tokens not in {500, 1000}:
+        raise ValueError(
+            "hostility-prompt-luna-v1 supports max_output_tokens=500 or 1000"
+        )
+
+
+def _valid_luna_benchmark_package(package: Any) -> bool:
+    benchmark = package.manifest.get("benchmark")
+    if package.task != "hostility" or len(package.records) != 100 or not isinstance(
+        benchmark, dict
+    ):
+        return False
+    shared = benchmark.get("canonical_schema_sha256") == package.schema.get("content_sha256")
+    if (
+        benchmark.get("set_id") == "hostility-heldout-100"
+        and benchmark.get("set_sha256") == HELDOUT_SAMPLE_SHA256
+    ):
+        return bool(
+            shared
+            and benchmark.get("prompt_version") == "hostility-prompt-v2"
+            and benchmark.get("prompt_sha256") == HOSTILITY_V2_PROMPT_SHA256
+            and benchmark.get("prediction_contract_sha256") == HOSTILITY_V2_CONTRACT_SHA256
+        )
+    if not (
+        shared
+        and benchmark.get("set_id") == LUNA_CONFIRMATION_SAMPLE_ID
+        and benchmark.get("set_sha256") == LUNA_CONFIRMATION_SAMPLE_SHA256
+        and benchmark.get("selected_record_count") == 100
+        and benchmark.get("review_status") == "pending_human_review"
+        and benchmark.get("prompt_version") == HOSTILITY_LUNA_PROMPT_VERSION
+        and benchmark.get("prompt_sha256") == LUNA_CONFIRMATION_PROMPT_SHA256
+        and benchmark.get("prediction_contract_version") == HOSTILITY_LUNA_CONTRACT_VERSION
+        and benchmark.get("prediction_contract_sha256") == LUNA_CONFIRMATION_CONTRACT_SHA256
+    ):
+        return False
+    root = Path(__file__).resolve().parents[3]
+    sample = load_frozen_sample(
+        root / "config/research_samples/hostility-luna-confirmation-100.json",
+        expected_sample_id=LUNA_CONFIRMATION_SAMPLE_ID,
+    )
+    return [str(record["speech"]["turn_key"]) for record in package.records] == [
+        turn.turn_key for turn in sample.turns
+    ]
 
 
 def parser() -> argparse.ArgumentParser:
@@ -120,6 +185,18 @@ def main(argv: list[str] | None = None) -> int:
         if arguments.provider != "openai" and arguments.reasoning_effort is not None:
             raise ValueError("reasoning_effort is only valid for OpenAI")
         package = load_evaluation_package(arguments.input)
+        if arguments.prompt_version == HOSTILITY_LUNA_PROMPT_VERSION:
+            if (
+                not _valid_luna_benchmark_package(package)
+                or arguments.provider != "openai"
+                or arguments.model != "gpt-6-luna"
+                or arguments.reasoning_effort != "medium"
+                or arguments.temperature is not None
+            ):
+                raise ValueError(
+                    "hostility-prompt-luna-v1 is locked to OpenAI gpt-6-luna, medium reasoning, and provider-default temperature"
+                )
+            _validate_luna_output_limit(arguments.max_output_tokens)
         if arguments.include_record_ids is not None and arguments.record_id:
             raise ValueError("--include-record-ids and --record-id are mutually exclusive")
         if arguments.include_record_ids is not None and arguments.exclude_record_ids is not None:
@@ -151,6 +228,19 @@ def main(argv: list[str] | None = None) -> int:
             exclusions,
             inclusions,
         )
+        if (
+            arguments.prompt_version == HOSTILITY_LUNA_PROMPT_VERSION
+            and (
+                len(records) != 100
+                or [r["record_id"] for r in records]
+                != [
+                r["record_id"] for r in package.records
+                ]
+            )
+        ):
+            raise ValueError(
+                "Luna prompt development evaluation requires the full frozen 100-record package"
+            )
         excluded_count = exclusions.count if exclusions is not None else 0
         exclusion_sha256 = exclusions.sha256 if exclusions is not None else None
         included_count = inclusions.count if inclusions is not None else 0
@@ -236,18 +326,37 @@ def main(argv: list[str] | None = None) -> int:
             inclusion_record_count=included_count,
             inclusion_set_sha256=inclusion_sha256,
         )
-        metric_values = (
-            compute_hostility_metrics(records, results)
-            if package.task == "hostility"
-            else compute_metrics(records, results, package.domain_codes)
-        )
+        reference_labels_present = all("human_annotation" in record for record in records)
+        if package.task == "hostility" and not reference_labels_present:
+            status_counts: dict[str, int] = {}
+            for result in results:
+                status = str(result.get("status", "invalid"))
+                status_counts[status] = status_counts.get(status, 0) + 1
+            metric_values = {
+                "task": "hostility",
+                "total_records": len(records),
+                "evaluated_records": 0,
+                "reference_labels_available": False,
+                "review_status": "pending_human_review",
+                "status_counts": status_counts,
+            }
+        else:
+            metric_values = (
+                compute_hostility_metrics(records, results)
+                if package.task == "hostility"
+                else compute_metrics(records, results, package.domain_codes)
+            )
         cost_values = aggregate_costs(results, arguments.provider, arguments.model, pricing)
         if package.task == "hostility":
-            mismatch_values = hostility_disagreements(
-                records,
-                results,
-                run_identity=configuration.identity(),
-                configured_model=arguments.model,
+            mismatch_values = (
+                hostility_disagreements(
+                    records,
+                    results,
+                    run_identity=configuration.identity(),
+                    configured_model=arguments.model,
+                )
+                if reference_labels_present
+                else []
             )
             benchmark = package.manifest.get("benchmark")
             comparative_benchmark = (
@@ -256,13 +365,31 @@ def main(argv: list[str] | None = None) -> int:
                 and benchmark.get("set_sha256")
                 == "f3d9451b3352025b769d263fc896f57683a741ea6fd9af0b6477651707cf3b36"
             )
-            write_hostility_reports(
-                arguments.output,
-                metric_values,
-                cost_values,
-                mismatch_values,
-                comparative_benchmark=comparative_benchmark,
-            )
+            if reference_labels_present:
+                write_hostility_reports(
+                    arguments.output,
+                    metric_values,
+                    cost_values,
+                    mismatch_values,
+                    comparative_benchmark=comparative_benchmark,
+                )
+            else:
+                (arguments.output / "metrics.json").write_text(
+                    json.dumps(metric_values, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                (arguments.output / "cost_report.json").write_text(
+                    json.dumps(cost_values, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                (arguments.output / "report.md").write_text(
+                    "# Frozen hostility confirmation run\n\n"
+                    "This is an expert-reviewed fresh confirmation sample. Human labels are "
+                    "pending; classification metrics are intentionally not computed. If AI "
+                    "suggestions are shown during review, report results as AI-assisted expert "
+                    "adjudication, not an independent blind benchmark.\n",
+                    encoding="utf-8",
+                )
         else:
             mismatch_values = mismatches(
                 records,

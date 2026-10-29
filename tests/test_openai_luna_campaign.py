@@ -64,11 +64,14 @@ def test_luna_request_uses_only_frozen_responses_contract() -> None:
     assert body["reasoning"] == {"effort": "medium"}
     assert "temperature" not in body
     output_schema = body["text"]["format"]["schema"]
+    luna_fields = {"hostility_present", "target", "evidence_spans"}
     assert set(output_schema["properties"]) == {
         "hostility_present",
         "target",
         "evidence_spans",
     }
+    assert set(output_schema["required"]) == luna_fields
+    assert "reasoning" not in output_schema["properties"]
     with pytest.raises(ValueError, match="frozen"):
         luna_batch_request(
             record_id=f"turn:{'a' * 64}",
@@ -96,6 +99,12 @@ def test_production_web_and_worker_receive_openai_key_from_secret_environment() 
 
 
 def test_openai_batch_collection_preserves_failure_invalid_and_missing(tmp_path: Path) -> None:
+    # Luna's frozen contract accepts exactly these fields and deliberately omits reasoning.
+    luna_schema = prediction_json_schema(HOSTILITY_LUNA_PROMPT_VERSION)
+    luna_fields = {"hostility_present", "target", "evidence_spans"}
+    assert set(luna_schema["properties"]) == luna_fields
+    assert set(luna_schema["required"]) == luna_fields
+
     records = tuple(
         production_record_from_turn(
             {
