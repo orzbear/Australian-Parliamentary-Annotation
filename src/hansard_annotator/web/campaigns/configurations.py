@@ -12,6 +12,10 @@ from hansard_annotator.llm_eval.hostility_validation import (
 from hansard_annotator.llm_eval.hostility_validation import (
     HELDOUT_SAMPLE_ID,
     HELDOUT_SAMPLE_SHA256,
+    LUNA_CONFIRMATION_CONTRACT_SHA256,
+    LUNA_CONFIRMATION_PROMPT_SHA256,
+    LUNA_CONFIRMATION_SAMPLE_ID,
+    LUNA_CONFIRMATION_SAMPLE_SHA256,
 )
 from hansard_annotator.llm_eval.hostility_validation import (
     MODEL as HOSTILITY_MODEL,
@@ -31,15 +35,25 @@ from hansard_annotator.llm_eval.operations import (
     canonical_hash,
     gemini_batch_schema,
 )
+from hansard_annotator.llm_eval.prompt import (
+    HOSTILITY_LUNA_PROMPT_VERSION,
+)
 from hansard_annotator.llm_eval.prompt import prediction_json_schema as policy_schema
+from hansard_annotator.llm_eval.providers import provider_prediction_schema_hash
 
 POLICY_CONFIGURATION_ID = "policy-v2"
 HOSTILITY_CONFIGURATION_ID = "hostility-v2"
+LUNA_CONFIRMATION_CONFIGURATION_ID = "hostility-luna-confirmation-100"
+LUNA_PRODUCTION_CONFIGURATION_ID = "hostility-luna-production-v1"
 HOSTILITY_SCHEMA_SHA256 = "959a51a987e0777cb72dc7ad12cd5b896429bef400b79f386764a20ddc3d5669"
 
 
 HOSTILITY_PROVIDER_SCHEMA_SHA256 = canonical_hash(
     gemini_batch_schema(hostility_schema(HOSTILITY_PROMPT_VERSION))
+)
+LUNA_CONFIRMATION_SCHEMA_SHA256 = HOSTILITY_SCHEMA_SHA256
+LUNA_CONFIRMATION_PROVIDER_SCHEMA_SHA256 = provider_prediction_schema_hash(
+    "openai", hostility_schema(HOSTILITY_LUNA_PROMPT_VERSION)
 )
 
 
@@ -118,10 +132,53 @@ APPROVED_AI_CONFIGURATIONS = {
         100,
         HELDOUT_SAMPLE_SHA256,
     ),
+    LUNA_PRODUCTION_CONFIGURATION_ID: ApprovedAIConfiguration(
+        LUNA_PRODUCTION_CONFIGURATION_ID,
+        "Targeted hostility — GPT-6 Luna production V1",
+        "Frozen full-corpus production classification using the Luna V1 prompt.",
+        "hostility",
+        "australian_partisan_hostility",
+        "0.2.0",
+        "openai",
+        "gpt-6-luna",
+        HOSTILITY_LUNA_PROMPT_VERSION,
+        LUNA_CONFIRMATION_PROMPT_SHA256,
+        LUNA_CONFIRMATION_SCHEMA_SHA256,
+        LUNA_CONFIRMATION_CONTRACT_SHA256,
+        LUNA_CONFIRMATION_PROVIDER_SCHEMA_SHA256,
+        {"max_output_tokens": 1000, "reasoning_effort": "medium"},
+        "batch",
+        "hostility-luna-production-v1",
+        "deterministic_selection",
+    ),
 }
+LUNA_CONFIRMATION_CONFIGURATION = ApprovedAIConfiguration(
+    LUNA_CONFIRMATION_CONFIGURATION_ID,
+    "Targeted hostility — Luna confirmation 100",
+    "Imports the frozen local GPT-6 Luna confirmation evaluation for human review.",
+    "hostility",
+    "australian_partisan_hostility",
+    "0.2.0",
+    "openai",
+    "gpt-6-luna",
+    HOSTILITY_LUNA_PROMPT_VERSION,
+    LUNA_CONFIRMATION_PROMPT_SHA256,
+    LUNA_CONFIRMATION_SCHEMA_SHA256,
+    LUNA_CONFIRMATION_CONTRACT_SHA256,
+    LUNA_CONFIRMATION_PROVIDER_SCHEMA_SHA256,
+    {"max_output_tokens": 1000, "reasoning_effort": "medium"},
+    "local_evaluation",
+    "hostility-luna-confirmation-v1",
+    "frozen_sample",
+    LUNA_CONFIRMATION_SAMPLE_ID,
+    100,
+    LUNA_CONFIRMATION_SAMPLE_SHA256,
+)
 
 
 def approved_configuration(configuration_id: str) -> ApprovedAIConfiguration:
+    if configuration_id == LUNA_CONFIRMATION_CONFIGURATION_ID:
+        return LUNA_CONFIRMATION_CONFIGURATION
     try:
         return APPROVED_AI_CONFIGURATIONS[configuration_id]
     except KeyError:

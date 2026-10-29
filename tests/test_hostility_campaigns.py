@@ -43,6 +43,7 @@ from hansard_annotator.web.campaigns.configurations import (
     APPROVED_AI_CONFIGURATIONS,
     HOSTILITY_CONFIGURATION_ID,
     HOSTILITY_SCHEMA_SHA256,
+    LUNA_PRODUCTION_CONFIGURATION_ID,
     POLICY_CONFIGURATION_ID,
     approved_configuration,
     configuration_for_campaign,
@@ -56,6 +57,7 @@ from hansard_annotator.web.campaigns.service import (
     PAID_CONFIRMATION,
     CampaignError,
     _provider_plan,
+    _recovery_retry_eligible,
     approved_campaign_configurations,
     collect_campaign,
     create_campaign,
@@ -71,6 +73,26 @@ from hansard_annotator.web.campaigns.service import (
 from hansard_annotator.web.config import WebSettings
 from hansard_annotator.web.tasks.frozen_samples import load_frozen_sample
 
+
+def test_luna_recovery_never_retries_success_or_evidence_resolution_failures() -> None:
+    assert not _recovery_retry_eligible(
+        {"status": "success", "prediction": {"hostility_present": "YES"}},
+        is_luna=True,
+    )
+    assert not _recovery_retry_eligible(
+        {
+            "status": "invalid",
+            "validation_error": "hostility evidence must resolve uniquely to canonical text",
+        },
+        is_luna=True,
+    )
+    assert _recovery_retry_eligible(
+        {"status": "invalid", "validation_error": "malformed structured output"},
+        is_luna=True,
+    )
+    assert _recovery_retry_eligible({"status": "provider_failure"}, is_luna=True)
+    assert _recovery_retry_eligible({"status": "missing"}, is_luna=True)
+    assert not _recovery_retry_eligible({"status": "success"}, is_luna=False)
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -177,6 +199,7 @@ def test_approved_campaign_registry_is_closed_and_frozen() -> None:
     assert set(APPROVED_AI_CONFIGURATIONS) == {
         POLICY_CONFIGURATION_ID,
         HOSTILITY_CONFIGURATION_ID,
+        LUNA_PRODUCTION_CONFIGURATION_ID,
     }
     policy = approved_configuration(POLICY_CONFIGURATION_ID)
     hostility = approved_configuration(HOSTILITY_CONFIGURATION_ID)
@@ -210,6 +233,15 @@ def test_approved_campaign_registry_is_closed_and_frozen() -> None:
     assert hostility.record_set_id == HELDOUT_SAMPLE_ID
     assert hostility.record_set_size == 100
     assert hostility.record_set_sha256 == HELDOUT_SAMPLE_SHA256
+
+    luna = approved_configuration(LUNA_PRODUCTION_CONFIGURATION_ID)
+    assert luna.provider == "openai"
+    assert luna.configured_model == "gpt-6-luna"
+    assert luna.prompt_version == "hostility-prompt-luna-v1"
+    assert luna.prompt_sha256 == "daeb12f872bb908112fc449ba5a0b0a444fa8624dcc9f805555e3e9a73bcc964"
+    assert luna.prediction_contract_sha256 == "c4f52db4fddb092a0f51fa949fa0ccc9b730ae11e2bedf42d27f5933eecd21e4"
+    assert luna.generation_config == {"max_output_tokens": 1000, "reasoning_effort": "medium"}
+    assert luna.record_set_mode == "deterministic_selection"
 
     with pytest.raises(ValueError, match="unknown approved"):
         approved_configuration("injected-prompt")

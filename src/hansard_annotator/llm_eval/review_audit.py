@@ -7,6 +7,7 @@ import csv
 import json
 import sys
 from collections import Counter
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -66,6 +67,30 @@ def _normalise_domains(value: object) -> list[str]:
     if not isinstance(value, (list, tuple)) or any(not isinstance(item, str) for item in value):
         raise ReviewAuditError("domain values must be a list of strings")
     return list(value)
+
+
+@lru_cache(maxsize=1)
+def _hostility_sample_keys() -> tuple[frozenset[str], frozenset[str]]:
+    """Load and verify the two frozen Luna comparison samples once per process."""
+    from hansard_annotator.web.tasks.frozen_samples import load_frozen_sample
+
+    root = Path(__file__).resolve().parents[3]
+    development = load_frozen_sample(
+        root / "config/research_samples/hostility-development-100.json",
+        "hostility-development-100",
+    )
+    confirmation = load_frozen_sample(
+        root / "config/research_samples/hostility-luna-confirmation-100.json",
+        "hostility-luna-confirmation-100",
+    )
+    if confirmation.sample_sha256 != (
+        "482d2951253840c5a294be028f6a61891693b6826ac3bdbebb087e71aa5c3c48"
+    ):
+        raise ReviewAuditError("frozen Luna confirmation sample identity has changed")
+    return (
+        frozenset(turn.turn_key for turn in development.turns),
+        frozenset(turn.turn_key for turn in confirmation.turns),
+    )
 
 
 def _label(non_policy: bool, primary: object) -> str:
@@ -203,6 +228,12 @@ def analyse_review_rows(
                 if human
                 else ""
             )
+        if row.get("prediction_task") == "hostility":
+            development_keys, confirmation_keys = _hostility_sample_keys()
+            development_member = str(row["turn_key"]) in development_keys
+            confirmation_member = str(row["turn_key"]) in confirmation_keys
+        else:
+            development_member, confirmation_member = False, False
         base = {
             "prediction_id": str(row["prediction_id"]),
             "run_id": str(row["run_public_id"]),
@@ -222,9 +253,21 @@ def analyse_review_rows(
             "ai_secondary_domains": _normalise_domains(row["ai_secondary_domains"]),
             "ai_reasoning": row.get("ai_reasoning"),
             "prediction_task": row.get("prediction_task"),
+            "hostility_development_sample": development_member,
+            "hostility_luna_confirmation_sample": confirmation_member,
             "ai_prediction_values": row.get("ai_prediction_values"),
             "ai_outcome_status": row.get("ai_outcome_status", "PREDICTION"),
             "ai_failure_reason": row.get("ai_failure_reason"),
+            "provider_batch_id": row.get("provider_batch_id"),
+            "provider_request_file_sha256": row.get("provider_request_file_sha256"),
+            "provider_output_file_sha256": row.get("provider_output_file_sha256"),
+            "provider_error_file_sha256": row.get("provider_error_file_sha256"),
+            "provider_retry_count": row.get("provider_retry_count"),
+            "provider_attempt_history": (
+                row.get("outcome_provenance", {}).get("recovery_attempt_history", [])
+                if isinstance(row.get("outcome_provenance"), dict)
+                else []
+            ),
             "ai_valid_prediction": row.get("ai_valid_prediction", True),
             "human_values": human or None,
             "human_is_non_policy": human.get("is_non_policy") if human else None,
@@ -366,6 +409,7 @@ def analyse_review_rows(
 def full_review_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Flatten every prediction while preserving prediction/review/human distinctions."""
     output: list[dict[str, Any]] = []
+    development_keys, confirmation_keys = _hostility_sample_keys()
     for row in rows:
         human_raw = row.get("human_values")
         human = human_raw if isinstance(human_raw, dict) else {}
@@ -386,6 +430,26 @@ def full_review_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "business_type": row.get("business_type"),
                 "speech_text": row.get("speech_text"),
                 "prediction_task": row.get("prediction_task"),
+                "provider_batch_id": row.get("provider_batch_id"),
+                "provider_request_file_sha256": row.get("provider_request_file_sha256"),
+                "provider_output_file_sha256": row.get("provider_output_file_sha256"),
+                "provider_error_file_sha256": row.get("provider_error_file_sha256"),
+                "provider_retry_count": row.get("provider_retry_count"),
+                "provider_attempt_history": (
+                    row.get("outcome_provenance", {}).get("recovery_attempt_history", [])
+                    if isinstance(row.get("outcome_provenance"), dict)
+                    else []
+                ),
+                "hostility_development_sample": (
+                    str(row["turn_key"]) in development_keys
+                    if row.get("prediction_task") == "hostility"
+                    else False
+                ),
+                "hostility_luna_confirmation_sample": (
+                    str(row["turn_key"]) in confirmation_keys
+                    if row.get("prediction_task") == "hostility"
+                    else False
+                ),
                 "ai_prediction_values": row.get("ai_prediction_values"),
                 "ai_outcome_status": row.get("ai_outcome_status", "PREDICTION"),
                 "ai_failure_reason": row.get("ai_failure_reason"),
@@ -652,6 +716,11 @@ def _load_rows(connection: psycopg.Connection[Any], run_id: int) -> list[dict[st
             SELECT mp.id,mp.public_id AS prediction_id,mp.run_id,run.public_id AS run_public_id,
                    mp.record_id,mp.speaker_turn_id,mp.prediction_task,
                    campaign_record.record_sha256 AS canonical_record_sha256,
+                   campaign_batch.provider_job_id AS provider_batch_id,
+                   campaign_batch.provider_input_file_sha256 AS provider_request_file_sha256,
+                   campaign_batch.provider_output_file_sha256,
+                   campaign_batch.provider_error_file_sha256,
+                   campaign_batch.retry_count AS provider_retry_count,
                    mp.prediction_values AS ai_prediction_values,
                    'PREDICTION'::text AS ai_outcome_status,NULL::text AS ai_failure_reason,
                    true AS ai_valid_prediction,
@@ -678,6 +747,10 @@ def _load_rows(connection: psycopg.Connection[Any], run_id: int) -> list[dict[st
             LEFT JOIN ai_annotation_campaign_records campaign_record
               ON campaign_record.campaign_id=campaign.id
              AND campaign_record.speaker_turn_id=mp.speaker_turn_id
+            LEFT JOIN ai_annotation_campaign_batches campaign_batch
+              ON campaign_batch.campaign_id=campaign.id
+             AND campaign_record.selection_order BETWEEN campaign_batch.first_selection_order
+                                                     AND campaign_batch.last_selection_order
             JOIN speaker_turns st ON st.id=mp.speaker_turn_id
             LEFT JOIN LATERAL (
               SELECT review_status,note,annotation_version_id,reviewer_user_id,reviewed_at,id
@@ -714,6 +787,11 @@ def _load_rows(connection: psycopg.Connection[Any], run_id: int) -> list[dict[st
             SELECT outcome.id,outcome.public_id AS prediction_id,outcome.run_id,
                    run.public_id AS run_public_id,outcome.record_id,outcome.speaker_turn_id,
                    campaign_record.record_sha256 AS canonical_record_sha256,
+                   campaign_batch.provider_job_id AS provider_batch_id,
+                   campaign_batch.provider_input_file_sha256 AS provider_request_file_sha256,
+                   campaign_batch.provider_output_file_sha256,
+                   campaign_batch.provider_error_file_sha256,
+                   campaign_batch.retry_count AS provider_retry_count,
                    run.prediction_task,NULL::jsonb AS ai_prediction_values,
                    'INVALID_OUTPUT'::text AS ai_outcome_status,
                    outcome.resolution_reason AS ai_failure_reason,
@@ -737,6 +815,10 @@ def _load_rows(connection: psycopg.Connection[Any], run_id: int) -> list[dict[st
             LEFT JOIN ai_annotation_campaign_records campaign_record
               ON campaign_record.campaign_id=campaign.id
              AND campaign_record.speaker_turn_id=outcome.speaker_turn_id
+            LEFT JOIN ai_annotation_campaign_batches campaign_batch
+              ON campaign_batch.campaign_id=campaign.id
+             AND campaign_record.selection_order BETWEEN campaign_batch.first_selection_order
+                                                     AND campaign_batch.last_selection_order
             JOIN speaker_turns st ON st.id=outcome.speaker_turn_id
             LEFT JOIN LATERAL (
               SELECT review_status,note,annotation_version_id,reviewer_user_id,reviewed_at,id
@@ -795,9 +877,17 @@ def create_review_audit(
         "business_type",
         "speech_text",
         "prediction_task",
+        "hostility_development_sample",
+        "hostility_luna_confirmation_sample",
         "ai_prediction_values",
         "ai_outcome_status",
         "ai_failure_reason",
+        "provider_batch_id",
+        "provider_request_file_sha256",
+        "provider_output_file_sha256",
+        "provider_error_file_sha256",
+        "provider_retry_count",
+        "provider_attempt_history",
         "ai_valid_prediction",
         "recovery_attempt_count",
         "ai_hostility_present",
@@ -848,9 +938,17 @@ def create_review_audit(
             "business_type",
             "speech_text",
             "prediction_task",
+            "hostility_development_sample",
+            "hostility_luna_confirmation_sample",
             "ai_prediction_values",
             "ai_outcome_status",
             "ai_failure_reason",
+            "provider_batch_id",
+            "provider_request_file_sha256",
+            "provider_output_file_sha256",
+            "provider_error_file_sha256",
+            "provider_retry_count",
+            "provider_attempt_history",
             "ai_failure_diagnostic",
             "ai_valid_prediction",
             "recovery_attempt_count",

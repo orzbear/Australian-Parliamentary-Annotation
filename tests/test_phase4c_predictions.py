@@ -380,9 +380,45 @@ def test_queue_filters_remain_bound_and_composable() -> None:
     )
     assert "mpr.public_id=%s::uuid" in query
     assert "mp.prediction_task=%s" in query
-    assert "mp.primary_australian_domain=%s" in query
+    assert "COALESCE(mp.primary_australian_domain,latest_policy.primary_australian_domain)=%s" in query
     assert "mp.is_non_policy=%s" in query
+    assert "AU06" not in query
     assert parameters == (42, "run-id", "hostility", "AU06", False)
+
+
+def test_hostility_queue_filters_are_bound_and_limit_outcome_queries() -> None:
+    sample_keys = ["frozen-turn-1", "frozen-turn-2"]
+    query, parameters = _ai_review_queue_query(
+        42,
+        review_filter="unreviewed",
+        run_id="run-id",
+        prediction_task="hostility",
+        primary_domain="AU07",
+        hostility_present="YES",
+        hostility_target="OPPOSING_PARTISAN_TARGET",
+        speech_year=2025,
+        hostility_failure="evidence",
+        sample_turn_keys=sample_keys,
+        random_seed="c0ffee12",
+    )
+    assert "mp.prediction_values->>'hostility_present'=%s" in query
+    assert "mp.prediction_values->>'target'=%s" in query
+    assert "EXTRACT(YEAR FROM st.speech_date)=%s" in query
+    assert "st.turn_key=ANY(%s)" in query
+    assert "latest_policy.primary_australian_domain" in query
+    assert "false" in query
+    assert "ORDER BY md5(%s || mpr.public_id::text || mp.record_id)" in query
+    assert parameters == (
+        42,
+        "run-id",
+        "hostility",
+        "AU07",
+        "YES",
+        "OPPOSING_PARTISAN_TARGET",
+        2025,
+        sample_keys,
+        "c0ffee12",
+    )
 
 
 def test_one_hundred_zero_review_predictions_are_not_limited_below_one_hundred() -> None:

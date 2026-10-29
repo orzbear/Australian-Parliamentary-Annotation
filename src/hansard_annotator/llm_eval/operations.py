@@ -8,8 +8,16 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from hansard_annotator.llm_eval.hostility import validate_prediction_with_diagnostics
-from hansard_annotator.llm_eval.prompt import build_system_prompt, build_user_prompt
+from hansard_annotator.llm_eval.hostility import (
+    HOSTILITY_PRODUCTION_CONTRACT_VERSION,
+    validate_prediction_with_diagnostics,
+)
+from hansard_annotator.llm_eval.hostility_validation import HELDOUT_SAMPLE_SHA256
+from hansard_annotator.llm_eval.prompt import (
+    HOSTILITY_PRODUCTION_PROMPT_VERSION,
+    build_system_prompt,
+    build_user_prompt,
+)
 from hansard_annotator.llm_eval.validation import InvalidPrediction, validate_prediction
 
 FROZEN_MODEL = "gemini-2.5-flash"
@@ -34,11 +42,28 @@ FROZEN_HOSTILITY_CANONICAL_SCHEMA_SHA256 = (
 FROZEN_HOSTILITY_CONTRACT_SHA256 = (
     "dc716b49e0759ba7063973038b234f6696e778c4d90ee4a405d9600a2435b11d"
 )
+OPTIMIZED_HOSTILITY_PROMPT_SHA256 = (
+    "42cea86b33e561b2ed8bec4ac57740e6132b614d577896e9b6ea8a0d92fc83b8"
+)
+OPTIMIZED_HOSTILITY_CONTRACT_SHA256 = (
+    "c4f52db4fddb092a0f51fa949fa0ccc9b730ae11e2bedf42d27f5933eecd21e4"
+)
+OPTIMIZED_HOSTILITY_PROVIDER_SCHEMA_SHA256 = (
+    "96324139d8eeadcf648585d009d2411a17a6e6a0a44158c504ef01bda50659bc"
+)
+OPTIMIZED_HOSTILITY_RECORD_IDS_SHA256 = (
+    "be09e365b53ac6cb1977b64df8b3bca593dd6aab85a23ee0dacf52154dc8cb27"
+)
 HOSTILITY_PREDICTION_FIELDS = {
     "hostility_present",
     "target",
     "evidence_spans",
     "reasoning",
+}
+OPTIMIZED_HOSTILITY_PREDICTION_FIELDS = {
+    "hostility_present",
+    "target",
+    "evidence_spans",
 }
 
 
@@ -159,9 +184,12 @@ def project_production_cost(
 def gemini_batch_schema(schema: dict[str, Any]) -> dict[str, Any]:
     """Derive Gemini Batch's supported Schema form from the canonical prediction contract."""
     properties = schema["properties"]
-    if set(properties) == {"hostility_present", "target", "evidence_spans", "reasoning"}:
+    if set(properties) in (
+        {"hostility_present", "target", "evidence_spans", "reasoning"},
+        {"hostility_present", "target", "evidence_spans"},
+    ):
         evidence = properties["evidence_spans"]["items"]
-        return {
+        result: dict[str, Any] = {
             "type": "OBJECT",
             "properties": {
                 "hostility_present": {
@@ -178,11 +206,13 @@ def gemini_batch_schema(schema: dict[str, Any]) -> dict[str, Any]:
                         "propertyOrdering": evidence["required"],
                     },
                 },
-                "reasoning": {"type": "STRING"},
             },
             "required": schema["required"],
             "propertyOrdering": schema["required"],
         }
+        if "reasoning" in properties:
+            result["properties"]["reasoning"] = {"type": "STRING"}
+        return result
     primary = properties["primary_australian_domain"]
     secondary = properties["secondary_australian_domains"]
     return {
@@ -238,8 +268,34 @@ def validate_production_plan(plan: dict[str, Any]) -> None:
         raise ValueError("Batch plan has no provenance")
     model = provenance.get("model")
     prompt_version = provenance.get("prompt_version")
-    if prompt_version == FROZEN_HOSTILITY_PROMPT_VERSION:
-        supported_generation: dict[str, dict[str, Any]] = {
+    optimized_hostility = prompt_version == HOSTILITY_PRODUCTION_PROMPT_VERSION
+    supported_generation: dict[str, dict[str, Any]]
+    if optimized_hostility:
+        variant = provenance.get("optimization_variant")
+        if not isinstance(variant, str):
+            raise ValueError("paid Batch submission blocked: unknown hostility optimization variant")
+        expected_tokens = {"A": 1000, "B": 500, "C": 500}.get(variant)
+        if expected_tokens is None:
+            raise ValueError("paid Batch submission blocked: unknown hostility optimization variant")
+        supported_generation = {FROZEN_MODEL: {"thinking_budget": 0}}
+        expected = {
+            "prompt_version": HOSTILITY_PRODUCTION_PROMPT_VERSION,
+            "assembled_prompt_sha256": OPTIMIZED_HOSTILITY_PROMPT_SHA256,
+            "canonical_schema_sha256": FROZEN_HOSTILITY_CANONICAL_SCHEMA_SHA256,
+            "prediction_contract_sha256": OPTIMIZED_HOSTILITY_CONTRACT_SHA256,
+            "prediction_contract_version": HOSTILITY_PRODUCTION_CONTRACT_VERSION,
+            "provider_schema_sha256": OPTIMIZED_HOSTILITY_PROVIDER_SCHEMA_SHA256,
+            "max_output_tokens": expected_tokens,
+            "prediction_task": "hostility",
+            "provider": "gemini",
+            "temperature": 0.0,
+            "record_count": 100,
+            "record_ids_sha256": OPTIMIZED_HOSTILITY_RECORD_IDS_SHA256,
+            "benchmark_set_sha256": HELDOUT_SAMPLE_SHA256,
+        }
+        expected_fields = OPTIMIZED_HOSTILITY_PREDICTION_FIELDS
+    elif prompt_version == FROZEN_HOSTILITY_PROMPT_VERSION:
+        supported_generation = {
             FROZEN_MODEL: {"thinking_budget": 0},
         }
         expected = {
@@ -267,7 +323,17 @@ def validate_production_plan(plan: dict[str, Any]) -> None:
         if provenance.get(key) != value:
             raise ValueError(f"paid Batch submission blocked: unexpected {key}")
     cache_identifier = provenance.get("cached_content")
-    if (
+    if optimized_hostility:
+        if provenance.get("optimization_variant") == "C":
+            if not isinstance(cache_identifier, str) or not cache_identifier.startswith(
+                "cachedContents/"
+            ):
+                raise ValueError("paid Batch submission blocked: Variant C requires explicit cache")
+            if provenance.get("cached_content_prefix_sha256") != OPTIMIZED_HOSTILITY_PROMPT_SHA256:
+                raise ValueError("paid Batch submission blocked: cached prefix hash mismatch")
+        elif cache_identifier is not None:
+            raise ValueError("paid Batch submission blocked: explicit cache is reserved for Variant C")
+    elif (
         not isinstance(cache_identifier, str)
         or not cache_identifier.startswith("cachedContents/")
         or "REPLACE" in cache_identifier
@@ -282,6 +348,16 @@ def validate_production_plan(plan: dict[str, Any]) -> None:
     )
     if not isinstance(requests, list) or not requests:
         raise ValueError("paid Batch submission blocked: plan has no requests")
+    if optimized_hostility:
+        actual_keys = [
+            str(item.get("metadata", {}).get("key"))
+            for item in requests
+            if isinstance(item, dict) and isinstance(item.get("metadata"), dict)
+        ]
+        if len(actual_keys) != 100 or canonical_hash(actual_keys) != (
+            OPTIMIZED_HOSTILITY_RECORD_IDS_SHA256
+        ):
+            raise ValueError("paid Batch submission blocked: unexpected frozen record set")
     expected_generation = supported_generation[model]
     provenance_generation = {
         key: provenance[key]
@@ -307,6 +383,19 @@ def validate_production_plan(plan: dict[str, Any]) -> None:
             raise ValueError("paid Batch submission blocked: provider schema hash mismatch")
         if config.get("thinkingConfig") != expected_thinking:
             raise ValueError("paid Batch submission blocked: unexpected thinking configuration")
+        if optimized_hostility and config.get("maxOutputTokens") != expected["max_output_tokens"]:
+            raise ValueError("paid Batch submission blocked: unexpected output-token limit")
+        if optimized_hostility and config.get("temperature") != 0.0:
+            raise ValueError("paid Batch submission blocked: unexpected temperature")
+        if optimized_hostility:
+            if variant == "C" and item["request"].get("systemInstruction") is not None:
+                raise ValueError("paid Batch submission blocked: Variant C must use cached prefix")
+            if variant == "C" and item["request"].get("cachedContent") != cache_identifier:
+                raise ValueError("paid Batch submission blocked: Variant C request cache mismatch")
+            if variant != "C" and item["request"].get("systemInstruction") is None:
+                raise ValueError("paid Batch submission blocked: variants A/B require shared prefix")
+            if variant != "C" and item["request"].get("cachedContent") is not None:
+                raise ValueError("paid Batch submission blocked: variants A/B cannot use explicit cache")
 
 
 def build_cache_create_request(
@@ -331,12 +420,15 @@ def build_batch_create_request(
     display_name: str,
     cached_content: str | None = None,
     generation: dict[str, Any] | None = None,
+    max_output_tokens: int = 1000,
 ) -> dict[str, Any]:
     requests: list[dict[str, Any]] = []
     for record in records:
         request: dict[str, Any] = {
             "contents": [{"role": "user", "parts": [{"text": build_user_prompt(record)}]}],
-            "generationConfig": gemini_generation_config(schema, generation=generation),
+            "generationConfig": gemini_generation_config(
+                schema, generation=generation, max_output_tokens=max_output_tokens
+            ),
         }
         if cached_content is None:
             request["systemInstruction"] = {"parts": [{"text": system_prompt}]}
@@ -547,17 +639,34 @@ def collect_inline_batch(
             parsed = json.loads(raw_text) if isinstance(raw_text, str) else raw_text
             if prediction_task == "hostility":
                 record = (records_by_id or {}).get(key)
+                prompt_version = str(plan.get("provenance", {}).get("prompt_version", "hostility-prompt-v2"))
+                if record is None and prompt_version == HOSTILITY_PRODUCTION_PROMPT_VERSION:
+                    request = planned[planned_indexes[key]].get("request", {})
+                    contents = request.get("contents", []) if isinstance(request, dict) else []
+                    parts = contents[0].get("parts", []) if contents and isinstance(contents[0], dict) else []
+                    user_text = parts[0].get("text") if parts and isinstance(parts[0], dict) else None
+                    marker = "\n\nSPEECH:\n"
+                    if isinstance(user_text, str) and marker in user_text:
+                        record = {"speech": {"text": user_text.split(marker, 1)[1]}}
                 if record is None:
                     raise InvalidPrediction("hostility validation has no canonical speech record")
                 validated, diagnostics = validate_prediction_with_diagnostics(
-                    parsed, str(record["speech"]["text"]), "hostility-prompt-v2"
+                    parsed, str(record["speech"]["text"]), prompt_version
                 )
                 if diagnostics["evidence_valid"] is not True:
                     raise InvalidPrediction(
                         "hostility evidence must resolve uniquely to canonical text"
                     )
                 validated.to_dict()
-                prediction = parsed
+                prediction = (
+                    validated.to_dict()
+                    if prompt_version == HOSTILITY_PRODUCTION_PROMPT_VERSION
+                    else parsed
+                )
+                if prompt_version == HOSTILITY_PRODUCTION_PROMPT_VERSION and isinstance(
+                    prediction, dict
+                ):
+                    prediction.pop("reasoning", None)
             else:
                 prediction = validate_prediction(parsed, domain_codes).to_dict()
             result_status = "success"

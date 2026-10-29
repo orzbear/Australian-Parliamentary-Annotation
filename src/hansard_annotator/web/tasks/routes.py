@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import secrets
+from pathlib import Path
 from typing import Annotated, Any, cast
 from urllib.parse import quote, urlencode
 
@@ -32,6 +34,7 @@ from hansard_annotator.web.auth.models import Principal
 from hansard_annotator.web.config import WebSettings
 from hansard_annotator.web.dependencies import enforce_csrf, get_settings, require_principal
 from hansard_annotator.web.projects.permissions import PermissionDenied
+from hansard_annotator.web.tasks.frozen_samples import load_frozen_sample
 from hansard_annotator.web.tasks.service import (
     assignment_progress,
     claim_next,
@@ -427,12 +430,65 @@ def review_project(
     status: str = "unreviewed",
     primary_domain: str | None = None,
     is_non_policy: bool | None = None,
+    hostility_present: str | None = None,
+    hostility_target: str | None = None,
+    year: int | None = None,
+    hostility_failure: str | None = None,
+    sample: str | None = None,
+    random_sample: bool = False,
+    sample_seed: str | None = None,
 ) -> object:
     if status not in REVIEW_FILTERS:
         status = "unreviewed"
     run = ai_review_run(settings, run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="AI review project not found")
+    if hostility_present not in {None, "", "YES", "NO", "UNSURE"}:
+        raise HTTPException(status_code=422, detail="invalid hostility presence filter")
+    if hostility_target not in {
+        None,
+        "",
+        "OPPOSING_PARTISAN_TARGET",
+        "OTHER_POLITICAL_TARGET",
+        "NON_POLITICAL_TARGET",
+        "UNSURE",
+    }:
+        raise HTTPException(status_code=422, detail="invalid hostility target filter")
+    if hostility_failure not in {None, "", "evidence", "provider", "structured"}:
+        raise HTTPException(status_code=422, detail="invalid hostility failure filter")
+    if sample not in {None, "", "development", "confirmation"}:
+        raise HTTPException(status_code=422, detail="invalid frozen sample filter")
+    if year is not None and not 1901 <= year <= 2100:
+        raise HTTPException(status_code=422, detail="invalid speech year filter")
+    if random_sample and not sample_seed:
+        query_values = dict(request.query_params)
+        query_values["random_sample"] = "true"
+        query_values["sample_seed"] = secrets.token_hex(12)
+        return RedirectResponse(
+            f"/ai-review/{quote(run_id, safe='')}?{urlencode(query_values)}",
+            status_code=303,
+        )
+    if random_sample and (
+        sample_seed is None
+        or len(sample_seed) > 64
+        or not sample_seed.isascii()
+        or not sample_seed.isalnum()
+    ):
+        raise HTTPException(status_code=422, detail="invalid random review seed")
+    sample_turn_keys: list[str] | None = None
+    if sample in {"development", "confirmation"}:
+        sample_id = (
+            "hostility-development-100"
+            if sample == "development"
+            else "hostility-luna-confirmation-100"
+        )
+        sample_file = Path(__file__).resolve().parents[4] / "config" / "research_samples" / f"{sample_id}.json"
+        frozen_sample = load_frozen_sample(sample_file, sample_id)
+        if sample == "confirmation" and frozen_sample.sample_sha256 != (
+            "482d2951253840c5a294be028f6a61891693b6826ac3bdbebb087e71aa5c3c48"
+        ):
+            raise HTTPException(status_code=409, detail="Frozen Luna confirmation sample identity changed")
+        sample_turn_keys = [turn.turn_key for turn in frozen_sample.turns]
     rows = ai_review_queue(
         settings,
         principal,
@@ -441,6 +497,12 @@ def review_project(
         prediction_task=str(run["prediction_task"]),
         primary_domain=primary_domain,
         is_non_policy=is_non_policy,
+        hostility_present=hostility_present,
+        hostility_target=hostility_target,
+        speech_year=year,
+        hostility_failure=hostility_failure,
+        sample_turn_keys=sample_turn_keys,
+        random_seed=sample_seed if random_sample else None,
     )
     return _templates(request).TemplateResponse(
         request,
@@ -453,6 +515,13 @@ def review_project(
             "active_run_id": run_id,
             "primary_domain": primary_domain or "",
             "is_non_policy": is_non_policy,
+            "hostility_present": hostility_present or "",
+            "hostility_target": hostility_target or "",
+            "year": year or "",
+            "hostility_failure": hostility_failure or "",
+            "sample": sample or "",
+            "random_sample": random_sample,
+            "sample_seed": sample_seed or "",
         },
     )
 

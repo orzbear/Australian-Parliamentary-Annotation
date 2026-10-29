@@ -1,0 +1,22 @@
+{
+  "configuration_id": "hostility-luna-v1-medium-1000",
+  "provider": "openai",
+  "model": "gpt-6-luna",
+  "prompt_version": "hostility-prompt-luna-v1",
+  "prompt_sha256": "daeb12f872bb908112fc449ba5a0b0a444fa8624dcc9f805555e3e9a73bcc964",
+  "reasoning_effort": "medium",
+  "max_output_tokens": 1000,
+  "temperature": null,
+  "output_contract": "hostility-output-luna-v1-no-reasoning",
+  "output_contract_sha256": "c4f52db4fddb092a0f51fa949fa0ccc9b730ae11e2bedf42d27f5933eecd21e4",
+  "canonical_schema_version": "0.2.0",
+  "canonical_schema_sha256": "959a51a987e0777cb72dc7ad12cd5b896429bef400b79f386764a20ddc3d5669",
+  "output_fields": [
+    "hostility_present",
+    "target",
+    "evidence_spans"
+  ],
+  "sample_id": "hostility-luna-confirmation-100",
+  "sample_sha256": "482d2951253840c5a294be028f6a61891693b6826ac3bdbebb087e71aa5c3c48",
+  "frozen_date": "2026-10-29"
+}

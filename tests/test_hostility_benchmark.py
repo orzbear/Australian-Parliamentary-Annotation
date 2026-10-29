@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -12,7 +13,10 @@ from hansard_annotator.llm_eval.hostility import write_reports
 from hansard_annotator.llm_eval.hostility_benchmark import (
     BASELINE_RUN_ID,
     CANDIDATE_MODEL,
+    LUNA_MODEL,
     SCHEMA_SHA256,
+    _baseline_results,
+    _transition,
     compare_benchmark,
     prepare_package,
 )
@@ -23,7 +27,8 @@ from hansard_annotator.llm_eval.hostility_validation import (
     PROMPT_SHA256,
     PROMPT_VERSION,
 )
-from hansard_annotator.llm_eval.operations import canonical_hash, production_record_from_turn
+from hansard_annotator.llm_eval.operations import canonical_hash
+from hansard_annotator.llm_eval.prompt import build_user_prompt
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -40,18 +45,19 @@ def _audit_data() -> tuple[list[str], list[dict[str, Any]]]:
     rows: list[dict[str, Any]] = []
     for index, frozen in enumerate(turns_doc["turns"]):
         text = f"Speech {index} attacked the opposing side."
-        frozen_record = production_record_from_turn(
-            {
+        frozen_record = {
+            "record_id": f"turn:{frozen['turn_key']}",
+            "speech": {
                 "turn_key": frozen["turn_key"],
                 "date": "2026-01-01",
                 "chamber": "House",
-                "speaker_name_raw": "Speaker",
-                "major_heading_original": "Debate",
-                "minor_heading_original": None,
-                "business_type": None,
-                "text_clean": text,
-            }
-        )
+                "speaker_name": "Speaker",
+                "major_heading": "Debate",
+                "minor_heading": "" if index == 0 else "Minor heading",
+                "business_type": "" if index == 0 else "business",
+                "text": text,
+            },
+        }
         presence = "NO" if index % 2 == 0 else "YES"
         values = {
             "hostility_present": presence,
@@ -71,6 +77,7 @@ def _audit_data() -> tuple[list[str], list[dict[str, Any]]]:
                 "turn_key": frozen["turn_key"],
                 "canonical_record_sha256": canonical_hash(frozen_record),
                 "prediction_task": "hostility",
+                "ai_outcome_status": "PREDICTION",
                 "terminal_review_action": "accepted",
                 "ai_valid_prediction": "true",
                 "human_values": json.dumps(values),
@@ -82,20 +89,27 @@ def _audit_data() -> tuple[list[str], list[dict[str, Any]]]:
                 "sitting_date": "2026-01-01",
                 "chamber": "House",
                 "major_heading": "Debate",
-                "minor_heading": "",
-                "business_type": "",
+                "minor_heading": frozen_record["speech"]["minor_heading"],
+                "business_type": frozen_record["speech"]["business_type"],
             }
         )
+        if index >= 98:
+            rows[-1].update(
+                {
+                    "terminal_review_action": "human_annotated_after_ai_failure",
+                    "ai_prediction_values": "",
+                    "ai_outcome_status": "INVALID_OUTPUT",
+                    "ai_valid_prediction": "false",
+                    "ai_failure_reason": "invalid structured output",
+                    "ai_failure_diagnostic": "terminal invalid output",
+                }
+            )
     return [str(row["turn_key"]) for row in turns_doc["turns"]], rows
 
 
-def _write_audit(tmp_path: Path) -> tuple[Path, Path, list[dict[str, Any]]]:
-    _, rows = _audit_data()
+def _write_audit(tmp_path: Path) -> tuple[Path, Path, list[dict[str, Any]], Path]:
+    turns, rows = _audit_data()
     csv_path = tmp_path / "full_review_results.csv"
-    with csv_path.open("w", encoding="utf-8", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
-        writer.writeheader()
-        writer.writerows(rows)
     summary = {
         "run": {
             "public_id": BASELINE_RUN_ID,
@@ -112,7 +126,8 @@ def _write_audit(tmp_path: Path) -> tuple[Path, Path, list[dict[str, Any]]]:
             "generation_config": {"thinking_budget": 0},
             "execution_mode": "batch",
             "requested_count": 100,
-            "valid_count": 100,
+            "valid_count": 98,
+            "invalid_count": 2,
             "input_tokens": 20000,
             "cached_input_tokens": 10000,
             "output_tokens": 5000,
@@ -122,13 +137,66 @@ def _write_audit(tmp_path: Path) -> tuple[Path, Path, list[dict[str, Any]]]:
     }
     summary_path = tmp_path / "review_summary.json"
     summary_path.write_text(json.dumps(summary), encoding="utf-8")
-    return csv_path, summary_path, rows
+    plan_path = tmp_path / "plan.json"
+    plan_entries = []
+    for row, key in zip(rows, turns, strict=True):
+        record = {
+            "record_id": f"turn:{key}",
+            "speech": {
+                "turn_key": key,
+                "date": row["sitting_date"],
+                "chamber": row["chamber"],
+                "speaker_name": row["speaker"],
+                "major_heading": row["major_heading"],
+                "minor_heading": row["minor_heading"],
+                "business_type": row["business_type"],
+                "text": row["speech_text"],
+            },
+        }
+        contents = build_user_prompt(record)
+        request = {
+            "cachedContent": "cachedContents/baseline-only",
+            "contents": [{"parts": [{"text": contents}]}],
+            "generationConfig": {
+                "thinkingConfig": {"thinkingBudget": 0},
+                "responseMimeType": "application/json",
+                "responseSchema": {"type": "OBJECT"},
+            },
+        }
+        row["canonical_record_sha256"] = canonical_hash(record)
+        plan_entries.append({"metadata": {"key": f"turn:{key}"}, "request": request})
+    plan_path.write_text(
+        json.dumps(
+            {
+                "provenance": {
+                    "prompt_version": PROMPT_VERSION,
+                    "assembled_prompt_sha256": PROMPT_SHA256,
+                    "prediction_contract_sha256": CONTRACT_SHA256,
+                    "canonical_schema_sha256": SCHEMA_SHA256,
+                    "provider_schema_sha256": canonical_hash(
+                        {"type": "OBJECT"}
+                    ),
+                    "provider": "gemini",
+                    "model": MODEL,
+                },
+                "request": {
+                    "batch": {"input_config": {"requests": {"requests": plan_entries}}}
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    with csv_path.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    return csv_path, summary_path, rows, plan_path
 
 
 def test_prepare_reuses_exact_frozen_sample_and_reviewed_reference(
     tmp_path: Path, capsys: Any
 ) -> None:
-    audit_csv, audit_summary, _ = _write_audit(tmp_path)
+    audit_csv, audit_summary, _, plan_path = _write_audit(tmp_path)
     package_path = tmp_path / "benchmark-input"
     result = prepare_package(
         audit_csv,
@@ -136,6 +204,7 @@ def test_prepare_reuses_exact_frozen_sample_and_reviewed_reference(
         ROOT / "config/research_samples/hostility-heldout-100.json",
         ROOT / "config/llm_eval/hostility-v2-codebook-context.json",
         package_path,
+        plan_path,
     )
     manifest = json.loads((package_path / "manifest.json").read_text(encoding="utf-8"))
     annotations = (package_path / "annotations.jsonl").read_text(encoding="utf-8").splitlines()
@@ -144,6 +213,11 @@ def test_prepare_reuses_exact_frozen_sample_and_reviewed_reference(
     assert result["records"] == 100
     assert result["set_sha256"] == HELDOUT_SAMPLE_SHA256
     assert manifest["benchmark"]["human_reference_run_id"] == BASELINE_RUN_ID
+    assert manifest["benchmark"]["source_type"] == "original_campaign_plan"
+    assert manifest["benchmark"]["source_baseline_campaign_id"] == "25f2f6da-e698-4a34-871f-3dc377544495"
+    assert manifest["benchmark"]["source_plan_sha256"] == hashlib.sha256(plan_path.read_bytes()).hexdigest()
+    assert "cachedContent" not in manifest["benchmark"]["active_provider_configuration"]
+    assert manifest["benchmark"]["candidate_generation"]["thinking_level"] == "minimal"
     assert len(annotations) == 100
     assert (
         first["speech"]["turn_key"]
@@ -154,6 +228,8 @@ def test_prepare_reuses_exact_frozen_sample_and_reviewed_reference(
         )["turns"][0]["turn_key"]
     )
     assert first["human_annotation"]["values"]["hostility_present"] == "NO"
+    assert first["speech"]["minor_heading"] == ""
+    assert first["speech"]["business_type"] == ""
     assert (
         evaluate_main(
             [
@@ -186,15 +262,99 @@ def test_prepare_reuses_exact_frozen_sample_and_reviewed_reference(
     assert dry_run["generation"]["thinking_level"] == "minimal"
 
 
-def test_prepare_rejects_text_that_differs_from_immutable_campaign_input(
+def test_baseline_results_parse_only_explicitly_valid_predictions(monkeypatch: Any) -> None:
+    valid_prediction = {
+        "hostility_present": "NO",
+        "target": "N/A",
+        "evidence_spans": [],
+        "reasoning": "valid",
+    }
+    parsed: list[str] = []
+    from hansard_annotator.llm_eval import hostility_benchmark
+
+    original_parse = hostility_benchmark._parse_json
+
+    def track_parse(value: object, label: str) -> Any:
+        parsed.append(str(value))
+        return original_parse(value, label)
+
+    monkeypatch.setattr(hostility_benchmark, "_parse_json", track_parse)
+    results = _baseline_results(
+        [
+            {
+                "record_id": "turn:valid",
+                "ai_valid_prediction": "true",
+                "ai_prediction_values": json.dumps(valid_prediction),
+            },
+            {
+                "record_id": "turn:terminal",
+                "ai_valid_prediction": "false",
+                "ai_prediction_values": "",
+                "ai_outcome_status": "INVALID_OUTPUT",
+                "ai_failure_diagnostic": "terminal invalid output",
+            },
+        ]
+    )
+
+    assert len(parsed) == 1 and parsed[0] == json.dumps(valid_prediction)
+    assert results[0]["status"] == "success"
+    assert results[0]["prediction"] == valid_prediction
+    assert results[1]["status"] == "invalid"
+    assert results[1]["prediction"] is None
+    assert results[1]["error_type"] == "INVALID_OUTPUT"
+
+
+def test_transition_names_are_ai_prediction_to_human_label() -> None:
+    human_no = {
+        "human_annotation": {"values": {"hostility_present": "NO", "target": None}}
+    }
+    human_yes = {
+        "human_annotation": {
+            "values": {
+                "hostility_present": "YES",
+                "target": "OPPOSING_PARTISAN_TARGET",
+            }
+        }
+    }
+    ai_yes = {
+        "status": "success",
+        "prediction": {"hostility_present": "YES", "target": "OPPOSING_PARTISAN_TARGET"},
+    }
+    ai_no = {"status": "success", "prediction": {"hostility_present": "NO", "target": "N/A"}}
+
+    assert _transition(human_no, ai_yes) == "YES_TO_NO"
+    assert _transition(human_yes, ai_no) == "NO_TO_YES"
+
+
+def test_prepare_uses_frozen_text_even_when_audit_csv_text_differs(
     tmp_path: Path,
 ) -> None:
-    audit_csv, audit_summary, rows = _write_audit(tmp_path)
+    audit_csv, audit_summary, rows, plan_path = _write_audit(tmp_path)
     rows[0]["speech_text"] += " changed"
     with audit_csv.open("w", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
+
+    package_path = tmp_path / "frozen-source-input"
+    prepare_package(
+        audit_csv,
+        audit_summary,
+        ROOT / "config/research_samples/hostility-heldout-100.json",
+        ROOT / "config/llm_eval/hostility-v2-codebook-context.json",
+        package_path,
+        plan_path,
+    )
+    first = json.loads((package_path / "annotations.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    assert first["speech"]["text"].startswith("Speech 0 attacked")
+
+
+def test_prepare_rejects_modified_original_plan_speech_text(tmp_path: Path) -> None:
+    audit_csv, audit_summary, _, plan_path = _write_audit(tmp_path)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    request = plan["request"]["batch"]["input_config"]["requests"]["requests"][0]["request"]
+    request["contents"][0]["parts"][0]["text"] += " changed"
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
 
     with pytest.raises(ValueError, match="canonical text/metadata differs"):
         prepare_package(
@@ -202,12 +362,69 @@ def test_prepare_rejects_text_that_differs_from_immutable_campaign_input(
             audit_summary,
             ROOT / "config/research_samples/hostility-heldout-100.json",
             ROOT / "config/llm_eval/hostility-v2-codebook-context.json",
-            tmp_path / "invalid-input",
+            tmp_path / "modified-plan-input",
+            plan_path,
+        )
+
+
+@pytest.mark.parametrize("mutation, message", [("duplicate", "duplicate selected turn"), ("missing", "missing selected turns")])
+def test_prepare_rejects_duplicate_or_missing_selected_plan_turn(
+    tmp_path: Path, mutation: str, message: str
+) -> None:
+    audit_csv, audit_summary, _, plan_path = _write_audit(tmp_path)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    entries = plan["request"]["batch"]["input_config"]["requests"]["requests"]
+    if mutation == "duplicate":
+        entries.append(entries[0])
+    else:
+        entries.pop(0)
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        prepare_package(
+            audit_csv,
+            audit_summary,
+            ROOT / "config/research_samples/hostility-heldout-100.json",
+            ROOT / "config/llm_eval/hostility-v2-codebook-context.json",
+            tmp_path / f"{mutation}-plan-input",
+            plan_path,
+        )
+
+
+def test_prepare_rejects_modified_plan_metadata_against_stored_input_hash(tmp_path: Path) -> None:
+    audit_csv, audit_summary, _, plan_path = _write_audit(tmp_path)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    request = plan["request"]["batch"]["input_config"]["requests"]["requests"][0]["request"]
+    original = request["contents"][0]["parts"][0]["text"]
+    request["contents"][0]["parts"][0]["text"] = original.replace('"date": "2026-01-01"', '"date": "2026-01-02"')
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="canonical text/metadata differs"):
+        prepare_package(
+            audit_csv,
+            audit_summary,
+            ROOT / "config/research_samples/hostility-heldout-100.json",
+            ROOT / "config/llm_eval/hostility-v2-codebook-context.json",
+            tmp_path / "metadata-mismatch-input",
+            plan_path,
+        )
+
+
+def test_prepare_fails_when_original_plan_is_missing(tmp_path: Path) -> None:
+    audit_csv, audit_summary, _, _ = _write_audit(tmp_path)
+    with pytest.raises(FileNotFoundError):
+        prepare_package(
+            audit_csv,
+            audit_summary,
+            ROOT / "config/research_samples/hostility-heldout-100.json",
+            ROOT / "config/llm_eval/hostility-v2-codebook-context.json",
+            tmp_path / "missing-plan-input",
+            tmp_path / "absent-plan.json",
         )
 
 
 def test_prepare_rejects_a_genuinely_wrong_run_task(tmp_path: Path) -> None:
-    audit_csv, audit_summary, _ = _write_audit(tmp_path)
+    audit_csv, audit_summary, _, plan_path = _write_audit(tmp_path)
     summary = json.loads(audit_summary.read_text(encoding="utf-8"))
     summary["run"]["prediction_task"] = "policy"
     audit_summary.write_text(json.dumps(summary), encoding="utf-8")
@@ -219,11 +436,12 @@ def test_prepare_rejects_a_genuinely_wrong_run_task(tmp_path: Path) -> None:
             ROOT / "config/research_samples/hostility-heldout-100.json",
             ROOT / "config/llm_eval/hostility-v2-codebook-context.json",
             tmp_path / "wrong-task-input",
+            plan_path,
         )
 
 
 def test_compare_reports_metrics_transitions_and_actual_baseline_cost(tmp_path: Path) -> None:
-    audit_csv, audit_summary, rows = _write_audit(tmp_path)
+    audit_csv, audit_summary, rows, plan_path = _write_audit(tmp_path)
     package_path = tmp_path / "benchmark-input"
     prepare_package(
         audit_csv,
@@ -231,6 +449,7 @@ def test_compare_reports_metrics_transitions_and_actual_baseline_cost(tmp_path: 
         ROOT / "config/research_samples/hostility-heldout-100.json",
         ROOT / "config/llm_eval/hostility-v2-codebook-context.json",
         package_path,
+        plan_path,
     )
     package_manifest = json.loads((package_path / "manifest.json").read_text(encoding="utf-8"))
     candidate_dir = tmp_path / "candidate"
@@ -241,6 +460,7 @@ def test_compare_reports_metrics_transitions_and_actual_baseline_cost(tmp_path: 
         "prompt_version": PROMPT_VERSION,
         "prompt_sha256": PROMPT_SHA256,
         "schema_sha256": SCHEMA_SHA256,
+        "prediction_contract_sha256": CONTRACT_SHA256,
         "package_snapshot_sha256": package_manifest["snapshot_sha256"],
         "generation": {
             "max_output_tokens": 1000,
@@ -254,6 +474,19 @@ def test_compare_reports_metrics_transitions_and_actual_baseline_cost(tmp_path: 
     )
     candidate_results = []
     for index, row in enumerate(rows):
+        if row["ai_valid_prediction"] == "false":
+            candidate_results.append(
+                {
+                    "record_id": row["record_id"],
+                    "status": "invalid",
+                    "prediction": None,
+                    "error_type": "InvalidPrediction",
+                    "error_message": "candidate terminal invalid output",
+                    "usage": {},
+                    "diagnostics": {},
+                }
+            )
+            continue
         prediction = json.loads(row["ai_prediction_values"])
         if index == 1:
             prediction = {
@@ -300,6 +533,69 @@ def test_compare_reports_metrics_transitions_and_actual_baseline_cost(tmp_path: 
         "".join(json.dumps(result) + "\n" for result in candidate_results), encoding="utf-8"
     )
 
+    luna_dir = tmp_path / "gpt-6-luna"
+    luna_dir.mkdir()
+    luna_configuration = {
+        "provider": "openai",
+        "model": LUNA_MODEL,
+        "prompt_version": PROMPT_VERSION,
+        "prompt_sha256": PROMPT_SHA256,
+        "schema_sha256": SCHEMA_SHA256,
+        "prediction_contract_sha256": CONTRACT_SHA256,
+        "provider_prediction_schema_sha256": CONTRACT_SHA256,
+        "package_snapshot_sha256": package_manifest["snapshot_sha256"],
+        "generation": {"max_output_tokens": 1000, "reasoning_effort": "low"},
+    }
+    (luna_dir / "run_metadata.json").write_text(
+        json.dumps({"configuration": luna_configuration}), encoding="utf-8"
+    )
+    luna_results = []
+    for index, row in enumerate(rows):
+        usage = {
+            "input_tokens": 100,
+            "cached_input_tokens": 10,
+            "output_tokens": 20,
+            "reasoning_tokens": 5,
+            "total_tokens": 125,
+        }
+        if index in {3, 98, 99}:
+            result = {
+                "record_id": row["record_id"],
+                "status": "invalid",
+                "prediction": None,
+                "error_type": "InvalidPrediction",
+                "error_message": "evidence text was unmatched"
+                if index == 3
+                else "invalid structured output",
+                "usage": usage,
+                "returned_model": "gpt-6-luna-2026-10-29",
+                "diagnostics": {"evidence_unmatched": ["not present"]} if index == 3 else {},
+            }
+        elif index == 5:
+            result = {
+                "record_id": row["record_id"],
+                "status": "api_failure",
+                "prediction": None,
+                "error_type": "ProviderError",
+                "error_message": "provider request failed",
+                "usage": usage,
+                "returned_model": None,
+                "diagnostics": {},
+            }
+        else:
+            result = {
+                "record_id": row["record_id"],
+                "status": "success",
+                "prediction": json.loads(row["ai_prediction_values"]),
+                "usage": usage,
+                "returned_model": "gpt-6-luna-2026-10-29",
+                "diagnostics": {"evidence_valid": True},
+            }
+        luna_results.append(result)
+    (luna_dir / "predictions.jsonl").write_text(
+        "".join(json.dumps(result) + "\n" for result in luna_results), encoding="utf-8"
+    )
+
     output = tmp_path / "comparison"
     report = compare_benchmark(
         audit_csv,
@@ -308,15 +604,57 @@ def test_compare_reports_metrics_transitions_and_actual_baseline_cost(tmp_path: 
         candidate_dir,
         output,
         ROOT / "config/llm_eval/pricing.yaml",
+        plan_path,
+        luna_dir,
     )
     candidate_metrics = report["metrics"][CANDIDATE_MODEL]
+    baseline_metrics = report["metrics"][MODEL]
+    assert baseline_metrics["total_records"] == 100
+    assert baseline_metrics["evaluated_records"] == 98
+    assert baseline_metrics["status_counts"]["invalid"] == 2
+    assert report["reliability"][MODEL]["coverage"] == 0.98
+    assert report["reliability"][MODEL]["terminal_failures"] == 2
+    assert candidate_metrics["total_records"] == 100
+    assert candidate_metrics["evaluated_records"] == 96
+    assert candidate_metrics["status_counts"]["invalid"] == 3
+    assert candidate_metrics["status_counts"]["api_failure"] == 1
+    assert report["reliability"][CANDIDATE_MODEL]["coverage"] == 0.96
+    assert report["reliability"][CANDIDATE_MODEL]["terminal_failures"] == 4
+    luna_metrics = report["metrics"][LUNA_MODEL]
+    assert luna_metrics["evaluated_records"] == 96
+    assert luna_metrics["status_counts"]["invalid"] == 3
+    assert luna_metrics["status_counts"]["api_failure"] == 1
+    assert report["reliability"][LUNA_MODEL]["coverage"] == 0.96
+    assert report["reliability"][LUNA_MODEL]["evidence_resolution_failures"] == 1
+    assert report["reliability"][LUNA_MODEL]["provider_api_failures"] == 1
+    assert report["cost"]["luna_run_provenance"]["requested_model"] == LUNA_MODEL
+    assert report["cost"]["luna_run_provenance"]["returned_models"] == [
+        "gpt-6-luna-2026-10-29"
+    ]
+    assert report["cost"]["luna_run_provenance"]["generation"] == {
+        "max_output_tokens": 1000,
+        "reasoning_effort": "low",
+    }
+    assert report["cost"]["luna_standard_api_usage_cost"]["pricing_found"] is True
+    assert report["cost"]["luna_batch_pricing_estimate"]["estimated_cost_usd"] == (
+        report["cost"]["luna_standard_api_usage_cost"]["estimated_cost_usd"] / 2
+    )
+    assert report["cost"]["luna_quality_gate"]["passed"] is False
+    assert "cost does not affect this gate" in report["cost"]["luna_quality_gate"]["decision_basis"]
+    with (output / "record_transitions.csv").open(encoding="utf-8", newline="") as stream:
+        transitions = {row["record_id"]: row for row in csv.DictReader(stream)}
+    for row in rows[-2:]:
+        transition = transitions[row["record_id"]]
+        assert transition["baseline_hostility"] == ""
+        assert transition["candidate_hostility"] == ""
+        assert transition["human_hostility"] in {"YES", "NO", "UNSURE"}
     assert candidate_metrics["binary_yes_vs_rest"]["false_negative"] == 1
-    assert report["ai_to_human_transitions"][CANDIDATE_MODEL]["YES_TO_NO"] == 1
+    assert report["ai_to_human_transitions"][CANDIDATE_MODEL]["NO_TO_YES"] == 1
     assert report["ai_to_human_transitions"][CANDIDATE_MODEL]["EVIDENCE_RESOLUTION_FAILURE"] == 1
     assert report["ai_to_human_transitions"][CANDIDATE_MODEL]["PROVIDER_API_FAILURE"] == 1
     assert report["reliability"][CANDIDATE_MODEL]["evidence_resolution_failures"] == 1
     assert report["reliability"][CANDIDATE_MODEL]["provider_api_failures"] == 1
-    assert report["reliability"][CANDIDATE_MODEL]["terminal_failures"] == 2
+    assert report["reliability"][CANDIDATE_MODEL]["terminal_failures"] == 4
     assert report["cost"]["baseline_actual_cost_usd"] == 0.012
     assert report["cost"]["baseline_pricing_estimate"]["estimated_cost_usd"] == 0.00805
     assert report["cost"]["baseline_cost_basis_source"] == "imported_run_total_cost_usd"
@@ -324,6 +662,11 @@ def test_compare_reports_metrics_transitions_and_actual_baseline_cost(tmp_path: 
     assert report["recommendation"] is None
     assert (output / "comparison.md").is_file()
     assert (output / "record_transitions.csv").is_file()
+    comparison_markdown = (output / "comparison.md").read_text(encoding="utf-8")
+    assert "| Measure | Gemini 2.5 Flash | Gemini 3.1 Flash-Lite | GPT-6 Luna |" in comparison_markdown
+    assert "Frozen comparative hostility benchmark" in comparison_markdown
+    assert "AI prediction -> human label `NO_TO_YES` (false-negative direction)" in comparison_markdown
+    assert "False negatives" in comparison_markdown
 
 
 def test_comparative_prediction_report_uses_correct_benchmark_label(tmp_path: Path) -> None:

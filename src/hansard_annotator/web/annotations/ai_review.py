@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 import psycopg
@@ -405,6 +406,13 @@ def _terminal_failure_workspace(
     human_data = dict(human) if human else None
     if human_data:
         human_data["changed_fields"] = []
+    failure_message = {
+        "API_FAILURE": "The model provider did not return a usable response.",
+        "INVALID_STRUCTURED_OUTPUT": "The model output did not pass hostility schema validation.",
+        "EVIDENCE_RESOLUTION_FAILED": (
+            "The model output did not pass canonical evidence validation."
+        ),
+    }.get(str(outcome["resolution_reason"]), "The AI prediction is unavailable.")
     return {
         "prediction": {
             **dict(outcome),
@@ -412,7 +420,7 @@ def _terminal_failure_workspace(
             "values": {},
             "reasoning": None,
             "ai_unavailable": True,
-            "failure_message": "The frozen model response did not pass canonical evidence validation.",
+            "failure_message": failure_message,
         },
         "effective_review": dict(effective) if effective else None,
         "human_annotation": human_data,
@@ -752,6 +760,12 @@ def ai_review_queue(
     prediction_task: str | None = None,
     primary_domain: str | None = None,
     is_non_policy: bool | None = None,
+    hostility_present: str | None = None,
+    hostility_target: str | None = None,
+    speech_year: int | None = None,
+    hostility_failure: str | None = None,
+    sample_turn_keys: list[str] | None = None,
+    random_seed: str | None = None,
 ) -> list[dict[str, object]]:
     """Return predictions with their effective latest append-only review event."""
     query, parameters = _ai_review_queue_query(
@@ -761,6 +775,12 @@ def ai_review_queue(
         prediction_task=prediction_task,
         primary_domain=primary_domain,
         is_non_policy=is_non_policy,
+        hostility_present=hostility_present,
+        hostility_target=hostility_target,
+        speech_year=speech_year,
+        hostility_failure=hostility_failure,
+        sample_turn_keys=sample_turn_keys,
+        random_seed=random_seed,
     )
     with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
         rows = connection.execute(query, parameters).fetchall()
@@ -785,8 +805,8 @@ def ai_review_queue(
             output.append(value)
         if (
             review_filter in {"unreviewed", "reviewed", "skipped"}
-            and primary_domain is None
-            and is_non_policy is None
+            and (prediction_task == "hostility" or (primary_domain is None and is_non_policy is None))
+            and (random_seed is None or hostility_failure is not None)
         ):
             status_sql = {
                 "unreviewed": "latest.review_status IS NULL",
@@ -797,6 +817,38 @@ def ai_review_queue(
             failure_parameters: tuple[object, ...] = (
                 (principal.user_id, run_id) if run_id else (principal.user_id,)
             )
+            failure_reason_sql = "outcome.resolution_type='INVALID_OUTPUT'"
+            failure_values: tuple[object, ...] = ()
+            if prediction_task == "hostility":
+                failure_reason_sql = "outcome.resolution_type IN ('INVALID_OUTPUT','PROVIDER_REFUSAL')"
+                if hostility_failure == "evidence":
+                    failure_reason_sql += " AND outcome.resolution_reason='EVIDENCE_RESOLUTION_FAILED'"
+                elif hostility_failure == "provider":
+                    failure_reason_sql += " AND (outcome.resolution_type='PROVIDER_REFUSAL' OR outcome.resolution_reason='API_FAILURE')"
+                elif hostility_failure == "structured":
+                    failure_reason_sql += " AND outcome.resolution_reason='INVALID_STRUCTURED_OUTPUT'"
+                elif hostility_failure:
+                    failure_reason_sql = "false"
+                if hostility_present or hostility_target:
+                    failure_reason_sql = "false"
+                if primary_domain:
+                    failure_reason_sql += " AND EXISTS (SELECT 1 FROM model_predictions policy_prediction "
+                    "JOIN model_prediction_runs policy_run ON policy_run.id=policy_prediction.run_id "
+                    "WHERE policy_prediction.speaker_turn_id=outcome.speaker_turn_id "
+                    "AND policy_prediction.prediction_task='policy' "
+                    "AND policy_prediction.primary_australian_domain=%s)"
+                    failure_values += (primary_domain,)
+                if sample_turn_keys:
+                    failure_reason_sql += " AND st.turn_key=ANY(%s)"
+                    failure_values += (sample_turn_keys,)
+                if speech_year is not None:
+                    failure_reason_sql += " AND EXTRACT(YEAR FROM st.speech_date)=%s"
+                    failure_values += (speech_year,)
+            failure_order_sql = "ORDER BY outcome.record_id"
+            failure_order_parameters: tuple[object, ...] = ()
+            if random_seed:
+                failure_order_sql = "ORDER BY md5(%s || outcome.record_id)"
+                failure_order_parameters = (random_seed,)
             failure_rows = connection.execute(
                     f"""SELECT assignment.id AS assignment_id,assignment.status AS assignment_status,
                            st.speaker_name_raw,st.speech_date,st.major_heading_original,
@@ -805,7 +857,8 @@ def ai_review_queue(
                            NULL::jsonb AS prediction_values,NULL::boolean AS is_non_policy,
                            NULL::text AS primary_australian_domain,NULL::text[] AS secondary_australian_domains,
                            run.public_id::text AS run_id,run.configured_model,run.prompt_version,
-                           latest.review_status,latest.reviewed_at,true AS ai_unavailable
+                           latest.review_status,latest.reviewed_at,true AS ai_unavailable,
+                           outcome.resolution_reason AS ai_failure_reason
                     FROM model_prediction_abstentions outcome
                     JOIN model_prediction_runs run ON run.id=outcome.run_id
                     JOIN speaker_turns st ON st.id=outcome.speaker_turn_id
@@ -818,12 +871,24 @@ def ai_review_queue(
                       WHERE t.speaker_turn_id=outcome.speaker_turn_id AND a.user_id=%s
                       ORDER BY a.updated_at DESC,a.id DESC LIMIT 1
                     ) assignment ON true
-                    WHERE outcome.resolution_type='INVALID_OUTPUT' AND {status_sql} {filter_run}
-                    ORDER BY outcome.record_id LIMIT 101""",
-                failure_parameters,
+                    WHERE {failure_reason_sql} AND {status_sql} {filter_run}
+                    {failure_order_sql} LIMIT 101""",
+                failure_parameters[:1]
+                + failure_values
+                + failure_parameters[1:]
+                + failure_order_parameters,
             ).fetchall()
             output.extend(dict(row) for row in failure_rows)
-        output.sort(key=lambda value: str(value.get("record_id") or ""))
+        if hostility_failure:
+            output = [row for row in output if row.get("ai_unavailable")]
+        if random_seed:
+            output.sort(
+                key=lambda value: hashlib.sha256(
+                    f"{random_seed}:{run_id or ''}:{value.get('record_id') or ''}".encode()
+                ).hexdigest()
+            )
+        else:
+            output.sort(key=lambda value: str(value.get("record_id") or ""))
         return output[:100]
 
 
@@ -835,6 +900,12 @@ def _ai_review_queue_query(
     prediction_task: str | None = None,
     primary_domain: str | None = None,
     is_non_policy: bool | None = None,
+    hostility_present: str | None = None,
+    hostility_target: str | None = None,
+    speech_year: int | None = None,
+    hostility_failure: str | None = None,
+    sample_turn_keys: list[str] | None = None,
+    random_seed: str | None = None,
 ) -> tuple[str, tuple[object, ...]]:
     """Build the fixed allowlisted queue query and its bound parameters."""
     if review_filter not in REVIEW_FILTERS:
@@ -861,12 +932,66 @@ def _ai_review_queue_query(
         conditions.append("mp.prediction_task=%s")
         parameters.append(prediction_task)
     if primary_domain:
-        conditions.append("mp.primary_australian_domain=%s")
+        conditions.append(
+            "COALESCE(mp.primary_australian_domain,latest_policy.primary_australian_domain)=%s"
+            if prediction_task == "hostility"
+            else "mp.primary_australian_domain=%s"
+        )
         parameters.append(primary_domain)
     if is_non_policy is not None:
         conditions.append("mp.is_non_policy=%s")
         parameters.append(is_non_policy)
+    if hostility_present:
+        if hostility_present not in {"YES", "NO", "UNSURE"}:
+            raise ValueError("invalid hostility presence filter")
+        conditions.append("mp.prediction_values->>'hostility_present'=%s")
+        parameters.append(hostility_present)
+    if hostility_target:
+        if hostility_target not in {
+            "OPPOSING_PARTISAN_TARGET", "OTHER_POLITICAL_TARGET", "NON_POLITICAL_TARGET", "UNSURE"
+        }:
+            raise ValueError("invalid hostility target filter")
+        conditions.append("mp.prediction_values->>'target'=%s")
+        parameters.append(hostility_target)
+    if speech_year is not None:
+        if not 1901 <= speech_year <= 2100:
+            raise ValueError("invalid speech year filter")
+        conditions.append("EXTRACT(YEAR FROM st.speech_date)=%s")
+        parameters.append(speech_year)
+    if hostility_failure:
+        if hostility_failure not in {"evidence", "provider", "structured"}:
+            raise ValueError("invalid hostility failure filter")
+        conditions.append("false")
+    if sample_turn_keys:
+        conditions.append("st.turn_key=ANY(%s)")
+        parameters.append(sample_turn_keys)
     where = " AND ".join(conditions) if conditions else "true"
+    policy_domain_join = (
+        """
+            LEFT JOIN LATERAL (
+              SELECT policy_prediction.primary_australian_domain
+              FROM model_predictions policy_prediction
+              JOIN model_prediction_runs policy_run ON policy_run.id=policy_prediction.run_id
+              WHERE policy_prediction.speaker_turn_id=mp.speaker_turn_id
+                AND policy_prediction.prediction_task='policy'
+              ORDER BY policy_run.imported_at DESC,policy_prediction.run_id DESC
+              LIMIT 1
+            ) latest_policy ON true
+        """
+        if prediction_task == "hostility"
+        else ""
+    )
+    primary_domain_expression = (
+        "COALESCE(mp.primary_australian_domain,latest_policy.primary_australian_domain)"
+        if prediction_task == "hostility"
+        else "mp.primary_australian_domain"
+    )
+    order_sql = "ORDER BY mp.record_id"
+    if random_seed:
+        if len(random_seed) > 64 or not random_seed.isascii() or not random_seed.isalnum():
+            raise ValueError("invalid random review seed")
+        order_sql = "ORDER BY md5(%s || mpr.public_id::text || mp.record_id)"
+        parameters.append(random_seed)
     return (
         f"""
             SELECT current_assignment.id AS assignment_id,
@@ -875,13 +1000,15 @@ def _ai_review_queue_query(
                    mp.public_id AS prediction_id,mp.record_id,mp.prediction_task,
                    mp.prediction_values->>'hostility_present' AS hostility_present,
                    mp.is_non_policy,
-                   mp.primary_australian_domain,mp.secondary_australian_domains,
+                   {primary_domain_expression} AS primary_australian_domain,
+                   mp.secondary_australian_domains,
                    mpr.public_id AS run_id,
                    mpr.configured_model,mpr.prompt_version,
                    latest_review.review_status,latest_review.reviewed_at
             FROM model_predictions mp
             JOIN speaker_turns st ON st.id=mp.speaker_turn_id
             JOIN model_prediction_runs mpr ON mpr.id=mp.run_id
+            {policy_domain_join}
             LEFT JOIN LATERAL (
               SELECT review_status,reviewed_at,id
               FROM model_prediction_reviews review
@@ -899,7 +1026,7 @@ def _ai_review_queue_query(
               LIMIT 1
             ) current_assignment ON true
             WHERE {where}
-            ORDER BY mp.record_id
+            {order_sql}
             LIMIT 101
             """,
         tuple(parameters),

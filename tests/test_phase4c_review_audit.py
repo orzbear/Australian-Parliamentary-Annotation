@@ -10,6 +10,7 @@ import pytest
 
 from hansard_annotator.llm_eval.review_audit import (
     ReviewAuditError,
+    _hostility_sample_keys,
     _load_rows,
     _write_csv,
     analyse_review_rows,
@@ -17,6 +18,7 @@ from hansard_annotator.llm_eval.review_audit import (
     full_review_rows,
     render_markdown,
 )
+from hansard_annotator.web.tasks.frozen_samples import load_frozen_sample
 
 
 def _run(count: int) -> dict[str, Any]:
@@ -193,6 +195,99 @@ def test_terminal_hostility_failure_stays_distinct_in_review_audit() -> None:
     assert exported["reviewed_hostility"] == "YES"
     assert exported["terminal_review_action"] == "human_annotated_after_ai_failure"
     assert summary["run"]["prediction_task"] == "hostility"
+
+
+def test_luna_confirmation_run_provenance_and_terminal_failure_export() -> None:
+    run = _run(1)
+    run.update(
+        prediction_task="hostility",
+        provider="openai",
+        configured_model="gpt-6-luna",
+        returned_model="gpt-6-luna",
+        prompt_version="hostility-prompt-luna-v1",
+        generation_config={"max_output_tokens": 1000, "reasoning_effort": "medium"},
+        execution_mode="local_evaluation",
+        provider_failure_count=1,
+        invalid_count=1,
+    )
+    valid = _row(1, status=None)
+    valid.update(
+        prediction_task="hostility",
+        ai_valid_prediction=True,
+        ai_prediction_values={
+            "hostility_present": "NO",
+            "target": "N/A",
+            "evidence_spans": [],
+        },
+        ai_is_non_policy=None,
+        ai_primary_domain=None,
+        ai_secondary_domains=None,
+        ai_reasoning=None,
+    )
+    failed = _row(2, status=None)
+    failed.update(
+        prediction_task="hostility",
+        ai_valid_prediction=False,
+        ai_outcome_status="INVALID_OUTPUT",
+        ai_failure_reason="API_FAILURE",
+        ai_prediction_values=None,
+        ai_is_non_policy=None,
+        ai_primary_domain=None,
+        ai_secondary_domains=None,
+        ai_reasoning=None,
+    )
+    summary, _, _ = analyse_review_rows(run, [valid, failed])
+    exported = full_review_rows([valid, failed])
+    assert summary["run"]["provider"] == "openai"
+    assert summary["run"]["generation_config"] == {
+        "max_output_tokens": 1000,
+        "reasoning_effort": "medium",
+    }
+    assert summary["counts"]["terminal_ai_failures"] == 1
+    assert exported[0]["ai_prediction_values"]["hostility_present"] == "NO"
+    assert exported[1]["ai_prediction_values"] is None
+    assert exported[1]["ai_failure_reason"] == "API_FAILURE"
+
+
+def test_frozen_hostility_membership_uses_the_committed_sample_files() -> None:
+    development, confirmation = _hostility_sample_keys()
+    assert len(development) == 100
+    assert len(confirmation) == 100
+    root = Path(__file__).parents[1]
+    expected_development = load_frozen_sample(
+        root / "config/research_samples/hostility-development-100.json",
+        "hostility-development-100",
+    )
+    expected_confirmation = load_frozen_sample(
+        root / "config/research_samples/hostility-luna-confirmation-100.json",
+        "hostility-luna-confirmation-100",
+    )
+    assert development == {turn.turn_key for turn in expected_development.turns}
+    assert confirmation == {turn.turn_key for turn in expected_confirmation.turns}
+
+
+def test_full_review_export_preserves_batch_and_recovery_attempt_provenance() -> None:
+    row = _row(1)
+    row.update(
+        prediction_task="hostility",
+        provider_batch_id="batch_luna_1",
+        provider_request_file_sha256="a" * 64,
+        provider_output_file_sha256="b" * 64,
+        provider_error_file_sha256="c" * 64,
+        provider_retry_count=1,
+        outcome_provenance={
+            "recovery_attempt_history": [{"attempt_number": 1, "status": "invalid"}]
+        },
+    )
+    exported = full_review_rows([row])[0]
+    assert exported["provider_batch_id"] == "batch_luna_1"
+    assert exported["provider_request_file_sha256"] == "a" * 64
+    assert exported["provider_output_file_sha256"] == "b" * 64
+    assert exported["provider_error_file_sha256"] == "c" * 64
+    assert exported["provider_retry_count"] == 1
+    assert exported["provider_attempt_history"] == [
+        {"attempt_number": 1, "status": "invalid"}
+    ]
 
 
 def test_prediction_task_can_be_derived_from_one_consistent_row_task() -> None:

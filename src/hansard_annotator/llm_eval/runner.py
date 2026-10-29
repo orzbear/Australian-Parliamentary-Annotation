@@ -28,6 +28,9 @@ from hansard_annotator.llm_eval.models import (
 from hansard_annotator.llm_eval.package import EvaluationPackage
 from hansard_annotator.llm_eval.prompt import (
     DEFAULT_PROMPT_VERSION,
+    HOSTILITY_LUNA_CONTRACT_VERSION,
+    HOSTILITY_LUNA_PROMPT_VERSION,
+    HOSTILITY_PRODUCTION_PROMPT_VERSION,
     build_system_prompt,
     build_user_prompt,
     prediction_json_schema,
@@ -57,6 +60,7 @@ class RunConfiguration:
     inclusion_record_count: int = 0
     inclusion_set_sha256: str | None = None
     prediction_contract_sha256: str | None = None
+    prediction_contract_version: str | None = None
 
     def identity(self) -> str:
         values = asdict(self)
@@ -70,6 +74,8 @@ class RunConfiguration:
             values.pop("inclusion_set_sha256")
         if self.prediction_contract_sha256 is None:
             values.pop("prediction_contract_sha256")
+        if self.prediction_contract_version is None:
+            values.pop("prediction_contract_version")
         payload = json.dumps(values, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -104,6 +110,11 @@ def make_configuration(
     contract_hash = hashlib.sha256(
         json.dumps(prediction_schema, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
+    contract_version = (
+        HOSTILITY_LUNA_CONTRACT_VERSION
+        if package.task == "hostility" and prompt_version == HOSTILITY_LUNA_PROMPT_VERSION
+        else None
+    )
     return RunConfiguration(
         provider,
         model,
@@ -123,6 +134,7 @@ def make_configuration(
         inclusion_record_count,
         inclusion_set_sha256,
         contract_hash if package.task == "hostility" else None,
+        contract_version,
     ), system
 
 
@@ -323,6 +335,13 @@ def evaluate(
                         diagnostics,
                     )
             value = result.to_dict()
+            if (
+                package.task == "hostility"
+                and prompt_version
+                in {HOSTILITY_PRODUCTION_PROMPT_VERSION, HOSTILITY_LUNA_PROMPT_VERSION}
+                and isinstance(value.get("prediction"), dict)
+            ):
+                value["prediction"].pop("reasoning", None)
             destination.write(json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n")
             destination.flush()
             os.fsync(destination.fileno())
