@@ -30,10 +30,12 @@ def adapt_policy_prediction(raw: object, domain_codes: tuple[str, ...]) -> Adapt
     return AdaptedPrediction("policy", *POLICY_SCHEMA, canonical, reasoning)
 
 
-def adapt_hostility_prediction(raw: object, speech_text: str) -> AdaptedPrediction:
-    """Validate frozen V2 output and retain resolved canonical offsets."""
+def adapt_hostility_prediction(
+    raw: object, speech_text: str, prompt_version: str = "hostility-prompt-v2"
+) -> AdaptedPrediction:
+    """Validate hostility output for its frozen prompt and retain canonical offsets."""
     value, diagnostics = validate_prediction_with_diagnostics(
-        raw, speech_text, "hostility-prompt-v2"
+        raw, speech_text, prompt_version
     )
     if diagnostics["evidence_valid"] is not True:
         raise ValueError("hostility evidence must resolve uniquely to canonical text")

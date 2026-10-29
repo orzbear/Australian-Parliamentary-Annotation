@@ -15,6 +15,7 @@ from hansard_annotator.web.campaigns.phase4e import (
     configured_orchestration_limits,
     orchestration_tick,
     plan_campaign_chunks,
+    refresh_campaign_batch_status,
     set_orchestration_paused,
 )
 from hansard_annotator.web.campaigns.service import (
@@ -483,6 +484,23 @@ async def campaign_orchestration_tick(
     principal: Annotated[Principal, Depends(require_admin)],
 ) -> RedirectResponse:
     return await _action(request, settings, principal, campaign_id, "orchestration-tick")
+
+
+@router.post("/{campaign_id}/refresh-batches")
+async def campaign_refresh_batches(
+    request: Request,
+    campaign_id: str,
+    settings: Annotated[WebSettings, Depends(get_settings)],
+    principal: Annotated[Principal, Depends(require_admin)],
+) -> RedirectResponse:
+    await enforce_csrf(request, principal, settings)
+    try:
+        refresh_campaign_batch_status(settings, principal, campaign_id)
+    except (CampaignError, LookupError, PermissionError, ValueError) as error:
+        raise _http_error(error) from error
+    return RedirectResponse(
+        f"/ai-annotation/{campaign_id}?notice=status-refreshed", status_code=303
+    )
 
 
 @router.post("/{campaign_id}/import")

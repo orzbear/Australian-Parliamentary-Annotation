@@ -17,6 +17,8 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from hansard_annotator.llm_eval.costs import load_pricing
+from hansard_annotator.llm_eval.hostility import prediction_json_schema as hostility_schema
+from hansard_annotator.llm_eval.hostility import validate_prediction_with_diagnostics
 from hansard_annotator.llm_eval.operations import (
     canonical_hash,
     collect_inline_batch,
@@ -24,7 +26,22 @@ from hansard_annotator.llm_eval.operations import (
     production_record_from_turn,
 )
 from hansard_annotator.llm_eval.ops_cli import _collection_summary
+from hansard_annotator.llm_eval.prompt import (
+    HOSTILITY_LUNA_PROMPT_VERSION,
+    build_system_prompt,
+    build_user_prompt,
+    prompt_hash,
+)
+from hansard_annotator.llm_eval.providers import provider_prediction_schema_hash
 from hansard_annotator.web.auth.models import Principal
+from hansard_annotator.web.campaigns.configurations import LUNA_PRODUCTION_CONFIGURATION_ID
+from hansard_annotator.web.campaigns.openai_batch import (
+    MAX_OPENAI_BATCH_FILE_BYTES,
+    MAX_OPENAI_BATCH_REQUESTS,
+    OpenAIBatchGateway,
+    luna_batch_request,
+    luna_custom_id,
+)
 from hansard_annotator.web.campaigns.recovery import (
     STRUCTURAL_REPAIR_RULE,
     apply_structural_repairs,
@@ -38,6 +55,7 @@ from hansard_annotator.web.campaigns.service import (
     LiveGeminiGateway,
     _artifact_directory,
     _campaign_configuration,
+    _configuration_context,
     _production_domain_codes,
     _provider_plan,
     cache_plan_status,
@@ -48,6 +66,7 @@ from hansard_annotator.web.codebook.service import ROOT
 from hansard_annotator.web.config import WebSettings
 
 FULL_PRODUCTION_CONFIRMATION = "START FULL PRODUCTION"
+LUNA_PRODUCTION_CONFIRMATION = "Launch paid Luna production annotation"
 CHUNK_PLANNER_VERSION = "phase4e-full-input-v1"
 DEFAULT_ENQUEUED_TOKEN_CEILING = 10_000_000
 DEFAULT_SAFETY_FACTOR = 0.90
@@ -81,6 +100,156 @@ class BatchFinder(Protocol):
     def find_batch(self, display_name: str, model: str) -> str | None: ...
 
 
+def _collect_openai_chunk(
+    gateway: OpenAIBatchGateway,
+    *,
+    chunk: dict[str, Any],
+    directory: Path,
+    records: tuple[dict[str, Any], ...],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    batch = gateway.retrieve(str(chunk["provider_job_id"]))
+    output_id = batch.get("output_file_id")
+    error_id = batch.get("error_file_id")
+    planned_id_map = {
+        luna_custom_id(str(record["record_id"])): str(record["record_id"])
+        for record in records
+    }
+    if len(planned_id_map) != len(records):
+        raise CampaignError("Luna Batch turn-key mapping is not unique")
+    responses: dict[str, dict[str, Any]] = {}
+    duplicate_count = 0
+    output_bytes = gateway.file_content(str(output_id)) if isinstance(output_id, str) else b""
+    error_bytes = gateway.file_content(str(error_id)) if isinstance(error_id, str) else b""
+    for content in (output_bytes, error_bytes):
+        for raw_line in content.splitlines():
+            if not raw_line:
+                continue
+            try:
+                value = json.loads(raw_line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if not isinstance(value, dict) or not isinstance(value.get("custom_id"), str):
+                continue
+            custom_id = str(value["custom_id"])
+            if custom_id not in planned_id_map:
+                continue
+            record_id = planned_id_map[custom_id]
+            if record_id in responses:
+                duplicate_count += 1
+            else:
+                responses[record_id] = value
+
+    rows: list[dict[str, Any]] = []
+    token_totals = {key: 0 for key in ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_tokens", "total_tokens")}
+    provider_successes = 0
+    provider_failures = 0
+    invalid = 0
+    evidence_failures = 0
+    for request_index, record in enumerate(records):
+        record_id = str(record["record_id"])
+        item = responses.get(record_id)
+        if item is None:
+            continue  # The campaign effective builder records this as missing.
+        response_value = item.get("response")
+        response = cast(dict[str, Any], response_value) if isinstance(response_value, dict) else {}
+        error = item.get("error")
+        body = response.get("body")
+        if not isinstance(body, dict) or error is not None or response.get("status_code") != 200:
+            provider_failures += 1
+            rows.append({
+                "record_id": record_id, "turn_key": record_id.removeprefix("turn:"),
+                "request_index": request_index, "status": "provider_failure",
+                "prediction": None, "provider_error": error or response.get("status_code") or "OpenAI response missing",
+                "provider_response": item,
+            })
+            continue
+        provider_successes += 1
+        usage_value = body.get("usage")
+        usage = cast(dict[str, Any], usage_value) if isinstance(usage_value, dict) else {}
+        input_details_value = usage.get("input_tokens_details")
+        input_details = (
+            cast(dict[str, Any], input_details_value)
+            if isinstance(input_details_value, dict)
+            else {}
+        )
+        output_details_value = usage.get("output_tokens_details")
+        output_details = (
+            cast(dict[str, Any], output_details_value)
+            if isinstance(output_details_value, dict)
+            else {}
+        )
+        values = {
+            "input_tokens": usage.get("input_tokens"),
+            "cached_input_tokens": input_details.get("cached_tokens"),
+            "output_tokens": usage.get("output_tokens"),
+            "reasoning_tokens": output_details.get("reasoning_tokens"),
+            "total_tokens": usage.get("total_tokens"),
+        }
+        for key, value in values.items():
+            token_totals[key] += value if isinstance(value, int) and value >= 0 else 0
+        output_text = body.get("output_text")
+        if not isinstance(output_text, str):
+            output_items = body.get("output")
+            if isinstance(output_items, list):
+                output_text = next((part.get("text") for message in output_items if isinstance(message, dict) and message.get("type") == "message" for part in message.get("content", []) if isinstance(part, dict) and part.get("type") == "output_text" and isinstance(part.get("text"), str)), None)
+        try:
+            parsed = json.loads(output_text) if isinstance(output_text, str) else None
+            prediction, diagnostics = validate_prediction_with_diagnostics(
+                parsed, str(record["speech"]["text"]), HOSTILITY_LUNA_PROMPT_VERSION
+            )
+            if diagnostics.get("evidence_valid") is not True:
+                raise ValueError("hostility evidence must resolve uniquely to canonical text")
+            status = "success"
+            output = prediction.to_dict()
+            output.pop("reasoning", None)
+            evidence_spans = output.get("evidence_spans")
+            output["evidence_spans"] = (
+                list(evidence_spans) if isinstance(evidence_spans, (list, tuple)) else []
+            )
+            validation_error = None
+        except (json.JSONDecodeError, TypeError, ValueError) as validation_error_value:
+            status = "invalid"
+            output = None
+            validation_error = str(validation_error_value)
+            invalid += 1
+            if validation_error == "hostility evidence must resolve uniquely to canonical text":
+                evidence_failures += 1
+        rows.append({
+            "record_id": record_id, "turn_key": record_id.removeprefix("turn:"),
+            "request_index": request_index, "status": status, "prediction": output,
+            "validation_error": validation_error, "provider_error": None,
+            "usage": values, "returned_model": body.get("model"),
+            "provider_response": item,
+        })
+
+    pricing = load_pricing(ROOT / "config/llm_eval/pricing.yaml")
+    entry = pricing["models"]["openai:gpt-6-luna"]["modes"]["batch"]
+    input_cost = token_totals["input_tokens"] * float(entry["input_per_million_usd"]) / 1_000_000
+    cached_cost = token_totals["cached_input_tokens"] * float(entry["cached_input_per_million_usd"]) / 1_000_000
+    output_cost = token_totals["output_tokens"] * float(entry["output_per_million_usd"]) / 1_000_000
+    total_cost = input_cost + cached_cost + output_cost
+    coverage = {
+        "planned_requests": len(planned_id_map), "provider_request_count": len(responses),
+        "collected_responses": len(responses), "missing_responses": len(planned_id_map) - len(responses),
+        "duplicate_mappings": duplicate_count,
+        "successful_provider_responses": provider_successes,
+        "failed_provider_responses": provider_failures,
+        "valid_structured_predictions": sum(row["status"] == "success" for row in rows),
+        "invalid_structured_predictions": invalid,
+        "evidence_resolution_failures": evidence_failures,
+        "accounting_invariant_ok": len(responses) + len(planned_id_map) - len(responses) == len(planned_id_map) and duplicate_count == 0,
+    }
+    summary = {
+        "provenance": {"provider": "openai", "model": "gpt-6-luna", "provider_batch_id": chunk["provider_job_id"], "input_file_sha256": chunk["provider_input_file_sha256"], "output_file_id": output_id, "error_file_id": error_id, "output_file_sha256": hashlib.sha256(output_bytes).hexdigest() if output_bytes else None, "error_file_sha256": hashlib.sha256(error_bytes).hexdigest() if error_bytes else None},
+        "batch_status": batch,
+        "coverage": coverage,
+        "tokens": token_totals,
+        "cost": {"batch_uncached_input_cost_usd": input_cost, "cached_input_cost_usd": cached_cost, "output_including_reasoning_cost_usd": output_cost, "token_processing_cost_usd": total_cost, "explicit_cache_storage_cost_usd": 0.0, "total_pilot_cost_usd": total_cost, "cost_per_valid_annotation_usd": total_cost / coverage["valid_structured_predictions"] if coverage["valid_structured_predictions"] else None},
+    }
+    (directory / "provider_response.json").write_text(json.dumps({"batch": batch, "output_file_sha256": summary["provenance"]["output_file_sha256"], "error_file_sha256": summary["provenance"]["error_file_sha256"]}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return rows, summary
+
+
 def configured_orchestration_limits() -> tuple[int, float, int]:
     ceiling = int(
         os.getenv(
@@ -102,6 +271,38 @@ def configured_orchestration_limits() -> tuple[int, float, int]:
 def estimate_record_input_tokens(text: str) -> int:
     """Conservative deterministic full-input estimate, including the cached prefix."""
     return INVARIANT_INPUT_TOKENS + max(1, math.ceil(len(text.encode("utf-8")) / CHARACTERS_PER_TOKEN))
+
+
+def _luna_input_tokens(record: dict[str, Any], system_prompt: str) -> int:
+    payload = system_prompt + "\n" + build_user_prompt(record)
+    return max(1, math.ceil(len(payload.encode("utf-8")) / CHARACTERS_PER_TOKEN))
+
+
+def _luna_prepared_requests(
+    campaign: dict[str, Any], records: tuple[dict[str, Any], ...]
+) -> tuple[dict[str, Any], ...]:
+    configuration = _campaign_configuration(campaign)
+    if configuration.configuration_id != LUNA_PRODUCTION_CONFIGURATION_ID:
+        raise CampaignError("OpenAI batch preparation is restricted to frozen Luna production")
+    context = _configuration_context(configuration)
+    system_prompt = build_system_prompt(context, configuration.prompt_version)
+    if prompt_hash(system_prompt) != configuration.prompt_sha256:
+        raise CampaignError("frozen Luna prompt hash differs from the approved configuration")
+    schema = hostility_schema(HOSTILITY_LUNA_PROMPT_VERSION)
+    if canonical_hash(schema) != configuration.prediction_contract_sha256:
+        raise CampaignError("frozen Luna output contract hash differs")
+    if provider_prediction_schema_hash("openai", schema) != configuration.provider_schema_sha256:
+        raise CampaignError("frozen Luna provider schema hash differs")
+    return tuple(
+        luna_batch_request(
+            record_id=str(record["record_id"]),
+            user_prompt=build_user_prompt(record),
+            system_prompt=system_prompt,
+            schema=schema,
+            generation=configuration.generation_config,
+        )
+        for record in records
+    )
 
 
 def deterministic_chunks(
@@ -487,6 +688,8 @@ def plan_campaign_chunks(
         ).fetchone()
         if campaign is None:
             raise LookupError("AI annotation campaign not found")
+        if campaign["orchestration_mode"] == "CHUNKED":
+            return dict(campaign)
         selection = campaign.get("selection_definition")
         if campaign["status"] != "PLANNED" or campaign["orchestration_mode"] != "LEGACY":
             raise CampaignError("only a newly planned legacy campaign can be chunked")
@@ -494,8 +697,12 @@ def plan_campaign_chunks(
             raise CampaignError("full production requires human-annotation exclusion OFF")
         if configuration_class(dict(campaign)) != "APPROVED_PRODUCTION":
             raise CampaignError("full production requires the approved frozen configuration")
-        if _campaign_configuration(dict(campaign)).prediction_task != "policy":
+        configuration = _campaign_configuration(dict(campaign))
+        is_luna = configuration.configuration_id == LUNA_PRODUCTION_CONFIGURATION_ID
+        if configuration.prediction_task != "policy" and not is_luna:
             raise CampaignError("full production orchestration is only supported for policy campaigns")
+        if is_luna and campaign["cache_status"] != "NOT_REQUIRED":
+            raise CampaignError("Luna production must not use a Gemini cache")
 
         def records() -> Iterator[dict[str, Any]]:
             with connection.cursor(name=f"phase4e_chunks_{campaign['id']}") as cursor:
@@ -512,12 +719,11 @@ def plan_campaign_chunks(
                 )
                 for value in cursor:
                     row = dict(value)
+                    input_tokens = estimate_record_input_tokens(str(row["prompt_text"]))
                     yield {
                         "selection_order": row["selection_order"],
                         "record_id": row["record_id"],
-                        "estimated_input_tokens": estimate_record_input_tokens(
-                            str(row["prompt_text"])
-                        ),
+                        "estimated_input_tokens": input_tokens,
                     }
 
         chunks = deterministic_chunks(
@@ -528,7 +734,7 @@ def plan_campaign_chunks(
         for chunk in chunks:
             count += 1
             estimated += chunk.estimated_input_tokens
-            connection.execute(
+            batch = connection.execute(
                 """
                 INSERT INTO ai_annotation_campaign_batches
                   (campaign_id,chunk_number,first_selection_order,last_selection_order,
@@ -538,6 +744,7 @@ def plan_campaign_chunks(
                    provider_schema_sha256,generation_config,execution_mode,
                    submission_display_name)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                RETURNING *
                 """,
                 (
                     campaign["id"], chunk.chunk_number, chunk.first_selection_order,
@@ -549,23 +756,96 @@ def plan_campaign_chunks(
                     Jsonb(campaign["generation_config"]), campaign["execution_mode"],
                     f"phase4e-{public_id}-chunk-{chunk.chunk_number:06d}",
                 ),
-            )
+            ).fetchone()
+            if batch is None:
+                raise CampaignError("child Batch preparation did not persist")
+            if is_luna:
+                chunk_records = _records_for_chunk(connection, dict(batch))
+                requests = _luna_prepared_requests(dict(campaign), chunk_records)
+                directory = _chunk_directory(public_id, chunk.chunk_number)
+                request_bytes = b"".join(
+                    (json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+                    for item in requests
+                )
+                if len(requests) > MAX_OPENAI_BATCH_REQUESTS:
+                    raise CampaignError("prepared Luna Batch exceeds OpenAI's request-count limit")
+                if len(request_bytes) > MAX_OPENAI_BATCH_FILE_BYTES:
+                    raise CampaignError("prepared Luna Batch exceeds OpenAI's input-file size limit")
+                directory.mkdir(parents=True, exist_ok=True)
+                request_path = directory / "requests.jsonl"
+                plan_path = directory / "plan.json"
+                if request_path.exists() and request_path.read_bytes() != request_bytes:
+                    raise CampaignError("prepared Luna request file conflicts with this chunk")
+                request_path.write_bytes(request_bytes)
+                request_sha256 = _hash_file(request_path)
+                plan = {
+                    "provider": "openai",
+                    "endpoint": "/v1/responses",
+                    "campaign_public_id": public_id,
+                    "chunk_number": chunk.chunk_number,
+                    "record_count": chunk.record_count,
+                    "record_set_sha256": chunk.record_set_sha256,
+                    "request_file_sha256": request_sha256,
+                    "provenance": {
+                        key: campaign[key]
+                        for key in (
+                            "provider", "configured_model", "prompt_version", "prompt_sha256",
+                            "canonical_schema_sha256", "prediction_contract_sha256",
+                            "provider_schema_sha256", "generation_config", "execution_mode",
+                        )
+                    },
+                }
+                plan_bytes = (json.dumps(plan, indent=2, sort_keys=True) + "\n").encode("utf-8")
+                if plan_path.exists() and plan_path.read_bytes() != plan_bytes:
+                    raise CampaignError("prepared Luna plan conflicts with this chunk")
+                plan_path.write_bytes(plan_bytes)
+                connection.execute(
+                    "UPDATE ai_annotation_campaign_batches "
+                    "SET provider_input_file_sha256=%s WHERE id=%s",
+                    (request_sha256, batch["id"]),
+                )
         if not count:
             raise CampaignError("campaign contains no records to chunk")
+        if is_luna:
+            pricing = load_pricing(ROOT / "config/llm_eval/pricing.yaml")
+            rates = pricing["models"]["openai:gpt-6-luna"]["modes"]["batch"]
+            output_estimate = int(campaign["planned_count"]) * 150
+            input_cost = estimated * float(rates["input_per_million_usd"]) / 1_000_000
+            output_cost = output_estimate * float(rates["output_per_million_usd"]) / 1_000_000
+            processing_estimate = input_cost + output_cost
+            estimate_note = "Prepared request bytes estimated at UTF-8 bytes/3; output planning allowance 150 tokens/record; actual charges use returned provider usage."
+        else:
+            output_estimate = int(campaign["estimated_output_tokens"] or 0)
+            processing_estimate = campaign["estimated_processing_cost_usd"]
+            estimate_note = None
         updated = connection.execute(
             """
             UPDATE ai_annotation_campaigns SET orchestration_mode='CHUNKED',
               orchestration_status='PLANNED',chunk_planner_version=%s,
               max_chunk_records=%s,enqueued_token_ceiling=%s,
               enqueued_token_safety_factor=%s,
+              estimated_input_tokens=%s,estimated_cached_input_tokens=%s,
+              estimated_uncached_input_tokens=%s,estimated_output_tokens=%s,
+              estimated_processing_cost_usd=%s,estimated_cache_storage_cost_usd=%s,
+              estimated_total_cost_usd=%s,
               operational_metadata=operational_metadata || %s
             WHERE id=%s RETURNING *
             """,
             (
                 CHUNK_PLANNER_VERSION, max_chunk_records, enqueued_token_ceiling,
-                safety_factor, Jsonb({"phase4e": {"chunk_count": count,
+                safety_factor,
+                estimated if is_luna else campaign["estimated_input_tokens"],
+                0 if is_luna else campaign["estimated_cached_input_tokens"],
+                estimated if is_luna else campaign["estimated_uncached_input_tokens"],
+                output_estimate,
+                processing_estimate,
+                0 if is_luna else campaign["estimated_cache_storage_cost_usd"],
+                processing_estimate if is_luna else campaign["estimated_total_cost_usd"],
+                Jsonb({"phase4e": {"chunk_count": count,
                     "estimated_full_input_tokens": estimated,
-                    "safe_active_token_ceiling": safe_tokens}}), campaign["id"],
+                    "safe_active_token_ceiling": safe_tokens,
+                    "estimate_method": estimate_note,
+                    "pricing_effective_date": pricing.get("effective_date") if is_luna else None}}), campaign["id"],
             ),
         ).fetchone()
         assert updated is not None
@@ -581,8 +861,6 @@ def authorize_full_production(
     spend_ceiling_usd: Decimal,
 ) -> dict[str, Any]:
     _require_admin(principal)
-    if confirmation != FULL_PRODUCTION_CONFIRMATION:
-        raise CampaignError(f"authorization requires typing {FULL_PRODUCTION_CONFIRMATION}")
     with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
         campaign = connection.execute(
             "SELECT * FROM ai_annotation_campaigns WHERE public_id::text=%s FOR UPDATE",
@@ -592,7 +870,17 @@ def authorize_full_production(
             raise LookupError("AI annotation campaign not found")
         if campaign["orchestration_status"] != "PLANNED" or campaign["authorized_at"] is not None:
             raise CampaignError("campaign is not awaiting full-production authorization")
-        if _campaign_configuration(dict(campaign)).prediction_task != "policy":
+        configuration = _campaign_configuration(dict(campaign))
+        expected_confirmation = (
+            LUNA_PRODUCTION_CONFIRMATION
+            if configuration.configuration_id == LUNA_PRODUCTION_CONFIGURATION_ID
+            else FULL_PRODUCTION_CONFIRMATION
+        )
+        if confirmation != expected_confirmation:
+            raise CampaignError(f"authorization requires typing {expected_confirmation}")
+        if configuration.prediction_task != "policy" and (
+            configuration.configuration_id != LUNA_PRODUCTION_CONFIGURATION_ID
+        ):
             raise CampaignError("full production orchestration is only supported for policy campaigns")
         estimate = Decimal(str(campaign["estimated_total_cost_usd"] or 0))
         if spend_ceiling_usd < estimate:
@@ -615,6 +903,8 @@ def authorize_full_production(
             ),
             "total_cost_usd": str(estimate),
         }
+        identity["record_set_sha256"] = campaign["record_set_sha256"]
+        identity["corpus_run_name"] = "phase1-full-20260723-v4" if configuration.configuration_id == LUNA_PRODUCTION_CONFIGURATION_ID else None
         updated = connection.execute(
             """
             UPDATE ai_annotation_campaigns SET status='READY',orchestration_status='RUNNING',
@@ -648,6 +938,55 @@ def set_orchestration_paused(
         if row is None:
             raise CampaignError("campaign orchestration cannot make that pause transition")
         return dict(row)
+
+
+def refresh_campaign_batch_status(
+    settings: WebSettings,
+    principal: Principal,
+    public_id: str,
+    *,
+    gateway: OpenAIBatchGateway | None = None,
+) -> int:
+    """Refresh already-submitted OpenAI batches; this function cannot submit or retry."""
+    _require_admin(principal)
+    provider = gateway or OpenAIBatchGateway()
+    refreshed = 0
+    with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
+        campaign = connection.execute(
+            "SELECT id,configuration_id FROM ai_annotation_campaigns WHERE public_id::text=%s",
+            (public_id,),
+        ).fetchone()
+        if campaign is None:
+            raise LookupError("AI annotation campaign not found")
+        if campaign["configuration_id"] != LUNA_PRODUCTION_CONFIGURATION_ID:
+            raise CampaignError("read-only Batch refresh is available for Luna production campaigns")
+        chunks = connection.execute(
+            """SELECT id,chunk_number,provider_job_id FROM ai_annotation_campaign_batches
+               WHERE campaign_id=%s AND status IN ('SUBMITTED','RUNNING')
+               ORDER BY chunk_number""",
+            (campaign["id"],),
+        ).fetchall()
+        for chunk in chunks:
+            batch = provider.retrieve(str(chunk["provider_job_id"]))
+            state = str(batch.get("status") or "unknown")
+            terminal = state in {"completed", "failed", "cancelled", "expired"}
+            target = "PROVIDER_COMPLETED" if terminal else "RUNNING" if state == "in_progress" else "SUBMITTED"
+            counts = batch.get("request_counts")
+            counts = counts if isinstance(counts, dict) else {}
+            connection.execute(
+                """UPDATE ai_annotation_campaign_batches SET status=%s,provider_state=%s,
+                   provider_success_count=%s,provider_failure_count=%s,
+                   provider_output_file_id=COALESCE(provider_output_file_id,%s),
+                   provider_error_file_id=COALESCE(provider_error_file_id,%s),
+                   provider_completed_at=CASE WHEN %s THEN COALESCE(provider_completed_at,now()) ELSE provider_completed_at END,
+                   failure_metadata=CASE WHEN %s THEN failure_metadata || %s ELSE failure_metadata END
+                   WHERE id=%s""",
+                (target, state, int(counts.get("completed") or 0), int(counts.get("failed") or 0),
+                 batch.get("output_file_id"), batch.get("error_file_id"), terminal,
+                 state in {"failed", "cancelled", "expired"}, Jsonb({"provider_error": batch.get("errors")}), chunk["id"]),
+            )
+            refreshed += 1
+    return refreshed
 
 
 def _records_for_chunk(
@@ -740,7 +1079,7 @@ def _finalize_main_pass(
                 yield str(row["record_id"])
 
     pricing = load_pricing(ROOT / "config/llm_eval/pricing.yaml")
-    pricing_entry = pricing["models"][f"gemini:{campaign['configured_model']}"]
+    pricing_entry = pricing["models"][f"{campaign['provider']}:{campaign['configured_model']}"]
     provenance = {
         "provider": campaign["provider"],
         "model": campaign["configured_model"],
@@ -797,7 +1136,12 @@ def _finalize_main_pass(
             coverage["successful_provider_responses"],
             coverage["failed_provider_responses"],
             coverage["valid_structured_predictions"],
-            coverage["invalid_structured_predictions"],
+            max(
+                0,
+                int(coverage["planned_requests"])
+                - int(coverage["valid_structured_predictions"])
+                - int(coverage.get("provider_refused") or 0),
+            ),
             Jsonb(
                 {
                     "coverage": coverage,
@@ -817,7 +1161,7 @@ def _orchestration_tick_locked(
     settings: WebSettings,
     public_id: str,
     *,
-    gateway: GeminiGateway | None = None,
+    gateway: Any | None = None,
 ) -> TickResult:
     """Advance one state while the caller holds this campaign's session lock.
 
@@ -923,9 +1267,35 @@ def _orchestration_tick_locked(
         if chunk_row is None:
             return TickResult("idle", public_id)
         chunk = dict(chunk_row)
-        provider = gateway or LiveGeminiGateway()
+        is_luna = campaign.get("configuration_id") == LUNA_PRODUCTION_CONFIGURATION_ID
+        provider: Any = gateway if gateway is not None else (OpenAIBatchGateway() if is_luna else LiveGeminiGateway())
 
         if chunk["status"] in {"SUBMITTED", "RUNNING"}:
+            if is_luna:
+                batch = provider.retrieve(str(chunk["provider_job_id"]))
+                state = str(batch.get("status") or "unknown")
+                target = (
+                    "PROVIDER_COMPLETED" if state in {"completed", "failed", "cancelled", "expired"}
+                    else "RUNNING" if state == "in_progress"
+                    else "SUBMITTED"
+                )
+                request_counts = batch.get("request_counts")
+                request_counts = request_counts if isinstance(request_counts, dict) else {}
+                connection.execute(
+                    """UPDATE ai_annotation_campaign_batches SET status=%s,provider_state=%s,
+                       provider_success_count=%s,provider_failure_count=%s,
+                       provider_output_file_id=COALESCE(provider_output_file_id,%s),
+                       provider_error_file_id=COALESCE(provider_error_file_id,%s),
+                       provider_completed_at=CASE WHEN %s THEN COALESCE(provider_completed_at,now())
+                         ELSE provider_completed_at END,
+                       failure_metadata=CASE WHEN %s THEN failure_metadata || %s ELSE failure_metadata END
+                       WHERE id=%s""",
+                    (target, state, int(request_counts.get("completed") or 0),
+                     int(request_counts.get("failed") or 0), batch.get("output_file_id"),
+                     batch.get("error_file_id"), state in {"completed", "failed", "cancelled", "expired"},
+                     state in {"failed", "cancelled", "expired"}, Jsonb({"provider_error": batch.get("errors")}), chunk["id"]),
+                )
+                return TickResult("refreshed", public_id, int(chunk["chunk_number"]), target)
             status = parse_batch_status(provider.status(str(chunk["provider_job_id"])))
             target = "PROVIDER_COMPLETED" if status["successful_terminal"] else (
                 "FAILED" if status["terminal"] else "RUNNING"
@@ -949,13 +1319,32 @@ def _orchestration_tick_locked(
             raise CampaignError("child Batch membership no longer matches its immutable range")
 
         if chunk["status"] == "PROVIDER_COMPLETED":
-            plan = _provider_plan(
-                campaign, records, expected_record_set_sha256=str(chunk["record_set_sha256"]),
-                cache_identifier=str(chunk["cache_identifier"]),
-                display_name=str(chunk["submission_display_name"]),
-            )
             directory = _chunk_directory(public_id, int(chunk["chunk_number"]))
-            if directory.exists():
+            if is_luna:
+                try:
+                    plan = json.loads((directory / "plan.json").read_text(encoding="utf-8"))
+                    regenerated = _luna_prepared_requests(campaign, records)
+                    request_bytes = b"".join(
+                        (json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+                        for item in regenerated
+                    )
+                    if (
+                        not isinstance(plan, dict)
+                        or plan.get("record_set_sha256") != chunk["record_set_sha256"]
+                        or plan.get("request_file_sha256") != chunk["provider_input_file_sha256"]
+                        or _hash_file(directory / "requests.jsonl") != chunk["provider_input_file_sha256"]
+                        or hashlib.sha256(request_bytes).hexdigest() != chunk["provider_input_file_sha256"]
+                    ):
+                        raise CampaignError("prepared Luna request identity no longer matches stored provenance")
+                except (OSError, ValueError, TypeError) as error:
+                    raise CampaignError("prepared Luna request artifact is missing or invalid") from error
+            else:
+                plan = _provider_plan(
+                    campaign, records, expected_record_set_sha256=str(chunk["record_set_sha256"]),
+                    cache_identifier=str(chunk["cache_identifier"]),
+                    display_name=str(chunk["submission_display_name"]),
+                )
+            if (directory / "summary.json").exists():
                 try:
                     stored_plan = json.loads(
                         (directory / "plan.json").read_text(encoding="utf-8")
@@ -975,39 +1364,45 @@ def _orchestration_tick_locked(
                         "existing child artifact is incomplete or invalid"
                     ) from error
             else:
-                response = provider.status(str(chunk["provider_job_id"]))
-                results, coverage = collect_inline_batch(
-                    batch_value=response,
-                    plan=plan,
-                    domain_codes=_production_domain_codes(),
-                )
-                directory.mkdir(parents=True, exist_ok=False)
-                pricing = load_pricing(ROOT / "config/llm_eval/pricing.yaml")
-                summary = _collection_summary(
-                    response,
-                    plan,
-                    results,
-                    coverage,
-                    pricing,
-                    _cache_receipt_for_chunk(chunk),
-                )
-                (directory / "plan.json").write_text(
-                    json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-                )
-                requests = plan["request"]["batch"]["input_config"]["requests"][
-                    "requests"
-                ]
-                (directory / "requests.jsonl").write_text(
-                    "".join(
-                        json.dumps(request, ensure_ascii=False, sort_keys=True) + "\n"
-                        for request in requests
-                    ),
-                    encoding="utf-8",
-                )
-                (directory / "provider_response.json").write_text(
-                    json.dumps(response, indent=2, sort_keys=True) + "\n",
-                    encoding="utf-8",
-                )
+                if is_luna:
+                    results, summary = _collect_openai_chunk(
+                        cast(OpenAIBatchGateway, provider), chunk=chunk, directory=directory, records=records
+                    )
+                    summary["provenance"].update(plan["provenance"])
+                    summary["provenance"].update({
+                        "prompt_version": campaign["prompt_version"],
+                        "prompt_sha256": campaign["prompt_sha256"],
+                        "canonical_schema_sha256": campaign["canonical_schema_sha256"],
+                        "prediction_contract_sha256": campaign["prediction_contract_sha256"],
+                        "provider_schema_sha256": campaign["provider_schema_sha256"],
+                        **campaign["generation_config"],
+                        "execution_mode": campaign["execution_mode"],
+                        "record_count": len(records),
+                        "record_ids_sha256": canonical_hash([record["record_id"] for record in records]),
+                    })
+                else:
+                    response = provider.status(str(chunk["provider_job_id"]))
+                    results, coverage = collect_inline_batch(
+                        batch_value=response, plan=plan,
+                        domain_codes=_production_domain_codes(),
+                    )
+                    directory.mkdir(parents=True, exist_ok=True)
+                    pricing = load_pricing(ROOT / "config/llm_eval/pricing.yaml")
+                    summary = _collection_summary(
+                        response, plan, results, coverage, pricing,
+                        _cache_receipt_for_chunk(chunk),
+                    )
+                    (directory / "plan.json").write_text(
+                        json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+                    )
+                    requests = plan["request"]["batch"]["input_config"]["requests"]["requests"]
+                    (directory / "requests.jsonl").write_text(
+                        "".join(json.dumps(request, ensure_ascii=False, sort_keys=True) + "\n" for request in requests),
+                        encoding="utf-8",
+                    )
+                    (directory / "provider_response.json").write_text(
+                        json.dumps(response, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+                    )
                 (directory / "predictions.jsonl").write_text(
                     "".join(
                         json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
@@ -1035,18 +1430,23 @@ def _orchestration_tick_locked(
                 """
                 UPDATE ai_annotation_campaign_batches SET status='COLLECTED',collected_at=now(),
                   artifact_reference=%s,artifact_sha256=%s,valid_count=%s,repaired_count=%s,
-                  invalid_count=%s,
+                  invalid_count=%s,provider_failure_count=%s,evidence_failure_count=%s,
                   missing_count=%s,duplicate_count=%s,input_tokens=%s,cached_input_tokens=%s,
-                  output_tokens=%s,reasoning_tokens=%s,processing_cost_usd=%s,cache_cost_usd=%s
+                  output_tokens=%s,reasoning_tokens=%s,processing_cost_usd=%s,cache_cost_usd=%s,
+                  provider_output_file_sha256=%s,provider_error_file_sha256=%s
                 WHERE id=%s AND status='PROVIDER_COMPLETED'
                 """,
                 (str(directory), digest, summary_coverage["valid_structured_predictions"],
                  structural_repair_count(results, _production_domain_codes()),
                  summary_coverage["invalid_structured_predictions"],
+                 summary_coverage["failed_provider_responses"],
+                 summary_coverage.get("evidence_resolution_failures", 0),
                  summary_coverage["missing_responses"],
                  summary_coverage["duplicate_mappings"], token["input_tokens"], token["cached_input_tokens"],
                  token["output_tokens"], token["reasoning_tokens"], cost["token_processing_cost_usd"],
-                 cost["explicit_cache_storage_cost_usd"], chunk["id"]),
+                 cost["explicit_cache_storage_cost_usd"],
+                 summary["provenance"].get("output_file_sha256"),
+                 summary["provenance"].get("error_file_sha256"), chunk["id"]),
             )
             return TickResult("collected", public_id, int(chunk["chunk_number"]))
 
@@ -1077,16 +1477,19 @@ def _orchestration_tick_locked(
                 "spend-ceiling", public_id, int(chunk["chunk_number"])
             )
 
-    worker_principal = Principal(
-        user_id=int(campaign["authorized_by_user_id"]), public_id=campaign["public_id"],
-        username="phase4e-worker", display_name="Phase 4E worker", must_change_password=False,
-        is_admin=True, session_id=0, csrf_token="worker",
-    )
-    prior_cache_identifier = campaign.get("cache_identifier")
-    prior_cache_was_reusable = cache_plan_status(campaign) == "REUSABLE"
-    ensured_campaign = ensure_campaign_cache(
-        settings, worker_principal, public_id, gateway=provider
-    )
+    if is_luna:
+        ensured_campaign = campaign
+    else:
+        worker_principal = Principal(
+            user_id=int(campaign["authorized_by_user_id"]), public_id=campaign["public_id"],
+            username="phase4e-worker", display_name="Phase 4E worker", must_change_password=False,
+            is_admin=True, session_id=0, csrf_token="worker",
+        )
+        prior_cache_identifier = campaign.get("cache_identifier")
+        prior_cache_was_reusable = cache_plan_status(campaign) == "REUSABLE"
+        ensured_campaign = ensure_campaign_cache(
+            settings, worker_principal, public_id, gateway=cast(GeminiGateway, provider)
+        )
     with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
         campaign = dict(ensured_campaign)
         current_chunk = connection.execute(
@@ -1110,17 +1513,71 @@ def _orchestration_tick_locked(
                 "cache_verified_at", "cache_metadata",
             )
         }
+        if is_luna:
+            directory = _chunk_directory(public_id, int(chunk["chunk_number"]))
+            request_path = directory / "requests.jsonl"
+            request_sha256 = _hash_file(request_path)
+            regenerated = _luna_prepared_requests(campaign, records)
+            regenerated_bytes = b"".join(
+                (json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+                for item in regenerated
+            )
+            if request_sha256 != chunk["provider_input_file_sha256"] or hashlib.sha256(regenerated_bytes).hexdigest() != request_sha256:
+                raise CampaignError("prepared Luna request file no longer matches campaign provenance")
+            plan = json.loads((directory / "plan.json").read_text(encoding="utf-8"))
+            found = provider.find_batch(public_id, int(chunk["chunk_number"]))
+            provider_job_id = found.get("id") if isinstance(found, dict) else None
+            batch_state = str(found.get("status") or "validating") if isinstance(found, dict) else "validating"
+            failure_metadata = chunk.get("failure_metadata")
+            submission_uncertain = isinstance(failure_metadata, dict) and bool(failure_metadata.get("submission_outcome_uncertain"))
+            if provider_job_id is None and submission_uncertain:
+                return TickResult("awaiting-submission-reconciliation", public_id, int(chunk["chunk_number"]))
+            input_file_id = chunk.get("provider_input_file_id")
+            if provider_job_id is None:
+                if not isinstance(input_file_id, str):
+                    try:
+                        input_file_id = provider.upload_requests(request_path)
+                        connection.execute(
+                            "UPDATE ai_annotation_campaign_batches SET provider_input_file_id=%s WHERE id=%s AND provider_input_file_id IS NULL",
+                            (input_file_id, chunk["id"]),
+                        )
+                    except Exception as error:
+                        connection.execute(
+                            """UPDATE ai_annotation_campaign_batches SET retry_count=retry_count+1,
+                               status=CASE WHEN retry_count>=2 THEN 'FAILED' ELSE 'PENDING' END,
+                               failure_metadata=failure_metadata || %s WHERE id=%s AND status='SUBMITTING'""",
+                            (Jsonb({"input_file_upload_error": str(error)[:1000]}), chunk["id"]),
+                        )
+                        return TickResult("input-upload-failed", public_id, int(chunk["chunk_number"]))
+                try:
+                    submitted = provider.submit(
+                        str(input_file_id), campaign_id=public_id,
+                        chunk_number=int(chunk["chunk_number"]),
+                    )
+                    provider_job_id = submitted.get("id")
+                    if not isinstance(provider_job_id, str):
+                        raise CampaignError("OpenAI Batch response omitted the batch id")
+                    batch_state = str(submitted.get("status") or "validating")
+                except Exception as error:
+                    connection.execute(
+                        """UPDATE ai_annotation_campaign_batches
+                           SET failure_metadata=failure_metadata || %s
+                           WHERE id=%s AND status='SUBMITTING' AND provider_job_id IS NULL""",
+                        (Jsonb({"submission_outcome_uncertain": True, "submission_error": str(error)[:1000]}), chunk["id"]),
+                    )
+                    return TickResult("submission-uncertain", public_id, int(chunk["chunk_number"]))
+            connection.execute(
+                """UPDATE ai_annotation_campaign_batches SET status='SUBMITTED',provider_job_id=%s,
+                   provider_state=%s,submitted_at=COALESCE(submitted_at,now())
+                   WHERE id=%s AND status='SUBMITTING' AND provider_job_id IS NULL""",
+                (provider_job_id, batch_state, chunk["id"]),
+            )
+            return TickResult("submitted", public_id, int(chunk["chunk_number"]), provider_job_id)
+
         raw_cache_metadata = cache["cache_metadata"]
         cache["cache_metadata"] = {
-            **(
-                cast(dict[str, Any], raw_cache_metadata)
-                if isinstance(raw_cache_metadata, dict)
-                else {}
-            ),
-            "created_for_phase4e_chunk": (
-                not prior_cache_was_reusable
-                or cache["cache_identifier"] != prior_cache_identifier
-            ),
+            **(cast(dict[str, Any], raw_cache_metadata) if isinstance(raw_cache_metadata, dict) else {}),
+            "created_for_phase4e_chunk": (not prior_cache_was_reusable or cache["cache_identifier"] != prior_cache_identifier),
         }
         plan = _provider_plan(campaign, records, expected_record_set_sha256=str(chunk["record_set_sha256"]), cache_identifier=str(cache["cache_identifier"]), display_name=str(chunk["submission_display_name"]))
         finder = cast(BatchFinder, provider)
@@ -1182,7 +1639,7 @@ def orchestration_tick(
     settings: WebSettings,
     public_id: str,
     *,
-    gateway: GeminiGateway | None = None,
+    gateway: Any | None = None,
 ) -> TickResult:
     """Advance one state while holding a session lock across any provider operation."""
     with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as lock_connection:

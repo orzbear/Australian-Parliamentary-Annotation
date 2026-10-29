@@ -13,11 +13,27 @@
   {% endfor %}
 </nav>
 
+{% if selected_run.prediction_task == 'hostility' %}
+<form method="get" class="surface mt-5 grid gap-3 p-4 sm:grid-cols-3" aria-label="Filter hostility predictions">
+  <input type="hidden" name="status" value="{{ active_filter }}">
+  {% if random_sample %}<input type="hidden" name="random_sample" value="true"><input type="hidden" name="sample_seed" value="{{ sample_seed }}">{% endif %}
+  <label>Hostility<select name="hostility_present"><option value="">Any prediction</option>{% for value in ['YES','NO','UNSURE'] %}<option value="{{ value }}" {% if hostility_present == value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></label>
+  <label>Target<select name="hostility_target"><option value="">Any target</option>{% for value in ['OPPOSING_PARTISAN_TARGET','OTHER_POLITICAL_TARGET','NON_POLITICAL_TARGET','UNSURE'] %}<option value="{{ value }}" {% if hostility_target == value %}selected{% endif %}>{{ value|replace('_',' ')|title }}</option>{% endfor %}</select></label>
+  <label>AU policy domain<select name="primary_domain"><option value="">Any domain</option>{% for value in ['AU01','AU02','AU03','AU04','AU05','AU06','AU07','AU08','AU09','AU10','AU11','AU12','AU13','AU14'] %}<option value="{{ value }}" {% if primary_domain == value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></label>
+  <label>Failure type<select name="hostility_failure"><option value="">All outcomes</option><option value="evidence" {% if hostility_failure == 'evidence' %}selected{% endif %}>Evidence resolution failure</option><option value="provider" {% if hostility_failure == 'provider' %}selected{% endif %}>Provider/API failure</option><option value="structured" {% if hostility_failure == 'structured' %}selected{% endif %}>Invalid structured output</option></select></label>
+  <label>Speech year<input type="number" name="year" min="1901" max="2100" value="{{ year }}"></label>
+  <label>Frozen sample<select name="sample"><option value="">All records</option><option value="development" {% if sample == 'development' %}selected{% endif %}>Development 100</option><option value="confirmation" {% if sample == 'confirmation' %}selected{% endif %}>Luna confirmation 100</option></select></label>
+  <div class="flex items-end gap-2"><button class="btn btn-secondary" type="submit">Apply filters</button><button class="btn btn-secondary" type="submit" name="random_sample" value="true">Random 100</button><a class="btn btn-quiet" href="/ai-review/{{ selected_run.public_id }}?status={{ active_filter }}">Clear</a></div>
+  <p class="text-xs text-muted sm:col-span-3">For hostility runs, AU domain uses the latest available policy prediction for that same turn. Frozen sample filters use the committed sample files.</p>
+  {% if random_sample %}<p class="text-xs text-muted sm:col-span-3">Deterministic random review order for seed <code>{{ sample_seed }}</code>; this is an operational review queue, not a research sample.</p>{% endif %}
+</form>
+{% endif %}
+
 <section class="mt-6" aria-labelledby="review-queue-heading">
   <div class="flex flex-wrap items-end justify-between gap-3"><div><p class="eyebrow">Selected project queue</p><h2 id="review-queue-heading" class="mt-1 text-2xl font-semibold">{{ rows|length }} records loaded</h2><p class="mt-1 text-sm text-muted">The queue loads up to 100 records at a time. Use Submit &amp; next to continue through the selected run.</p></div>{% if principal.is_admin %}<a class="btn btn-secondary" href="/exports#run-{{ selected_run.public_id }}">Review exports</a>{% endif %}</div>
   <div class="surface mt-4 overflow-x-auto">
     {% if rows %}<table><thead><tr><th>Speech</th><th>Prediction</th><th>Run</th><th>Review</th><th></th></tr></thead><tbody>
-    {% for row in rows %}<tr class="review-table-row"><td><a class="font-semibold text-brand" href="/ai-review/{{ selected_run.public_id }}/{{ row.prediction_id }}">{{ row.speaker_name_raw or 'Unknown speaker' }}</a><br><small>{{ row.speech_date }} · {{ row.major_heading_original }}</small></td><td>{% if row.ai_unavailable %}Hostility · AI unavailable{% elif row.prediction_task == 'hostility' %}Hostility · {{ row.hostility_present }}{% else %}{{ 'Non-Policy' if row.is_non_policy else 'Policy' }}{% if row.primary_domain_display %}<br><small>{{ row.primary_domain_display }}</small>{% endif %}{% endif %}</td><td><small>{{ row.run_id }}</small></td><td>{{ badge(row.review_status or 'unreviewed') }}</td><td><a class="btn btn-primary" href="/ai-review/{{ selected_run.public_id }}/{{ row.prediction_id }}">Review</a></td></tr>{% endfor %}
+    {% for row in rows %}<tr class="review-table-row"><td><a class="font-semibold text-brand" href="/ai-review/{{ selected_run.public_id }}/{{ row.prediction_id }}">{{ row.speaker_name_raw or 'Unknown speaker' }}</a><br><small>{{ row.speech_date }} · {{ row.major_heading_original }}</small></td><td>{% if row.ai_unavailable %}Hostility · AI unavailable{% if row.ai_failure_reason %}<br><small>{{ row.ai_failure_reason|replace('_',' ')|title }}</small>{% endif %}{% elif row.prediction_task == 'hostility' %}Hostility · {{ row.hostility_present }}{% else %}{{ 'Non-Policy' if row.is_non_policy else 'Policy' }}{% if row.primary_domain_display %}<br><small>{{ row.primary_domain_display }}</small>{% endif %}{% endif %}</td><td><small>{{ row.run_id }}</small></td><td>{{ badge(row.review_status or 'unreviewed') }}</td><td><a class="btn btn-primary" href="/ai-review/{{ selected_run.public_id }}/{{ row.prediction_id }}">Review</a></td></tr>{% endfor %}
     </tbody></table>{% else %}<div class="empty-state m-6"><p>No records match this review filter.</p></div>{% endif %}
   </div>
 </section>

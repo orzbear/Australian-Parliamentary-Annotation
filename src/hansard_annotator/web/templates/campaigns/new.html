@@ -10,11 +10,11 @@
     {{ csrf(principal) }}
     <fieldset><legend>AI annotation configuration</legend><div class="choice-stack mt-3">
     {% for item in configurations %}
-      <label class="choice-card"><input type="radio" name="configuration_id" value="{{ item.configuration_id }}" {% if loop.first %}checked{% endif %}><span><strong>{{ item.display_label }}</strong><small>{{ item.description }}</small><small>Task: {{ item.prediction_task }} · Schema: {{ item.annotation_schema_slug }} {{ item.annotation_schema_version }} · Prompt: {{ item.prompt_version }} · Model: {{ item.configured_model }}</small>{% if item.record_set_mode == 'frozen_sample' %}<small>Record set: Hostility held-out 100 · {{ item.record_set_size }} records · frozen validation sample</small>{% else %}<small>Record set: deterministic corpus selection configured after draft creation</small>{% endif %}</span></label>
+      <label class="choice-card"><input type="radio" name="configuration_id" value="{{ item.configuration_id }}" {% if loop.first %}checked{% endif %}><span><strong>{{ item.display_label }}</strong><small>{{ item.description }}</small><small>Task: {{ item.prediction_task }} · Schema: {{ item.annotation_schema_slug }} {{ item.annotation_schema_version }} · Prompt: {{ item.prompt_version }} · Model: {{ item.configured_model }}</small>{% if item.configuration_id == 'hostility-luna-production-v1' %}<small>Full corpus: active phase1-full-20260723-v4; fixed Luna V1 production configuration; paid Batch launch requires separate typed confirmation.</small>{% elif item.record_set_mode == 'frozen_sample' %}<small>Record set: {% if item.record_set_id == 'hostility-heldout-100' %}Hostility held-out 100{% else %}{{ item.record_set_id }}{% endif %} · {{ item.record_set_size }} frozen records</small>{% else %}<small>Record set: deterministic corpus selection configured after draft creation</small>{% endif %}</span></label>
     {% endfor %}
     </div></fieldset>
     <div><label for="name">Campaign name</label><input id="name" name="name" required></div>
-    <div><label for="corpus">Corpus</label><select id="corpus" name="corpus_id">{% for corpus in corpora %}<option value="{{ corpus.id }}">{{ corpus.name }}</option>{% endfor %}</select></div>
+    <div><label for="corpus">Corpus</label><select id="corpus" name="corpus_id">{% for corpus in corpora %}<option value="{{ corpus.id }}">{{ corpus.name }} — {{ corpus.run_name or 'no active preprocessing run' }}</option>{% endfor %}</select></div>
     <p class="help">The server freezes the selected configuration and its allowed record-set rules. Credential values and technical hashes are never editable here.</p>
     <button class="btn btn-primary" type="submit">Create draft campaign</button>
   </form>

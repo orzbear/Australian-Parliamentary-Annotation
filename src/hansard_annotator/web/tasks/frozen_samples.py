@@ -30,10 +30,14 @@ class FrozenSample(BaseModel):
 
     schema_version: Literal["1"]
     sample_id: str = Field(pattern=r"^[a-z0-9][a-z0-9-]*$")
-    purpose: Literal["HOSTILITY_DEVELOPMENT", "HOSTILITY_HELDOUT_VALIDATION"]
+    purpose: Literal[
+        "HOSTILITY_DEVELOPMENT",
+        "HOSTILITY_HELDOUT_VALIDATION",
+        "HOSTILITY_LUNA_CONFIRMATION",
+    ]
     version: str | None = None
     sample_version: str | None = None
-    sample_role: Literal["development", "heldout_validation"] | None = None
+    sample_role: Literal["development", "heldout_validation", "confirmation"] | None = None
     source_frame_path: str | None = None
     eligible_population: list[str] | None = None
     development_sample_exclusion: str | None = None

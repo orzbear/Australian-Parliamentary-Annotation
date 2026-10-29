@@ -10,6 +10,7 @@ from collections import Counter
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Protocol, cast
 from urllib.parse import quote
@@ -49,7 +50,9 @@ from hansard_annotator.llm_eval.ops_cli import (
     _get_gemini_resource,
 )
 from hansard_annotator.llm_eval.prompt import (
+    HOSTILITY_LUNA_PROMPT_VERSION,
     build_system_prompt,
+    build_user_prompt,
     prediction_json_schema,
     prompt_hash,
 )
@@ -57,11 +60,13 @@ from hansard_annotator.llm_eval.providers import _http_json
 from hansard_annotator.web.auth.models import Principal
 from hansard_annotator.web.campaigns.configurations import (
     APPROVED_AI_CONFIGURATIONS,
+    LUNA_PRODUCTION_CONFIGURATION_ID,
     POLICY_CONFIGURATION_ID,
     ApprovedAIConfiguration,
     approved_configuration,
     configuration_for_campaign,
 )
+from hansard_annotator.web.campaigns.openai_batch import OpenAIBatchGateway, luna_batch_request
 from hansard_annotator.web.campaigns.recovery import (
     RecoveryArtifactError,
     artifact_sha256,
@@ -180,7 +185,11 @@ def production_configuration() -> dict[str, Any]:
 
 
 def approved_campaign_configurations() -> list[dict[str, Any]]:
-    return [value.persistence_values() for value in APPROVED_AI_CONFIGURATIONS.values()]
+    return [
+        value.persistence_values()
+        for value in APPROVED_AI_CONFIGURATIONS.values()
+        if value.execution_mode != "local_evaluation"
+    ]
 
 
 def configuration_class(configuration: dict[str, Any]) -> str:
@@ -395,11 +404,29 @@ def selection_breakdown(
 
 
 def estimate_plan(
-    records: int, *, model: str = APPROVED_PRODUCTION_MODEL
+    records: int, *, model: str = APPROVED_PRODUCTION_MODEL, provider: str = "gemini"
 ) -> dict[str, float | int]:
     pricing = load_pricing(ROOT / "config/llm_eval/pricing.yaml")
-    entry = pricing["models"][f"gemini:{model}"]
+    entry = pricing["models"][f"{provider}:{model}"]
     rates = entry["modes"]["batch"]
+    if provider == "openai":
+        # Planning estimate only. Prepared request text replaces the input estimate
+        # during chunk preparation; output usage is bounded by the frozen 1,000-token cap.
+        input_tokens = 1_000 * records
+        output_tokens = 150 * records
+        processing = (
+            input_tokens * float(rates["input_per_million_usd"])
+            + output_tokens * float(rates["output_per_million_usd"])
+        ) / 1_000_000
+        return {
+            "input_tokens": input_tokens,
+            "cached_input_tokens": 0,
+            "uncached_input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "token_processing_cost_usd": processing,
+            "explicit_cache_storage_cost_usd": 0.0,
+            "estimated_total_cost_usd": processing,
+        }
     estimate = simulate_costs(
         records=records,
         input_tokens_per_record=INPUT_TOKENS_PER_RECORD,
@@ -720,7 +747,12 @@ def list_corpora(settings: WebSettings) -> list[dict[str, Any]]:
         return [
             dict(row)
             for row in connection.execute(
-                "SELECT id,public_id,slug,name FROM corpora WHERE is_active ORDER BY name"
+                """SELECT corpus.id,corpus.public_id,corpus.slug,corpus.name,
+                          run.run_name
+                   FROM corpora corpus
+                   LEFT JOIN preprocessing_runs run
+                     ON run.id=corpus.current_preprocessing_run_id
+                   WHERE corpus.is_active ORDER BY corpus.name"""
             ).fetchall()
         ]
 
@@ -740,8 +772,26 @@ def create_campaign(
         approved = approved_configuration(configuration_id)
     except ValueError as error:
         raise CampaignError(str(error)) from error
+    if approved.execution_mode == "local_evaluation":
+        raise CampaignError(
+            "this frozen confirmation campaign is created only by the local evaluation importer"
+        )
     configuration = approved.persistence_values()
     with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
+        if approved.configuration_id == LUNA_PRODUCTION_CONFIGURATION_ID:
+            corpus_run = connection.execute(
+                """
+                SELECT run.run_name FROM corpora corpus
+                JOIN preprocessing_runs run
+                  ON run.id=corpus.current_preprocessing_run_id
+                WHERE corpus.id=%s AND corpus.is_active
+                """,
+                (corpus_id,),
+            ).fetchone()
+            if corpus_run is None or corpus_run["run_name"] != "phase1-full-20260723-v4":
+                raise CampaignError(
+                    "Luna production is restricted to the active phase1-full-20260723-v4 corpus"
+                )
         reusable = connection.execute(
             """
             SELECT cache_identifier,cache_content_sha256,cache_model,cache_display_name,
@@ -772,8 +822,10 @@ def create_campaign(
                 _cache_display_name(approved.prompt_sha256),
                 int(CACHE_REUSE_MINIMUM.total_seconds()),
             ),
-        ).fetchone()
+        ).fetchone() if approved.provider == "gemini" else None
         cache = dict(reusable) if reusable is not None else {}
+        if approved.provider == "openai":
+            cache["cache_status"] = "NOT_REQUIRED"
         row = connection.execute(
             """
             INSERT INTO ai_annotation_campaigns
@@ -808,7 +860,9 @@ def create_campaign(
                 Jsonb(configuration["generation_config"]),
                 configuration["execution_mode"],
                 "APPROVED_PRODUCTION",
-                "REUSABLE" if cache else "REQUIRED",
+                "NOT_REQUIRED" if approved.provider == "openai" else (
+                    "REUSABLE" if cache else "REQUIRED"
+                ),
                 cache.get("cache_identifier"),
                 cache.get("cache_content_sha256"),
                 cache.get("cache_model"),
@@ -956,9 +1010,12 @@ def get_campaign(
     with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
         row = connection.execute(
             """
-            SELECT campaign.*,corpus.name AS corpus_name,run.public_id AS run_public_id
+            SELECT campaign.*,corpus.name AS corpus_name,run.public_id AS run_public_id,
+                   preprocessing.run_name AS corpus_run_name
             FROM ai_annotation_campaigns campaign
             JOIN corpora corpus ON corpus.id=campaign.corpus_id
+            LEFT JOIN preprocessing_runs preprocessing
+              ON preprocessing.id=corpus.current_preprocessing_run_id
             LEFT JOIN model_prediction_runs run ON run.id=campaign.model_prediction_run_id
             WHERE campaign.public_id::text=%s
             """,
@@ -982,6 +1039,16 @@ def get_campaign(
             )
             result["approved_record_set_size"] = result.get("planned_count")
         result["cache_plan_status"] = cache_plan_status(result)
+        if (
+            approved is not None
+            and approved.configuration_id == LUNA_PRODUCTION_CONFIGURATION_ID
+            and result["status"] == "DRAFT"
+        ):
+            result["luna_eligible_count"] = int(
+                _planning_breakdown(
+                    connection, result, exclude_human_annotated=False
+                )["eligible_count"]
+            )
         selection = cast(dict[str, Any], result.get("selection_definition") or {})
         other_reasons = selection.get("other_exclusion_reasons")
         if not isinstance(other_reasons, dict) and selection.get(
@@ -1057,6 +1124,7 @@ def get_campaign(
               COALESCE(sum(valid_count),0) AS chunk_valid,
               COALESCE(sum(repaired_count),0) AS chunk_repaired,
               COALESCE(sum(invalid_count),0) AS chunk_invalid,
+              COALESCE(sum(evidence_failure_count),0) AS chunk_evidence_failures,
               COALESCE(sum(provider_failure_count),0) AS chunk_provider_failures,
               COALESCE(sum(missing_count),0) AS chunk_missing,
               COALESCE(sum(duplicate_count),0) AS chunk_duplicates,
@@ -1071,6 +1139,14 @@ def get_campaign(
             (row["id"],),
         ).fetchone()
         result["batch_progress"] = dict(batch_progress) if batch_progress else {}
+        if result.get("configuration_id") == LUNA_PRODUCTION_CONFIGURATION_ID:
+            progress = result["batch_progress"]
+            result["retryable_failure_count"] = (
+                int(progress.get("chunk_invalid") or 0)
+                - int(progress.get("chunk_evidence_failures") or 0)
+                + int(progress.get("chunk_provider_failures") or 0)
+                + int(progress.get("chunk_missing") or 0)
+            )
         result["chunk_preview"] = [
             dict(value)
             for value in connection.execute(
@@ -1078,7 +1154,11 @@ def get_campaign(
                 SELECT chunk_number,first_selection_order,last_selection_order,record_count,
                        estimated_input_tokens,status,provider_state,provider_job_id,
                        cache_identifier,valid_count,repaired_count,invalid_count,
-                       missing_count,duplicate_count,processing_cost_usd,cache_cost_usd
+                       evidence_failure_count,provider_failure_count,missing_count,duplicate_count,
+                       processing_cost_usd,cache_cost_usd,
+                       provider_input_file_sha256,provider_input_file_id,
+                       provider_output_file_id,provider_output_file_sha256,
+                       provider_error_file_id,provider_error_file_sha256,retry_count
                 FROM ai_annotation_campaign_batches WHERE campaign_id=%s
                 ORDER BY chunk_number LIMIT 20 OFFSET %s
                 """,
@@ -1187,12 +1267,37 @@ def plan_campaign(
             if limit != configuration.record_set_size:
                 raise CampaignError("frozen hostility sample requires planned_count=100")
             return _plan_frozen_sample_campaign(connection, dict(campaign), configuration)
+        if configuration.configuration_id == LUNA_PRODUCTION_CONFIGURATION_ID:
+            current_run = connection.execute(
+                """
+                SELECT run.run_name FROM corpora corpus
+                JOIN preprocessing_runs run
+                  ON run.id=corpus.current_preprocessing_run_id
+                WHERE corpus.id=%s AND corpus.is_active
+                """,
+                (campaign["corpus_id"],),
+            ).fetchone()
+            if current_run is None or current_run["run_name"] != "phase1-full-20260723-v4":
+                raise CampaignError("Luna production corpus/run identity has changed")
+            if exclude_human_annotated or retry_provider_refusals:
+                raise CampaignError(
+                    "Luna production must include human-annotated turns and cannot retry prior failures during selection"
+                )
+            if seed != "hostility-luna-production-v1":
+                raise CampaignError("Luna production selection seed is frozen")
         breakdown = _planning_breakdown(
             connection,
             dict(campaign),
             exclude_human_annotated=exclude_human_annotated,
             retry_provider_refusals=retry_provider_refusals,
         )
+        if (
+            configuration.configuration_id == LUNA_PRODUCTION_CONFIGURATION_ID
+            and limit != int(breakdown["eligible_count"])
+        ):
+            raise CampaignError(
+                "Luna production plan must include every eligible annotation-ready turn"
+            )
         record_set_hasher = _RecordSetHasher()
         selected_count = 0
         preview: list[dict[str, Any]] = []
@@ -1249,7 +1354,11 @@ def plan_campaign(
                 insert_values,
             )
         record_set_sha256 = record_set_hasher.hexdigest()
-        estimate = estimate_plan(selected_count)
+        estimate = estimate_plan(
+            selected_count,
+            model=configuration.configured_model,
+            provider=configuration.provider,
+        )
         selection = {
             "eligibility_rule": AI_ELIGIBILITY_RULE,
             "exclude_human_annotated": exclude_human_annotated,
@@ -1363,7 +1472,9 @@ def _plan_frozen_sample_campaign(
         """,
         values,
     )
-    estimate = estimate_plan(len(values), model=configuration.configured_model)
+    estimate = estimate_plan(
+        len(values), model=configuration.configured_model, provider=configuration.provider
+    )
     selection = {
         "mode": "frozen_sample",
         "sample_id": sample.sample_id,
@@ -2005,8 +2116,10 @@ def _records_for_recovery(
 
 
 def _recovery_cache(
-    campaign: dict[str, Any], provider: GeminiGateway
+    campaign: dict[str, Any], provider: Any
 ) -> tuple[dict[str, Any], bool]:
+    if campaign.get("configuration_id") == LUNA_PRODUCTION_CONFIGURATION_ID:
+        return {"cache_identifier": None, "cache_metadata": {}}, False
     cache_plan = _canonical_cache_plan(campaign)
     if cache_plan_status(campaign) == "REUSABLE":
         identifier = str(campaign["cache_identifier"])
@@ -2034,13 +2147,26 @@ def _mark_recovery_failed(
         )
 
 
+def _recovery_retry_eligible(result: dict[str, Any], *, is_luna: bool) -> bool:
+    status = result.get("status")
+    if status in {"provider_failure", "missing"}:
+        return True
+    if status != "invalid":
+        return False
+    return not (
+        is_luna
+        and result.get("validation_error")
+        == "hostility evidence must resolve uniquely to canonical text"
+    )
+
+
 def submit_recovery(
     settings: WebSettings,
     principal: Principal,
     public_id: str,
     confirmation: str,
     *,
-    gateway: GeminiGateway | None = None,
+    gateway: Any | None = None,
 ) -> dict[str, Any]:
     """Submit only unresolved invalid/provider-failed records under frozen provenance."""
     _require_admin(principal)
@@ -2059,6 +2185,9 @@ def submit_recovery(
             raise CampaignError("campaign is not eligible for targeted recovery")
         if configuration_class(campaign) != "APPROVED_PRODUCTION":
             raise CampaignError("recovery requires the approved production configuration")
+        is_luna = campaign.get("configuration_id") == LUNA_PRODUCTION_CONFIGURATION_ID
+        if is_luna and gateway is None:
+            provider = OpenAIBatchGateway()
         _original_coverage_complete(campaign)
         active = connection.execute(
             """
@@ -2077,7 +2206,7 @@ def submit_recovery(
         unresolved_digest = hashlib.sha256(b"[")
         unresolved_count = 0
         for result in iter_jsonl(source_path):
-            if result.get("status") not in {"invalid", "provider_failure", "missing"}:
+            if not _recovery_retry_eligible(result, is_luna=is_luna):
                 continue
             record_id = result.get("record_id")
             if not isinstance(record_id, str):
@@ -2103,6 +2232,29 @@ def submit_recovery(
         ).fetchone()
         assert attempt_row is not None
         attempt_number = int(attempt_row["attempt_number"])
+        if is_luna and attempt_number > 3:
+            raise CampaignError("Luna production allows at most three append-only recovery attempts")
+        if is_luna:
+            if campaign.get("authorized_at") is None or campaign.get("authorized_spend_ceiling_usd") is None:
+                raise CampaignError("Luna recovery requires the original spend authorization")
+            actual = connection.execute(
+                """
+                SELECT
+                  COALESCE((SELECT sum(processing_cost_usd+cache_cost_usd)
+                    FROM ai_annotation_campaign_batches WHERE campaign_id=%s),0)
+                  + COALESCE((SELECT sum(NULLIF(operational_metadata->'cost'->>'total_pilot_cost_usd','')::numeric)
+                    FROM ai_annotation_campaign_recoveries WHERE campaign_id=%s),0) AS committed
+                """,
+                (campaign["id"], campaign["id"]),
+            ).fetchone()
+            committed = Decimal(str(actual["committed"] if actual else 0))
+            reserve = (
+                Decimal(str(campaign["estimated_total_cost_usd"] or 0))
+                * Decimal(unresolved_count)
+                / Decimal(int(campaign["planned_count"]))
+            )
+            if committed + reserve > Decimal(str(campaign["authorized_spend_ceiling_usd"])):
+                raise CampaignError("Luna recovery would exceed the original authorized spend ceiling")
         display_name = f"phase4d-recovery-{public_id}-{attempt_number:03d}"
         recovery = connection.execute(
             """
@@ -2121,7 +2273,7 @@ def submit_recovery(
         ).fetchone()
         assert recovery is not None
         for result in iter_jsonl(source_path):
-            if result.get("status") not in {"invalid", "provider_failure", "missing"}:
+            if not _recovery_retry_eligible(result, is_luna=is_luna):
                 continue
             record_id = str(result["record_id"])
             error = result.get("validation_error") or result.get("provider_error")
@@ -2162,6 +2314,76 @@ def submit_recovery(
             settings.database.psycopg_url, row_factory=dict_row
         ) as connection:
             records = _records_for_recovery(connection, int(recovery["id"]))
+            if is_luna:
+                configuration = _campaign_configuration(campaign)
+                context = _configuration_context(configuration)
+                system_prompt = build_system_prompt(context, configuration.prompt_version)
+                if prompt_hash(system_prompt) != configuration.prompt_sha256:
+                    raise CampaignError("frozen Luna prompt hash differs from approved configuration")
+                schema = hostility_schema(HOSTILITY_LUNA_PROMPT_VERSION)
+                requests = tuple(
+                    luna_batch_request(
+                        record_id=str(record["record_id"]),
+                        user_prompt=build_user_prompt(record),
+                        system_prompt=system_prompt,
+                        schema=schema,
+                        generation=configuration.generation_config,
+                    )
+                    for record in records
+                )
+                directory = _recovery_directory(public_id, attempt_number)
+                directory.mkdir(parents=True, exist_ok=False)
+                request_bytes = b"".join(
+                    (json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+                    for value in requests
+                )
+                (directory / "requests.jsonl").write_bytes(request_bytes)
+                plan = {
+                    "provider": "openai", "endpoint": "/v1/responses",
+                    "campaign_public_id": public_id, "recovery_attempt_number": attempt_number,
+                    "record_count": len(records), "record_set_sha256": unresolved_hash,
+                    "request_file_sha256": hashlib.sha256(request_bytes).hexdigest(),
+                    "provenance": {
+                        "provider": configuration.provider,
+                        "model": configuration.configured_model,
+                        "prompt_version": configuration.prompt_version,
+                        "prompt_sha256": configuration.prompt_sha256,
+                        "canonical_schema_sha256": configuration.canonical_schema_sha256,
+                        "prediction_contract_sha256": configuration.prediction_contract_sha256,
+                        "provider_schema_sha256": configuration.provider_schema_sha256,
+                        **configuration.generation_config,
+                        "execution_mode": configuration.execution_mode,
+                    },
+                }
+                (directory / "plan.json").write_text(
+                    json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+                )
+                gateway_openai = cast(OpenAIBatchGateway, provider)
+                input_file_id = gateway_openai.upload_requests(directory / "requests.jsonl")
+                connection.execute(
+                    """UPDATE ai_annotation_campaign_recoveries SET provider_input_file_id=%s,
+                       provider_input_file_sha256=%s WHERE id=%s""",
+                    (input_file_id, plan["request_file_sha256"], recovery["id"]),
+                )
+                connection.commit()
+                recovery_identity = f"{public_id}:recovery:{attempt_number}"
+                submission_may_exist = True
+                found = gateway_openai.find_batch(recovery_identity, 1)
+                provider_batch = found or gateway_openai.submit(
+                    input_file_id, campaign_id=recovery_identity, chunk_number=1
+                )
+                provider_job_id = provider_batch.get("id")
+                if not isinstance(provider_job_id, str):
+                    raise CampaignError("OpenAI Batch response omitted the recovery batch id")
+                updated = connection.execute(
+                    """UPDATE ai_annotation_campaign_recoveries SET status='SUBMITTED',
+                       provider_job_id=%s,provider_state=%s,submitted_at=now()
+                       WHERE id=%s AND status='PREPARING' AND provider_job_id IS NULL RETURNING *""",
+                    (provider_job_id, provider_batch.get("status", "validating"), recovery["id"]),
+                ).fetchone()
+                if updated is None:
+                    raise CampaignError("recovery submission identity could not be persisted")
+                return dict(updated)
             plan = _provider_plan(
                 {**campaign, "cache_identifier": cache["cache_identifier"]},
                 records,
@@ -2182,7 +2404,11 @@ def submit_recovery(
                 """,
                 (recovery["id"],),
             ).fetchall()
-            requests = plan["request"]["batch"]["input_config"]["requests"]["requests"]
+            request_plan = cast(dict[str, Any], plan["request"])
+            batch_plan = cast(dict[str, Any], request_plan["batch"])
+            input_config = cast(dict[str, Any], batch_plan["input_config"])
+            request_config = cast(dict[str, Any], input_config["requests"])
+            provider_requests = cast(list[Any], request_config["requests"])
             (directory / "requests.jsonl").write_text(
                 "".join(
                     json.dumps(
@@ -2196,7 +2422,7 @@ def submit_recovery(
                         sort_keys=True,
                     )
                     + "\n"
-                    for lineage, request in zip(lineage_rows, requests, strict=True)
+                    for lineage, request in zip(lineage_rows, provider_requests, strict=True)
                 ),
                 encoding="utf-8",
             )
@@ -2259,7 +2485,8 @@ def submit_recovery(
             _mark_recovery_failed(settings, int(recovery["id"]), error)
         if isinstance(error, (CampaignError, RecoveryArtifactError)):
             raise
-        raise CampaignError(f"Gemini recovery submission failed: {error}") from error
+        provider_label = "OpenAI" if is_luna else "Gemini"
+        raise CampaignError(f"{provider_label} recovery submission failed: {error}") from error
 
 
 def refresh_recovery(
@@ -2267,14 +2494,13 @@ def refresh_recovery(
     principal: Principal,
     public_id: str,
     *,
-    gateway: GeminiGateway | None = None,
+    gateway: Any | None = None,
 ) -> dict[str, Any]:
     _require_admin(principal)
-    provider = gateway or LiveGeminiGateway()
     with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
         recovery = connection.execute(
             """
-            SELECT recovery.* FROM ai_annotation_campaign_recoveries recovery
+            SELECT recovery.*,campaign.configuration_id FROM ai_annotation_campaign_recoveries recovery
             JOIN ai_annotation_campaigns campaign ON campaign.id=recovery.campaign_id
             WHERE campaign.public_id::text=%s AND recovery.status IN
               ('SUBMITTED','RUNNING','PROVIDER_COMPLETED')
@@ -2284,7 +2510,28 @@ def refresh_recovery(
         ).fetchone()
         if recovery is None or not isinstance(recovery["provider_job_id"], str):
             raise CampaignError("campaign has no active recovery job")
-        status = parse_batch_status(provider.status(str(recovery["provider_job_id"])))
+        is_luna = recovery["configuration_id"] == LUNA_PRODUCTION_CONFIGURATION_ID
+        provider = gateway or (OpenAIBatchGateway() if is_luna else LiveGeminiGateway())
+        if is_luna:
+            openai_provider = cast(OpenAIBatchGateway, provider)
+            batch = openai_provider.retrieve(str(recovery["provider_job_id"]))
+            state = str(batch.get("status") or "unknown")
+            terminal = state in {"completed", "failed", "cancelled", "expired"}
+            target = "PROVIDER_COMPLETED" if terminal else "RUNNING" if state == "in_progress" else "SUBMITTED"
+            updated = connection.execute(
+                """UPDATE ai_annotation_campaign_recoveries SET status=%s,provider_state=%s,
+                   provider_output_file_id=COALESCE(provider_output_file_id,%s),
+                   provider_error_file_id=COALESCE(provider_error_file_id,%s),
+                   provider_completed_at=CASE WHEN %s THEN COALESCE(provider_completed_at,now()) ELSE provider_completed_at END,
+                   failure_metadata=CASE WHEN %s THEN failure_metadata || %s ELSE failure_metadata END
+                   WHERE id=%s RETURNING *""",
+                (target, state, batch.get("output_file_id"), batch.get("error_file_id"), terminal,
+                 state in {"failed", "cancelled", "expired"}, Jsonb({"provider_error": batch.get("errors")}), recovery["id"]),
+            ).fetchone()
+            assert updated is not None
+            return dict(updated)
+        gemini_provider = cast(LiveGeminiGateway, provider)
+        status = parse_batch_status(gemini_provider.status(str(recovery["provider_job_id"])))
         target = (
             "PROVIDER_COMPLETED"
             if status["successful_terminal"]
@@ -2473,18 +2720,15 @@ def recover_recovery_submission(
     principal: Principal,
     public_id: str,
     *,
-    gateway: GeminiGateway | None = None,
+    gateway: Any | None = None,
 ) -> dict[str, Any]:
     """Recover a provider job when submission succeeded but its receipt was lost."""
     _require_admin(principal)
-    provider = gateway or LiveGeminiGateway()
-    finder = getattr(provider, "find_batch", None)
-    if not callable(finder):
-        raise CampaignError("the Gemini gateway cannot recover submitted Batch jobs")
     with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
         recovery = connection.execute(
             """
-            SELECT recovery.*,campaign.configured_model
+            SELECT recovery.*,campaign.configured_model,campaign.configuration_id,
+                   campaign.public_id::text AS campaign_public_id
             FROM ai_annotation_campaign_recoveries recovery
             JOIN ai_annotation_campaigns campaign ON campaign.id=recovery.campaign_id
             WHERE campaign.public_id::text=%s AND recovery.status='PREPARING'
@@ -2494,19 +2738,26 @@ def recover_recovery_submission(
         ).fetchone()
         if recovery is None:
             raise CampaignError("campaign has no pending recovery submission to recover")
-        provider_job_id = finder(
-            str(recovery["submission_display_name"]),
-            str(recovery["configured_model"]),
+        is_luna = recovery["configuration_id"] == LUNA_PRODUCTION_CONFIGURATION_ID
+        provider = gateway or (OpenAIBatchGateway() if is_luna else LiveGeminiGateway())
+        finder = getattr(provider, "find_batch", None)
+        if not callable(finder):
+            raise CampaignError("provider gateway cannot recover submitted Batch jobs")
+        provider_job = (
+            finder(f"{recovery['campaign_public_id']}:recovery:{recovery['attempt_number']}", 1)
+            if is_luna
+            else finder(str(recovery["submission_display_name"]), str(recovery["configured_model"]))
         )
+        provider_job_id = provider_job.get("id") if isinstance(provider_job, dict) else provider_job
         if provider_job_id is None:
-            raise CampaignError("no matching Gemini recovery Batch is visible yet")
+            raise CampaignError("no matching provider recovery Batch is visible yet")
         updated = connection.execute(
             """
             UPDATE ai_annotation_campaign_recoveries SET status='SUBMITTED',
-              provider_job_id=%s,provider_state='BATCH_STATE_PENDING',submitted_at=now()
+              provider_job_id=%s,provider_state=%s,submitted_at=now()
             WHERE id=%s AND status='PREPARING' AND provider_job_id IS NULL RETURNING *
             """,
-            (provider_job_id, recovery["id"]),
+            (provider_job_id, provider_job.get("status", "validating") if isinstance(provider_job, dict) else "BATCH_STATE_PENDING", recovery["id"]),
         ).fetchone()
         if updated is None:
             raise CampaignError("recovery submission was already recovered")
@@ -2518,10 +2769,9 @@ def collect_recovery(
     principal: Principal,
     public_id: str,
     *,
-    gateway: GeminiGateway | None = None,
+    gateway: Any | None = None,
 ) -> dict[str, Any]:
     _require_admin(principal)
-    provider = gateway or LiveGeminiGateway()
     with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
         row = connection.execute(
             """
@@ -2532,6 +2782,9 @@ def collect_recovery(
                    recovery.cache_created_at AS recovery_cache_created_at,
                    recovery.cache_expires_at AS recovery_cache_expires_at,
                    recovery.cache_metadata AS recovery_cache_metadata,
+                   recovery.provider_input_file_sha256 AS recovery_input_file_sha256,
+                   recovery.provider_output_file_id AS recovery_output_file_id,
+                   recovery.provider_error_file_id AS recovery_error_file_id,
                    recovery.unresolved_set_sha256
             FROM ai_annotation_campaigns campaign
             JOIN ai_annotation_campaign_recoveries recovery
@@ -2548,76 +2801,150 @@ def collect_recovery(
             return combined
         if combined["recovery_status"] != "PROVIDER_COMPLETED":
             raise CampaignError("recovery provider job is not ready for collection")
+        is_luna = combined["configuration_id"] == LUNA_PRODUCTION_CONFIGURATION_ID
+        provider = gateway or (OpenAIBatchGateway() if is_luna else LiveGeminiGateway())
         records = _records_for_recovery(connection, int(combined["recovery_id"]))
-        plan = _provider_plan(
-            {**combined, "cache_identifier": combined["recovery_cache_identifier"]},
-            records,
-            expected_record_set_sha256=str(combined["unresolved_set_sha256"]),
-            cache_identifier=str(combined["recovery_cache_identifier"]),
-            display_name=f"phase4d-recovery-{public_id}-{int(combined['attempt_number']):03d}",
-        )
-        batch_value = provider.status(str(combined["recovery_provider_job_id"]))
-        configuration = _campaign_configuration(combined)
-        domain_codes = (
-            tuple(label.code for label in production_codebook()["taxonomy"].labels)
-            if configuration.prediction_task == "policy"
-            else ()
-        )
-        results, coverage = collect_inline_batch(
-            batch_value=batch_value, plan=plan, domain_codes=domain_codes,
-            prediction_task=configuration.prediction_task,
-            records_by_id={str(record["record_id"]): record for record in records},
-        )
-        lineage = {
-            str(value["record_id"]): dict(value)
-            for value in connection.execute(
-                """
-                SELECT record_id,original_request_index,original_validation_error
-                FROM ai_annotation_campaign_recovery_records WHERE recovery_id=%s
-                """,
-                (combined["recovery_id"],),
-            ).fetchall()
-        }
-        for result in results:
-            details = lineage[str(result["record_id"])]
-            result.update(
-                campaign_id=public_id,
-                recovery_attempt_number=int(combined["attempt_number"]),
-                recovery_provider_job_id=combined["recovery_provider_job_id"],
-                original_request_index=details["original_request_index"],
-                original_validation_error=details["original_validation_error"],
-                replacement_validation_result=result.get("status"),
-                provider=combined["provider"],
-                configured_model=combined["configured_model"],
-                prompt_version=combined["prompt_version"],
-                prompt_sha256=combined["prompt_sha256"],
-                schema_sha256=combined["canonical_schema_sha256"],
-                execution_mode=combined["execution_mode"],
-                cache_identifier=combined["recovery_cache_identifier"],
-                batch_id=combined["recovery_provider_job_id"],
-                pricing_effective_date=plan["provenance"]["pricing_effective_date"],
+        if is_luna:
+            directory = _recovery_directory(public_id, int(combined["attempt_number"]))
+            try:
+                plan = json.loads((directory / "plan.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError) as error:
+                raise CampaignError("Luna recovery request artifact is missing or invalid") from error
+            from hansard_annotator.web.campaigns.phase4e import _collect_openai_chunk
+
+            results, summary = _collect_openai_chunk(
+                cast(OpenAIBatchGateway, provider),
+                chunk={
+                    "provider_job_id": combined["recovery_provider_job_id"],
+                    "provider_input_file_sha256": combined["recovery_input_file_sha256"],
+                },
+                directory=directory,
+                records=records,
             )
-            result.update(combined["generation_config"])
-        cache_metadata = combined.get("recovery_cache_metadata")
-        cache_receipt = None
-        if isinstance(cache_metadata, dict) and cache_metadata.get("created_for_recovery"):
-            cache_receipt = {
-                "response": {
-                    "createTime": str(combined["recovery_cache_created_at"]),
-                    "expireTime": str(combined["recovery_cache_expires_at"]),
-                    "usageMetadata": cache_metadata.get("usageMetadata", {}),
-                }
+            lineage = {
+                str(value["record_id"]): dict(value)
+                for value in connection.execute(
+                    """SELECT record_id,original_request_index,original_validation_error
+                       FROM ai_annotation_campaign_recovery_records WHERE recovery_id=%s""",
+                    (combined["recovery_id"],),
+                ).fetchall()
             }
-        pricing = load_pricing(ROOT / "config/llm_eval/pricing.yaml")
-        summary = _collection_summary(
-            batch_value, plan, results, coverage, pricing, cache_receipt
-        )
+            by_id = {str(result["record_id"]): result for result in results}
+            for index, record in enumerate(records):
+                record_id = str(record["record_id"])
+                if record_id not in by_id:
+                    missing = {
+                        "record_id": record_id, "turn_key": record_id.removeprefix("turn:"),
+                        "request_index": index, "status": "missing", "prediction": None,
+                        "provider_error": "recovery response missing", "provider_response": None,
+                    }
+                    results.append(missing)
+                    by_id[record_id] = missing
+            for result in results:
+                details = lineage[str(result["record_id"])]
+                result.update(
+                    campaign_id=public_id,
+                    recovery_attempt_number=int(combined["attempt_number"]),
+                    recovery_provider_job_id=combined["recovery_provider_job_id"],
+                    original_request_index=details["original_request_index"],
+                    original_validation_error=details["original_validation_error"],
+                    replacement_validation_result=result.get("status"),
+                    provider=combined["provider"], configured_model=combined["configured_model"],
+                    prompt_version=combined["prompt_version"], prompt_sha256=combined["prompt_sha256"],
+                    schema_sha256=combined["canonical_schema_sha256"],
+                    execution_mode=combined["execution_mode"],
+                    cache_identifier=None, batch_id=combined["recovery_provider_job_id"],
+                    **combined["generation_config"],
+                )
+            summary["provenance"].update(plan.get("provenance", {}))
+            summary["provenance"].update({
+                "recovery_attempt_number": int(combined["attempt_number"]),
+                "record_set_sha256": combined["unresolved_set_sha256"],
+                "record_ids_sha256": canonical_hash([record["record_id"] for record in records]),
+            })
+            (directory / "predictions.jsonl").write_text(
+                "".join(json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n" for value in results),
+                encoding="utf-8",
+            )
+            (directory / "failures.jsonl").write_text(
+                "".join(json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n" for value in results if value.get("status") != "success"),
+                encoding="utf-8",
+            )
+            (directory / "summary.json").write_text(
+                json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            batch_value: dict[str, Any] = summary["batch_status"]
+            coverage = summary["coverage"]
+        else:
+            directory = _recovery_directory(public_id, int(combined["attempt_number"]))
+            plan = _provider_plan(
+                {**combined, "cache_identifier": combined["recovery_cache_identifier"]},
+                records,
+                expected_record_set_sha256=str(combined["unresolved_set_sha256"]),
+                cache_identifier=str(combined["recovery_cache_identifier"]),
+                display_name=f"phase4d-recovery-{public_id}-{int(combined['attempt_number']):03d}",
+            )
+            gemini_provider = cast(LiveGeminiGateway, provider)
+            batch_value = gemini_provider.status(str(combined["recovery_provider_job_id"]))
+            configuration = _campaign_configuration(combined)
+            domain_codes = (
+                tuple(label.code for label in production_codebook()["taxonomy"].labels)
+                if configuration.prediction_task == "policy" else ()
+            )
+            results, coverage = collect_inline_batch(
+                batch_value=batch_value, plan=plan, domain_codes=domain_codes,
+                prediction_task=configuration.prediction_task,
+                records_by_id={str(record["record_id"]): record for record in records},
+            )
+            directory = _recovery_directory(public_id, int(combined["attempt_number"]))
+        if not is_luna:
+            lineage = {
+                str(value["record_id"]): dict(value)
+                for value in connection.execute(
+                    """SELECT record_id,original_request_index,original_validation_error
+                       FROM ai_annotation_campaign_recovery_records WHERE recovery_id=%s""",
+                    (combined["recovery_id"],),
+                ).fetchall()
+            }
+            for result in results:
+                details = lineage[str(result["record_id"])]
+                result.update(
+                    campaign_id=public_id,
+                    recovery_attempt_number=int(combined["attempt_number"]),
+                    recovery_provider_job_id=combined["recovery_provider_job_id"],
+                    original_request_index=details["original_request_index"],
+                    original_validation_error=details["original_validation_error"],
+                    replacement_validation_result=result.get("status"),
+                    provider=combined["provider"], configured_model=combined["configured_model"],
+                    prompt_version=combined["prompt_version"], prompt_sha256=combined["prompt_sha256"],
+                    schema_sha256=combined["canonical_schema_sha256"],
+                    execution_mode=combined["execution_mode"],
+                    cache_identifier=combined["recovery_cache_identifier"],
+                    batch_id=combined["recovery_provider_job_id"],
+                    pricing_effective_date=plan["provenance"]["pricing_effective_date"],
+                )
+                result.update(combined["generation_config"])
+            cache_metadata = combined.get("recovery_cache_metadata")
+            cache_receipt = None
+            if isinstance(cache_metadata, dict) and cache_metadata.get("created_for_recovery"):
+                cache_receipt = {
+                    "response": {
+                        "createTime": str(combined["recovery_cache_created_at"]),
+                        "expireTime": str(combined["recovery_cache_expires_at"]),
+                        "usageMetadata": cache_metadata.get("usageMetadata", {}),
+                    }
+                }
+            pricing = load_pricing(ROOT / "config/llm_eval/pricing.yaml")
+            summary = _collection_summary(
+                batch_value, plan, results, coverage, pricing, cache_receipt
+            )
         directory = _recovery_directory(public_id, int(combined["attempt_number"]))
         if not directory.exists():
             raise CampaignError("recovery request artifact directory is missing")
-        (directory / "provider_response.json").write_text(
-            json.dumps(batch_value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
+        if not is_luna:
+            (directory / "provider_response.json").write_text(
+                json.dumps(batch_value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
         (directory / "predictions.jsonl").write_text(
             "".join(
                 json.dumps(result, ensure_ascii=False, sort_keys=True) + "\n"
@@ -2673,12 +3000,15 @@ def collect_recovery(
         effective_invalid = int(
             effective_summary["coverage"]["invalid_structured_predictions"]
         )
+        summary_provenance = summary.get("provenance")
+        summary_provenance = summary_provenance if isinstance(summary_provenance, dict) else {}
         updated = connection.execute(
             """
             UPDATE ai_annotation_campaign_recoveries SET status='COLLECTED',
               artifact_reference=%s,artifact_sha256=%s,
               effective_artifact_reference=%s,effective_artifact_sha256=%s,
-              valid_count=%s,invalid_count=%s,operational_metadata=%s,collected_at=now()
+              valid_count=%s,invalid_count=%s,operational_metadata=%s,
+              provider_output_file_sha256=%s,provider_error_file_sha256=%s,collected_at=now()
             WHERE id=%s AND status='PROVIDER_COMPLETED' RETURNING *
             """,
             (
@@ -2689,6 +3019,8 @@ def collect_recovery(
                 current_recovery["valid_count"],
                 current_recovery["invalid_count"],
                 Jsonb(current_recovery["operational_metadata"]),
+                summary_provenance.get("output_file_sha256"),
+                summary_provenance.get("error_file_sha256"),
                 combined["recovery_id"],
             ),
         ).fetchone()
@@ -2761,10 +3093,15 @@ def validate_campaign(
             for _row in iter_terminal_invalid_artifact(
                 directory, prediction_task=configuration.prediction_task,
                 terminal_recovery_history=recovery_history,
-                require_recovery_lineage=True,
+                require_recovery_lineage=(
+                    configuration.configuration_id != LUNA_PRODUCTION_CONFIGURATION_ID
+                ),
             )
         )
         invalid_reported = int(coverage.get("invalid_structured_predictions") or 0)
+        if configuration.configuration_id == LUNA_PRODUCTION_CONFIGURATION_ID:
+            invalid_reported += int(coverage.get("failed_provider_responses") or 0)
+            invalid_reported += int(coverage.get("missing_responses") or 0)
         if invalid_reported != terminal_invalid_count:
             raise CampaignError("terminal invalid outcomes do not match collected results")
         if terminal_invalid_count and configuration.prediction_task != "hostility":
@@ -2773,13 +3110,11 @@ def validate_campaign(
             campaign["planned_count"]
         ):
             raise CampaignError("validated result coverage does not equal planned records")
-        if any(
+        if int(coverage.get("duplicate_mappings") or 0):
+            raise CampaignError("unresolved provider results or mappings block import")
+        if configuration.configuration_id != LUNA_PRODUCTION_CONFIGURATION_ID and any(
             int(coverage.get(key) or 0)
-            for key in (
-                "failed_provider_responses",
-                "missing_responses",
-                "duplicate_mappings",
-            )
+            for key in ("failed_provider_responses", "missing_responses")
         ):
             raise CampaignError("unresolved provider results or mappings block import")
         updated = connection.execute(
@@ -2833,7 +3168,9 @@ def import_campaign(
             annotation_schema_version=configuration.annotation_schema_version,
             expected_configuration=expected,
             terminal_recovery_history=terminal_recovery_history,
-            require_terminal_recovery_lineage=True,
+            require_terminal_recovery_lineage=(
+                configuration.configuration_id != LUNA_PRODUCTION_CONFIGURATION_ID
+            ),
             campaign_provenance={
                 "campaign_id": str(campaign["public_id"]),
                 "campaign_name": str(campaign["name"]),
