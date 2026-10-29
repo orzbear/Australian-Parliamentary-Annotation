@@ -54,6 +54,7 @@ from hansard_annotator.web.campaigns.service import (
     GeminiGateway,
     LiveGeminiGateway,
     _artifact_directory,
+    _assert_hostility_policy_eligible,
     _campaign_configuration,
     _configuration_context,
     _production_domain_codes,
@@ -699,6 +700,8 @@ def plan_campaign_chunks(
             raise CampaignError("full production requires the approved frozen configuration")
         configuration = _campaign_configuration(dict(campaign))
         is_luna = configuration.configuration_id == LUNA_PRODUCTION_CONFIGURATION_ID
+        if configuration.prediction_task == "hostility":
+            _assert_hostility_policy_eligible(connection, int(campaign["id"]))
         if configuration.prediction_task != "policy" and not is_luna:
             raise CampaignError("full production orchestration is only supported for policy campaigns")
         if is_luna and campaign["cache_status"] != "NOT_REQUIRED":
@@ -882,6 +885,8 @@ def authorize_full_production(
             configuration.configuration_id != LUNA_PRODUCTION_CONFIGURATION_ID
         ):
             raise CampaignError("full production orchestration is only supported for policy campaigns")
+        if configuration.prediction_task == "hostility":
+            _assert_hostility_policy_eligible(connection, int(campaign["id"]))
         estimate = Decimal(str(campaign["estimated_total_cost_usd"] or 0))
         if spend_ceiling_usd < estimate:
             raise CampaignError("authorization ceiling is below the current campaign estimate")

@@ -166,7 +166,9 @@ def test_eligibility_query_is_configuration_aware_and_not_ever_predicted() -> No
         assert predicate in source
     assert "exclude_human_annotated" in source
     assert 'and row["eligible_main_analysis"]' not in source
-    assert '"eligibility_rule": AI_ELIGIBILITY_RULE' in source
+    assert '"eligibility_rule": AI_ELIGIBILITY_RULE' not in source
+    assert '"eligibility_rule": (' in source
+    assert "HOSTILITY_POLICY_ELIGIBILITY_RULE" in source
 
 
 def test_state_machine_accepts_only_explicit_transitions() -> None:
@@ -221,6 +223,10 @@ def test_planning_query_is_database_bounded_and_preserves_seeded_ordering() -> N
     assert "eligible_main_analysis" not in query
     assert "annotation.status IN ('submitted','revised')" in query
     assert "annotation.status IN ('submitted','revised')" in count_source
+    assert "prediction.prediction_task='policy'" in count_source
+    assert "ORDER BY policy_run.imported_at DESC, prediction.run_id DESC" in count_source
+    assert "latest_policy_is_non_policy IS FALSE" in count_source
+    assert "latest_policy.is_non_policy IS FALSE" in query
     for noncanonical_status in ("draft", "skipped", "flagged", "in_progress"):
         assert f"'{noncanonical_status}'" not in query
         assert f"'{noncanonical_status}'" not in count_source
@@ -274,11 +280,17 @@ class _PlanningConnection:
         }
         self.breakdown = {
             "corpus_total_count": 160_577,
+            "latest_policy_count": 0,
+            "policy_eligible_count": 0,
+            "excluded_non_policy_count": 0,
+            "missing_latest_policy_count": 0,
             "human_annotated_count": 43,
             "human_prediction_overlap_count": 11,
             "excluded_existing_prediction_count": 100,
             "excluded_human_annotated_count": 32,
             "excluded_other_count": 10,
+            "missing_prompt_text_count": 10,
+            "hostility_policy_ineligible_count": 0,
             "eligible_count": 160_435,
         }
         self.rows = rows

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 from datetime import UTC, datetime, timedelta
@@ -54,10 +55,15 @@ from hansard_annotator.web.campaigns.phase4e import (
 )
 from hansard_annotator.web.campaigns.routes import campaign_create
 from hansard_annotator.web.campaigns.service import (
+    HOSTILITY_POLICY_ELIGIBILITY_RULE,
+    LUNA_PRODUCTION_PILOT_SEED,
+    LUNA_PRODUCTION_PILOT_SIZE,
     PAID_CONFIRMATION,
     CampaignError,
+    _assert_hostility_policy_eligible,
     _provider_plan,
     _recovery_retry_eligible,
+    _selection_query,
     approved_campaign_configurations,
     collect_campaign,
     create_campaign,
@@ -67,6 +73,7 @@ from hansard_annotator.web.campaigns.service import (
     plan_campaign,
     production_configuration,
     repair_campaign_results,
+    require_current_ai_selection,
     submit_campaign,
     validate_campaign,
 )
@@ -94,6 +101,194 @@ def test_luna_recovery_never_retries_success_or_evidence_resolution_failures() -
     assert _recovery_retry_eligible({"status": "missing"}, is_luna=True)
     assert not _recovery_retry_eligible({"status": "success"}, is_luna=False)
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_hostility_eligibility_uses_latest_valid_policy_prediction_contract() -> None:
+    breakdown_source = inspect.getsource(
+        __import__("hansard_annotator.web.campaigns.service", fromlist=["_planning_breakdown"])
+        ._planning_breakdown
+    )
+    selection = _selection_query()
+    for query in (breakdown_source, selection):
+        assert "prediction.prediction_task='policy'" in query
+        assert "ORDER BY policy_run.imported_at DESC, prediction.run_id DESC" in query
+        assert "LIMIT 1" in query
+    assert "latest_policy_is_non_policy IS FALSE" in breakdown_source
+    assert "AND (%s OR latest_policy_is_non_policy IS FALSE)" in breakdown_source
+    assert "latest_policy.is_non_policy IS FALSE" in selection
+    # A latest TRUE excludes a row even if an older policy row was FALSE; a latest
+    # FALSE includes it even if the older row was TRUE. Missing rows cannot match.
+    assert "latest_policy.is_non_policy IS DISTINCT FROM FALSE" in inspect.getsource(
+        _assert_hostility_policy_eligible
+    )
+
+
+def test_hostility_launch_guard_rejects_a_prepared_non_policy_member() -> None:
+    class _Result:
+        def fetchone(self) -> dict[str, Any]:
+            return {"invalid_count": 1, "example_turn_key": "turn-non-policy"}
+
+    class _Connection:
+        def execute(self, query: str, params: tuple[object, ...]) -> _Result:
+            assert "prediction_task='policy'" in query
+            assert "ORDER BY policy_run.imported_at DESC, policy_prediction.run_id DESC" in query
+            assert params == (9,)
+            return _Result()
+
+    with pytest.raises(CampaignError, match=r"latest policy prediction marked is_non_policy=false.*turn-non-policy"):
+        _assert_hostility_policy_eligible(cast(Any, _Connection()), 9)
+
+
+def test_luna_pilot_uses_fixed_size_seed_and_deterministic_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configuration = approved_configuration(LUNA_PRODUCTION_CONFIGURATION_ID)
+    candidates = [
+        {
+            "id": index,
+            "turn_key": f"pilot-turn-{index:04d}",
+            "date": "2026-01-01",
+            "chamber": "House",
+            "speaker_name_raw": "Speaker",
+            "major_heading_original": "Debate",
+            "minor_heading_original": None,
+            "business_type": None,
+            "text_clean": f"Policy-eligible speech {index}",
+            "text_raw": None,
+        }
+        for index in range(1_005)
+    ]
+    ordered = sorted(
+        candidates,
+        key=lambda row: (
+            hashlib.sha256(
+                f"{row['turn_key']}:{LUNA_PRODUCTION_PILOT_SEED}".encode()
+            ).digest(),
+            row["turn_key"],
+        ),
+    )
+
+    class _Result:
+        def __init__(self, row: dict[str, Any]) -> None:
+            self.row = row
+
+        def fetchone(self) -> dict[str, Any]:
+            return self.row
+
+    class _InsertCursor:
+        def __init__(self) -> None:
+            self.values: list[tuple[object, ...]] = []
+
+        def executemany(self, _query: str, values: list[tuple[object, ...]]) -> None:
+            self.values.extend(values)
+
+    class _SelectionCursor:
+        itersize = 0
+
+        def __enter__(self) -> _SelectionCursor:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def execute(self, query: str, params: tuple[object, ...]) -> None:
+            assert "latest_policy.is_non_policy IS FALSE" in query
+            assert params[-3:] == (False, LUNA_PRODUCTION_PILOT_SEED, 1_000)
+
+        def __iter__(self) -> Any:
+            return iter(ordered[:LUNA_PRODUCTION_PILOT_SIZE])
+
+    class _Connection:
+        def __init__(self) -> None:
+            self.campaign = {
+                **configuration.persistence_values(),
+                "id": 90,
+                "public_id": UUID(int=90),
+                "corpus_id": 1,
+                "status": "DRAFT",
+            }
+            self.insert_cursor = _InsertCursor()
+            self.selection_cursor = _SelectionCursor()
+
+        def __enter__(self) -> _Connection:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def execute(self, query: str, params: object = None) -> _Result:
+            if "FOR UPDATE" in query:
+                return _Result(self.campaign)
+            if "SELECT run.run_name" in query:
+                return _Result({"run_name": "phase1-full-20260723-v4"})
+            if "AS invalid_count" in query:
+                return _Result({"invalid_count": 0, "example_turn_key": None})
+            if "UPDATE ai_annotation_campaigns SET" in query:
+                assert isinstance(params, tuple)
+                self.campaign = {
+                    **self.campaign,
+                    "status": "PLANNED",
+                    "selection_definition": params[0].obj,
+                    "planned_count": params[6],
+                }
+                return _Result(self.campaign)
+            raise AssertionError(f"unexpected campaign query: {query}")
+
+        def cursor(self, name: str | None = None) -> Any:
+            return self.selection_cursor if name else self.insert_cursor
+
+    connection = _Connection()
+    monkeypatch.setattr(
+        "hansard_annotator.web.campaigns.service._planning_breakdown",
+        lambda *_args, **_kwargs: {
+            "corpus_total_count": 1_005,
+            "eligible_count": 1_005,
+            "human_annotated_count": 0,
+            "human_prediction_overlap_count": 0,
+            "excluded_existing_prediction_count": 0,
+            "excluded_human_annotated_count": 0,
+            "excluded_other_count": 0,
+            "other_exclusion_reasons": {},
+        },
+    )
+
+    planned = plan_campaign(
+        _settings(),
+        _principal(),
+        str(connection.campaign["public_id"]),
+        limit=1_000,
+        seed=LUNA_PRODUCTION_PILOT_SEED,
+        exclude_human_annotated=False,
+        _connection=cast(Any, connection),
+    )
+    assert LUNA_PRODUCTION_PILOT_SIZE == 1_000
+    assert planned.campaign["planned_count"] == 1_000
+    assert planned.campaign["selection_definition"]["selection_kind"] == "production_pilot_1000"
+    assert planned.campaign["selection_definition"]["eligibility_rule"] == HOSTILITY_POLICY_ELIGIBILITY_RULE
+    require_current_ai_selection(planned.campaign)
+    assert [value[2] for value in connection.insert_cursor.values] == [
+        f"turn:{row['turn_key']}" for row in ordered[:1_000]
+    ]
+
+
+def test_luna_full_plan_still_avoids_successful_same_configuration_predictions() -> None:
+    source = inspect.getsource(__import__(
+        "hansard_annotator.web.campaigns.service", fromlist=["_planning_breakdown"]
+    )._planning_breakdown)
+    assert "EXISTS (" in source
+    assert "FROM model_predictions prediction" in source
+    for identity_field in (
+        "run.provider=%s",
+        "run.configured_model=%s",
+        "run.prompt_version=%s",
+        "run.prompt_sha256=%s",
+        "run.canonical_schema_sha256=%s",
+        "run.prediction_contract_sha256=%s",
+        "run.provider_schema_sha256=%s",
+        "run.generation_config @> %s",
+        "run.execution_mode=%s",
+    ):
+        assert identity_field in source
 
 
 def _principal(*, admin: bool = True) -> Principal:
@@ -441,6 +636,8 @@ def test_hostility_planning_preserves_frozen_order_and_rejects_tampering(
                 return _PlanResultRow(db_rows)
             if "SELECT count(*) AS count FROM speaker_turns" in query:
                 return _PlanResultRow({"count": 160_577})
+            if "AS invalid_count" in query:
+                return _PlanResultRow({"invalid_count": 0, "example_turn_key": None})
             if "UPDATE ai_annotation_campaigns SET status='PLANNED'" in query:
                 assert isinstance(params, tuple)
                 selection = params[0].obj
@@ -1011,6 +1208,8 @@ def test_webui_templates_render_task_aware_new_and_detail_views(
     assert 'name="prompt_version"' not in new_html
     assert 'name="configured_model"' not in new_html
     assert 'name="sample_sha256"' not in new_html
+    assert "hostility-luna-production-pilot-1000" in new_html
+    assert "policy-eligible records only" in new_html
 
     # Test get_campaign + detail.html for a READY hostility campaign.
     ready_row = _hostility_campaign_row(
@@ -1085,3 +1284,41 @@ def test_webui_templates_render_task_aware_new_and_detail_views(
     assert "Already human annotated (exclusive)" not in detail_html
     assert "Phase 4E child Batch orchestration" not in detail_html
     assert "Deterministic structural repairs" not in detail_html
+
+    luna_config = approved_configuration(LUNA_PRODUCTION_CONFIGURATION_ID)
+    luna_draft = {
+        **luna_config.persistence_values(),
+        "public_id": "luna-draft",
+        "status": "DRAFT",
+        "configuration_display_label": luna_config.display_label,
+        "configuration_class": "APPROVED_PRODUCTION",
+        "record_set_mode": "deterministic_selection",
+        "corpus_name": "Australian Commonwealth Hansard 1998-2025",
+        "corpus_run_name": "phase1-full-20260723-v4",
+        "luna_corpus_total_count": 160_577,
+        "latest_policy_count": 160_567,
+        "policy_eligible_count": 117_893,
+        "excluded_non_policy_count": 42_674,
+        "missing_latest_policy_count": 10,
+        "luna_eligible_count": 117_893,
+        "preview": [],
+        "operational_metadata": {},
+        "recoveries": [],
+        "active_recovery": None,
+        "retryable_failure_count": 0,
+        "structural_repair_available_count": 0,
+        "provider_refusal_available_count": 0,
+    }
+    luna_html = env.get_template("campaigns/detail.html").render(
+        principal=_principal(),
+        campaign=luna_draft,
+        credentials=credential_status(),
+        notice_message=None,
+        phase4e_defaults={},
+    )
+    assert "Eligible policy records" in luna_html
+    assert "117,893" in luna_html
+    assert "Excluded non-policy" in luna_html
+    assert "Prepare 1,000-record Luna production pilot" in luna_html
+    assert "hostility-luna-production-pilot-1000-v1" in luna_html
+    assert "Prepare full remaining Luna production set" in luna_html
