@@ -93,8 +93,14 @@ PRODUCTION_GENERATION_CONFIG = APPROVED_PRODUCTION_GENERATION
 PRODUCTION_EXECUTION_MODE = "batch"
 DEFAULT_EXCLUDE_HUMAN_ANNOTATED = True
 AI_ELIGIBILITY_RULE = "prompt_text_present_v1"
+HOSTILITY_POLICY_ELIGIBILITY_RULE = "latest_policy_is_non_policy_false_v1"
+LUNA_PRODUCTION_PILOT_SEED = "hostility-luna-production-pilot-1000-v1"
+LUNA_PRODUCTION_PILOT_SIZE = 1_000
 OTHER_EXCLUSION_LABELS = {
     "missing_prompt_text": "No cleaned or raw speech text",
+    "hostility_policy_eligibility": (
+        "No latest policy prediction marked policy-relevant"
+    ),
     "unmapped_business_heading": (
         "Legacy main-analysis rule: business heading has no reviewed mapping"
     ),
@@ -525,16 +531,31 @@ def _planning_breakdown(
               WHEN turn.text_raw IS NOT NULL AND turn.text_raw<>''
                 THEN btrim(turn.text_raw)<>''
               ELSE false
-            END AS prompt_text_present
+            END AS prompt_text_present,
+            latest_policy.is_non_policy AS latest_policy_is_non_policy,
+            latest_policy.policy_run_id AS latest_policy_run_id
           FROM speaker_turns turn
           JOIN reconstruction_runs reconstruction
             ON reconstruction.id=turn.reconstruction_run_id
           JOIN corpora corpus ON corpus.current_preprocessing_run_id=
             reconstruction.preprocessing_run_id
+          LEFT JOIN LATERAL (
+            SELECT prediction.is_non_policy,policy_run.id AS policy_run_id
+            FROM model_predictions prediction
+            JOIN model_prediction_runs policy_run ON policy_run.id=prediction.run_id
+            WHERE prediction.speaker_turn_id=turn.id
+              AND prediction.prediction_task='policy'
+            ORDER BY policy_run.imported_at DESC, prediction.run_id DESC
+            LIMIT 1
+          ) latest_policy ON true
           WHERE corpus.id=%s
         )
         SELECT
           count(*)::integer AS corpus_total_count,
+          count(*) FILTER (WHERE latest_policy_run_id IS NOT NULL)::integer AS latest_policy_count,
+          count(*) FILTER (WHERE latest_policy_is_non_policy IS FALSE)::integer AS policy_eligible_count,
+          count(*) FILTER (WHERE latest_policy_is_non_policy IS TRUE)::integer AS excluded_non_policy_count,
+          count(*) FILTER (WHERE latest_policy_is_non_policy IS NULL)::integer AS missing_latest_policy_count,
           count(*) FILTER (WHERE human_annotated)::integer AS human_annotated_count,
           count(*) FILTER (
             WHERE human_annotated AND already_predicted
@@ -548,12 +569,24 @@ def _planning_breakdown(
           count(*) FILTER (
             WHERE NOT already_predicted
               AND (NOT %s OR NOT human_annotated)
-              AND NOT prompt_text_present
+              AND (NOT prompt_text_present OR (%s AND latest_policy_is_non_policy IS NOT FALSE))
           )::integer AS excluded_other_count,
           count(*) FILTER (
             WHERE NOT already_predicted
               AND (NOT %s OR NOT human_annotated)
+              AND NOT prompt_text_present
+          )::integer AS missing_prompt_text_count,
+          count(*) FILTER (
+            WHERE NOT already_predicted
+              AND (NOT %s OR NOT human_annotated)
               AND prompt_text_present
+              AND %s AND latest_policy_is_non_policy IS NOT FALSE
+          )::integer AS hostility_policy_ineligible_count,
+          count(*) FILTER (
+            WHERE NOT already_predicted
+              AND (NOT %s OR NOT human_annotated)
+              AND prompt_text_present
+              AND (%s OR latest_policy_is_non_policy IS FALSE)
           )::integer AS eligible_count
         FROM base
         """,
@@ -564,16 +597,25 @@ def _planning_breakdown(
             campaign["corpus_id"],
             exclude_human_annotated,
             exclude_human_annotated,
+            campaign.get("prediction_task") == "hostility",
             exclude_human_annotated,
+            exclude_human_annotated,
+            campaign.get("prediction_task") == "hostility",
+            exclude_human_annotated,
+            campaign.get("prediction_task") != "hostility",
         ),
     ).fetchone()
     assert row is not None
     result = dict(row)
-    result["other_exclusion_reasons"] = (
-        {"missing_prompt_text": result["excluded_other_count"]}
-        if result["excluded_other_count"]
-        else {}
-    )
+    result["other_exclusion_reasons"] = {}
+    if result["missing_prompt_text_count"]:
+        result["other_exclusion_reasons"]["missing_prompt_text"] = result[
+            "missing_prompt_text_count"
+        ]
+    if result["hostility_policy_ineligible_count"]:
+        result["other_exclusion_reasons"]["hostility_policy_eligibility"] = result[
+            "hostility_policy_ineligible_count"
+        ]
     return result
 
 
@@ -588,6 +630,15 @@ def _selection_query() -> str:
           ON reconstruction.id=turn.reconstruction_run_id
         JOIN corpora corpus ON corpus.current_preprocessing_run_id=
           reconstruction.preprocessing_run_id
+        LEFT JOIN LATERAL (
+          SELECT prediction.is_non_policy
+          FROM model_predictions prediction
+          JOIN model_prediction_runs policy_run ON policy_run.id=prediction.run_id
+          WHERE prediction.speaker_turn_id=turn.id
+            AND prediction.prediction_task='policy'
+          ORDER BY policy_run.imported_at DESC, prediction.run_id DESC
+          LIMIT 1
+        ) latest_policy ON true
         WHERE corpus.id=%s
           AND NOT EXISTS (
             SELECT 1 FROM model_predictions prediction
@@ -627,6 +678,7 @@ def _selection_query() -> str:
               THEN btrim(turn.text_raw)<>''
             ELSE false
           END
+          AND (%s OR latest_policy.is_non_policy IS FALSE)
         ORDER BY
           sha256(convert_to(turn.turn_key || ':' || %s,'UTF8')),
           turn.turn_key COLLATE "C"
@@ -648,9 +700,50 @@ def _selection_query_parameters(
         retry_provider_refusals,
         *_configuration_query_parameters(campaign),
         exclude_human_annotated,
+        campaign.get("prediction_task") != "hostility",
         seed,
         limit,
     )
+
+
+def _assert_hostility_policy_eligible(
+    connection: psycopg.Connection[dict[str, Any]], campaign_id: int
+) -> None:
+    row = connection.execute(
+        """
+        SELECT count(*) FILTER (
+                 WHERE latest_policy.policy_run_id IS NULL
+                    OR latest_policy.is_non_policy IS DISTINCT FROM FALSE
+               )::integer AS invalid_count,
+               min(turn.turn_key) FILTER (
+                 WHERE latest_policy.policy_run_id IS NULL
+                    OR latest_policy.is_non_policy IS DISTINCT FROM FALSE
+               ) AS example_turn_key
+        FROM ai_annotation_campaign_records record
+        JOIN speaker_turns turn ON turn.id=record.speaker_turn_id
+        LEFT JOIN LATERAL (
+          SELECT policy_prediction.is_non_policy,policy_run.id AS policy_run_id
+          FROM model_predictions policy_prediction
+          JOIN model_prediction_runs policy_run ON policy_run.id=policy_prediction.run_id
+          WHERE policy_prediction.speaker_turn_id=turn.id
+            AND policy_prediction.prediction_task='policy'
+          ORDER BY policy_run.imported_at DESC, policy_prediction.run_id DESC
+          LIMIT 1
+        ) latest_policy ON true
+        WHERE record.campaign_id=%s
+        """,
+        (campaign_id,),
+    ).fetchone()
+    assert row is not None
+    invalid_count = int(row["invalid_count"])
+    if invalid_count:
+        example = row.get("example_turn_key")
+        suffix = f" (example turn {example})" if example else ""
+        raise CampaignError(
+            "hostility campaign contains "
+            f"{invalid_count} record(s) without a latest policy prediction "
+            f"marked is_non_policy=false{suffix}"
+        )
 
 
 class GeminiGateway(Protocol):
@@ -1044,11 +1137,15 @@ def get_campaign(
             and approved.configuration_id == LUNA_PRODUCTION_CONFIGURATION_ID
             and result["status"] == "DRAFT"
         ):
-            result["luna_eligible_count"] = int(
-                _planning_breakdown(
-                    connection, result, exclude_human_annotated=False
-                )["eligible_count"]
+            luna_breakdown = _planning_breakdown(
+                connection, result, exclude_human_annotated=False
             )
+            result["luna_eligible_count"] = int(luna_breakdown["eligible_count"])
+            result["luna_corpus_total_count"] = int(luna_breakdown["corpus_total_count"])
+            result["latest_policy_count"] = int(luna_breakdown["latest_policy_count"])
+            result["policy_eligible_count"] = int(luna_breakdown["policy_eligible_count"])
+            result["excluded_non_policy_count"] = int(luna_breakdown["excluded_non_policy_count"])
+            result["missing_latest_policy_count"] = int(luna_breakdown["missing_latest_policy_count"])
         selection = cast(dict[str, Any], result.get("selection_definition") or {})
         other_reasons = selection.get("other_exclusion_reasons")
         if not isinstance(other_reasons, dict) and selection.get(
@@ -1074,8 +1171,13 @@ def get_campaign(
                 and selection.get("sample_sha256") == approved.record_set_sha256
             )
         else:
+            expected_eligibility_rule = (
+                HOSTILITY_POLICY_ELIGIBILITY_RULE
+                if result.get("prediction_task") == "hostility"
+                else AI_ELIGIBILITY_RULE
+            )
             result["selection_current"] = (
-                selection.get("eligibility_rule") == AI_ELIGIBILITY_RULE
+                selection.get("eligibility_rule") == expected_eligibility_rule
             )
         result["preview"] = [
             dict(value)
@@ -1283,7 +1385,10 @@ def plan_campaign(
                 raise CampaignError(
                     "Luna production must include human-annotated turns and cannot retry prior failures during selection"
                 )
-            if seed != "hostility-luna-production-v1":
+            if seed not in {
+                "hostility-luna-production-v1",
+                LUNA_PRODUCTION_PILOT_SEED,
+            }:
                 raise CampaignError("Luna production selection seed is frozen")
         breakdown = _planning_breakdown(
             connection,
@@ -1291,13 +1396,19 @@ def plan_campaign(
             exclude_human_annotated=exclude_human_annotated,
             retry_provider_refusals=retry_provider_refusals,
         )
-        if (
+        luna_pilot = (
             configuration.configuration_id == LUNA_PRODUCTION_CONFIGURATION_ID
-            and limit != int(breakdown["eligible_count"])
-        ):
-            raise CampaignError(
-                "Luna production plan must include every eligible annotation-ready turn"
-            )
+            and seed == LUNA_PRODUCTION_PILOT_SEED
+        )
+        if configuration.configuration_id == LUNA_PRODUCTION_CONFIGURATION_ID:
+            if luna_pilot and limit != LUNA_PRODUCTION_PILOT_SIZE:
+                raise CampaignError("Luna production pilot requires exactly 1,000 records")
+            if luna_pilot and int(breakdown["eligible_count"]) < LUNA_PRODUCTION_PILOT_SIZE:
+                raise CampaignError("fewer than 1,000 policy-eligible hostility records are available")
+            if not luna_pilot and limit != int(breakdown["eligible_count"]):
+                raise CampaignError(
+                    "Luna full-production plan must include every remaining eligible annotation-ready turn"
+                )
         record_set_hasher = _RecordSetHasher()
         selected_count = 0
         preview: list[dict[str, Any]] = []
@@ -1353,6 +1464,8 @@ def plan_campaign(
                 """,
                 insert_values,
             )
+        if configuration.prediction_task == "hostility":
+            _assert_hostility_policy_eligible(connection, int(campaign["id"]))
         record_set_sha256 = record_set_hasher.hexdigest()
         estimate = estimate_plan(
             selected_count,
@@ -1360,7 +1473,12 @@ def plan_campaign(
             provider=configuration.provider,
         )
         selection = {
-            "eligibility_rule": AI_ELIGIBILITY_RULE,
+            "eligibility_rule": (
+                HOSTILITY_POLICY_ELIGIBILITY_RULE
+                if configuration.prediction_task == "hostility"
+                else AI_ELIGIBILITY_RULE
+            ),
+            "selection_kind": "production_pilot_1000" if luna_pilot else "full_eligible_population" if configuration.configuration_id == LUNA_PRODUCTION_CONFIGURATION_ID else "ordinary_deterministic_selection",
             "exclude_human_annotated": exclude_human_annotated,
             "retry_provider_refusals": retry_provider_refusals,
             "human_annotated_count": breakdown["human_annotated_count"],
@@ -1443,7 +1561,7 @@ def _plan_frozen_sample_campaign(
         FROM speaker_turns turn
         JOIN reconstruction_runs reconstruction ON reconstruction.id=turn.reconstruction_run_id
         JOIN corpora corpus ON corpus.current_preprocessing_run_id=reconstruction.preprocessing_run_id
-        WHERE corpus.id=%s AND turn.turn_key=ANY(%s)
+        WHERE corpus.id=%s AND corpus.is_active AND turn.turn_key=ANY(%s)
         """,
         (campaign["corpus_id"], turn_keys),
     ).fetchall()
@@ -1472,6 +1590,8 @@ def _plan_frozen_sample_campaign(
         """,
         values,
     )
+    if configuration.prediction_task == "hostility":
+        _assert_hostility_policy_eligible(connection, int(campaign["id"]))
     estimate = estimate_plan(
         len(values), model=configuration.configured_model, provider=configuration.provider
     )
@@ -1532,6 +1652,8 @@ def transition_campaign(
         if row is None:
             raise LookupError("AI annotation campaign not found")
         validate_transition(str(row["status"]), target)
+        if target == "READY" and row.get("prediction_task") == "hostility":
+            _assert_hostility_policy_eligible(connection, int(row["id"]))
         updated = connection.execute(
             "UPDATE ai_annotation_campaigns SET status=%s WHERE id=%s RETURNING *",
             (target, row["id"]),
@@ -1681,9 +1803,19 @@ def require_current_ai_selection(campaign: dict[str, Any]) -> None:
             raise CampaignError("campaign frozen record-set identity differs")
         return
     rule = selection.get("eligibility_rule") if isinstance(selection, dict) else None
-    if rule != AI_ELIGIBILITY_RULE:
+    expected_rule = (
+        HOSTILITY_POLICY_ELIGIBILITY_RULE
+        if configuration.prediction_task == "hostility"
+        else AI_ELIGIBILITY_RULE
+    )
+    if rule != expected_rule:
+        if configuration.prediction_task != "hostility":
+            raise CampaignError(
+                "campaign uses the legacy main-analysis eligibility rule; create and plan "
+                "a new campaign before paid submission"
+            )
         raise CampaignError(
-            "campaign uses the legacy main-analysis eligibility rule; create and plan "
+            "campaign uses an outdated hostility policy-eligibility rule; create and plan "
             "a new campaign before paid submission"
         )
 
@@ -1711,6 +1843,8 @@ def ensure_campaign_cache(
         if configuration_class(campaign) != "APPROVED_PRODUCTION":
             raise CampaignError("cache preparation requires the approved production configuration")
         require_current_ai_selection(campaign)
+        if campaign.get("prediction_task") == "hostility":
+            _assert_hostility_policy_eligible(connection, int(campaign["id"]))
         cache_plan = _canonical_cache_plan(campaign)
         if campaign.get("cache_status") == "CREATING":
             raise CampaignError("cache preparation is already in progress")
@@ -1792,6 +1926,8 @@ def submit_campaign(
         records = _records_for_campaign(connection, int(campaign["id"]))
         if len(records) != int(campaign["planned_count"]):
             raise CampaignError("stored campaign record count differs from the approved plan")
+        if campaign.get("prediction_task") == "hostility":
+            _assert_hostility_policy_eligible(connection, int(campaign["id"]))
         plan = _provider_plan(campaign, records)
         provider_job_id = provider.submit(plan, str(campaign["configured_model"]))
         updated = connection.execute(
