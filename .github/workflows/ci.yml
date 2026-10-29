@@ -60,10 +60,51 @@ jobs:
           npm run build
           git diff --exit-code -- src/hansard_annotator/web/static/dist
 
+      - name: Diagnose Python package resolution
+        env:
+          PYTHONPATH: ${{ github.workspace }}/src
+        run: |
+          git rev-parse HEAD
+          python --version
+          python -m pip --version
+          python -m pip show hansard-annotator || true
+          python - <<'PY'
+          import sys
+
+          import hansard_annotator.llm_eval.hostility_validation as hostility_validation
+          import hansard_annotator.llm_eval.prompt as prompt
+          import hansard_annotator.web.campaigns.phase4e as phase4e
+
+          print("sys.path:")
+          print("\n".join(sys.path))
+          for module, names in (
+              (
+                  hostility_validation,
+                  (
+                      "LUNA_CONFIRMATION_SAMPLE_ID",
+                      "LUNA_CONFIRMATION_SAMPLE_SHA256",
+                      "LUNA_CONFIRMATION_PROMPT_SHA256",
+                      "LUNA_CONFIRMATION_CONTRACT_SHA256",
+                  ),
+              ),
+              (prompt, ("HOSTILITY_LUNA_PROMPT_VERSION",)),
+              (phase4e, ("_collect_openai_chunk",)),
+          ):
+              print(module.__file__)
+              for name in names:
+                  print(f"{name}: {hasattr(module, name)}")
+          PY
+
       - name: Lint and type-check
         run: |
           python -m ruff check .
-          python -m mypy
+          python -m mypy -v > "$RUNNER_TEMP/mypy-resolution.log" 2>&1 || {
+            cat "$RUNNER_TEMP/mypy-resolution.log"
+            exit 1
+          }
+          grep -E "Found source:.*(hostility_validation|llm_eval.*prompt.py|campaigns.*phase4e.py)" \
+            "$RUNNER_TEMP/mypy-resolution.log"
+          tail -n 1 "$RUNNER_TEMP/mypy-resolution.log"
 
       - name: Run unit and fixture tests
         run: python -m pytest -q
