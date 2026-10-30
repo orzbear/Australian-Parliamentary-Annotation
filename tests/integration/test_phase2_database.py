@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import psycopg
 import pyarrow as pa
@@ -3442,6 +3443,159 @@ def test_campaign_configuration_migration_round_trip_and_constraints(
             assert row["annotation_schema_version"] == "0.2.0"
             assert row["record_set_id"] is None
             assert row["approved_record_set_sha256"] is None
+
+
+def test_gemini_hostility_campaign_configuration_allowlist_migration(
+    database_url: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HANSARD_DATABASE_URL", database_url)
+    config = Config("alembic.ini")
+    web_settings = _web_settings(database_url)
+    import_validated_run(
+        web_settings.database,
+        _fixture_run(tmp_path, run_id="gemini-campaign-allowlist"),
+    )
+    user = create_user(
+        web_settings,
+        "gemini-allowlist-admin",
+        "Gemini Allowlist Admin",
+        "gemini allowlist migration password",
+        admin=True,
+        must_change_password=False,
+    )
+    db_url = database_url.replace("postgresql+psycopg://", "postgresql://")
+    with psycopg.connect(db_url, row_factory=dict_row) as connection:
+        corpus_id = connection.execute("SELECT id FROM corpora LIMIT 1").fetchone()["id"]
+
+        def insert_campaign(
+            db_connection: psycopg.Connection[dict[str, Any]],
+            configuration_id: str,
+            prediction_task: str,
+            schema_slug: str,
+            *,
+            record_set_id: str | None = None,
+            sample_sha256: str | None = None,
+        ) -> int:
+            row = db_connection.execute(
+                """
+                INSERT INTO ai_annotation_campaigns
+                  (name,corpus_id,created_by_user_id,status,provider,configured_model,
+                   prompt_version,prompt_sha256,canonical_schema_sha256,
+                   prediction_contract_sha256,provider_schema_sha256,generation_config,
+                   execution_mode,configuration_class,configuration_id,prediction_task,
+                   annotation_schema_slug,annotation_schema_version,record_set_id,
+                   approved_record_set_sha256)
+                VALUES (%s,%s,%s,'DRAFT','gemini','gemini-2.5-flash',%s,%s,%s,%s,%s,
+                        %s,'batch','APPROVED_PRODUCTION',%s,%s,%s,'0.2.0',%s,%s)
+                RETURNING id
+                """,
+                (
+                    f"allowlist test {configuration_id}",
+                    corpus_id,
+                    user["id"],
+                    "hostility-prompt-v2",
+                    "1" * 64,
+                    "2" * 64,
+                    "3" * 64,
+                    "4" * 64,
+                    "5" * 64,
+                    Jsonb({"thinking_budget": 0}),
+                    configuration_id,
+                    prediction_task,
+                    schema_slug,
+                    record_set_id,
+                    sample_sha256,
+                ),
+            ).fetchone()
+            assert row is not None
+            return int(row["id"])
+
+        expected = (
+            ("policy-v2", "policy", "australian_policy_annotation", None, None),
+            (
+                "hostility-v2",
+                "hostility",
+                "australian_partisan_hostility",
+                "hostility-heldout-100",
+                "f3d9451b3352025b769d263fc896f57683a741ea6fd9af0b6477651707cf3b36",
+            ),
+            (
+                "hostility-luna-confirmation-100",
+                "hostility",
+                "australian_partisan_hostility",
+                "hostility-luna-confirmation-100",
+                "482d2951253840c5a294be028f6a61891693b6826ac3bdbebb087e71aa5c3c48",
+            ),
+            (
+                "hostility-luna-production-v1",
+                "hostility",
+                "australian_partisan_hostility",
+                None,
+                None,
+            ),
+            (
+                "hostility-gemini-25-flash-production",
+                "hostility",
+                "australian_partisan_hostility",
+                None,
+                None,
+            ),
+        )
+        campaign_ids = [
+            insert_campaign(connection, configuration, task, schema, record_set_id=sample_id,
+                            sample_sha256=sample_sha)
+            for configuration, task, schema, sample_id, sample_sha in expected
+        ]
+        with pytest.raises(psycopg.errors.CheckViolation), connection.transaction():
+            insert_campaign(
+                connection,
+                "unknown-test-configuration",
+                "hostility",
+                "australian_partisan_hostility",
+            )
+
+    with pytest.raises(RuntimeError, match="Gemini hostility production campaigns exist"):
+        command.downgrade(config, "20261030_16")
+
+    with psycopg.connect(db_url, row_factory=dict_row) as connection:
+        gemini_id = campaign_ids[-1]
+        connection.execute(
+            "SELECT set_config('hansard.allow_unused_campaign_delete',%s,true)",
+            (str(gemini_id),),
+        )
+        connection.execute("DELETE FROM ai_annotation_campaigns WHERE id=%s", (gemini_id,))
+        connection.commit()
+
+    command.downgrade(config, "20261030_16")
+    with (
+        psycopg.connect(db_url, row_factory=dict_row) as connection,
+        pytest.raises(psycopg.errors.CheckViolation),
+        connection.transaction(),
+    ):
+        insert_campaign(
+            connection,
+            "hostility-gemini-25-flash-production",
+            "hostility",
+            "australian_partisan_hostility",
+        )
+    command.upgrade(config, "20261030_17")
+    with psycopg.connect(db_url, row_factory=dict_row) as connection:
+        upgraded_gemini_id = insert_campaign(
+            connection,
+            "hostility-gemini-25-flash-production",
+            "hostility",
+            "australian_partisan_hostility",
+        )
+        connection.execute(
+            "SELECT set_config('hansard.allow_unused_campaign_delete',%s,true)",
+            (str(upgraded_gemini_id),),
+        )
+        connection.execute(
+            "DELETE FROM ai_annotation_campaigns WHERE id=%s",
+            (upgraded_gemini_id,),
+        )
 
 
 def test_phase3_authentication_lockout_sessions_and_disable(
