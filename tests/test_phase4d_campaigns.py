@@ -1378,6 +1378,28 @@ def test_campaign_deletion_migration_blocks_provider_and_research_provenance() -
     assert "hansard.allow_unused_campaign_delete" in migration
 
 
+def test_gemini_hostility_configuration_migration_preserves_allowlist_and_guards_downgrade() -> None:
+    migration = (
+        ROOT / "migrations/versions/20261030_17_gemini_hostility_campaign.py"
+    ).read_text(encoding="utf-8")
+    upgrade, downgrade = migration.split("def downgrade() -> None:", maxsplit=1)
+    for configuration_id in (
+        "policy-v2",
+        "hostility-v2",
+        "hostility-luna-confirmation-100",
+        "hostility-luna-production-v1",
+        "hostility-gemini-25-flash-production",
+    ):
+        assert configuration_id in upgrade
+    assert "prediction_task='hostility'" in upgrade
+    assert "annotation_schema_slug='australian_partisan_hostility'" in upgrade
+    assert "configuration_id='hostility-gemini-25-flash-production'" in upgrade
+    assert "WHERE configuration_id='hostility-gemini-25-flash-production'" in downgrade
+    assert "refusing to remove their configuration" in downgrade
+    assert "hostility-luna-confirmation-100" in downgrade
+    assert "hostility-luna-production-v1" in downgrade
+
+
 def test_campaign_delete_route_requires_post_and_redirects_with_success_notice(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
