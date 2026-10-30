@@ -42,6 +42,7 @@ from hansard_annotator.llm_eval.prompt import build_system_prompt, prompt_hash
 from hansard_annotator.web.auth.models import Principal
 from hansard_annotator.web.campaigns.configurations import (
     APPROVED_AI_CONFIGURATIONS,
+    GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID,
     HOSTILITY_CONFIGURATION_ID,
     HOSTILITY_SCHEMA_SHA256,
     LUNA_PRODUCTION_CONFIGURATION_ID,
@@ -100,6 +101,143 @@ def test_luna_recovery_never_retries_success_or_evidence_resolution_failures() -
     assert _recovery_retry_eligible({"status": "provider_failure"}, is_luna=True)
     assert _recovery_retry_eligible({"status": "missing"}, is_luna=True)
     assert not _recovery_retry_eligible({"status": "success"}, is_luna=False)
+
+
+def test_gemini_hostility_recovery_retries_operational_failures_but_not_evidence_failures() -> None:
+    assert _recovery_retry_eligible(
+        {"status": "provider_failure"},
+        is_luna=False,
+        preserve_evidence_failures=True,
+    )
+    assert _recovery_retry_eligible(
+        {"status": "missing"},
+        is_luna=False,
+        preserve_evidence_failures=True,
+    )
+    assert _recovery_retry_eligible(
+        {"status": "invalid", "validation_error": "malformed structured output"},
+        is_luna=False,
+        preserve_evidence_failures=True,
+    )
+    assert not _recovery_retry_eligible(
+        {
+            "status": "invalid",
+            "validation_error": "hostility evidence must resolve uniquely to canonical text",
+        },
+        is_luna=False,
+        preserve_evidence_failures=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("configuration_id", "expected_error"),
+    [
+        (LUNA_PRODUCTION_CONFIGURATION_ID, "new provider submission is disabled"),
+        (
+            GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID,
+            "authorized Phase 4E child Batches",
+        ),
+    ],
+)
+def test_production_hostility_cannot_use_legacy_one_shot_submission(
+    monkeypatch: pytest.MonkeyPatch,
+    configuration_id: str,
+    expected_error: str,
+) -> None:
+    class _Connection:
+        def __enter__(self) -> _Connection:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def execute(self, _query: str, _params: object = None) -> Any:
+            class _Result:
+                def fetchone(self) -> dict[str, str]:
+                    return {"configuration_id": configuration_id}
+
+            return _Result()
+
+    class _NoProviderWork:
+        def create_cache(self, *_args: object, **_kwargs: object) -> Any:
+            raise AssertionError("legacy production route must not contact a provider")
+
+        def submit(self, *_args: object, **_kwargs: object) -> Any:
+            raise AssertionError("legacy production route must not submit a Batch")
+
+    monkeypatch.setattr(
+        "hansard_annotator.web.campaigns.service.psycopg.connect",
+        lambda *_args, **_kwargs: _Connection(),
+    )
+    with pytest.raises(CampaignError, match=expected_error):
+        submit_campaign(
+            _settings(),
+            _principal(),
+            "production-campaign",
+            PAID_CONFIRMATION,
+            gateway=cast(Any, _NoProviderWork()),
+        )
+
+
+def test_gemini_hostility_production_uses_typed_phase4e_authorization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configuration = approved_configuration(
+        GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID
+    )
+    campaign = _hostility_campaign_row(**configuration.persistence_values())
+    campaign.update(
+        {
+            "id": 10,
+            "public_id": UUID(int=10),
+            "status": "PLANNED",
+            "orchestration_status": "PLANNED",
+            "authorized_at": None,
+            "planned_count": 1_000,
+            "estimated_total_cost_usd": Decimal("3.25"),
+            "estimated_processing_cost_usd": Decimal("3.25"),
+            "record_set_sha256": "a" * 64,
+            "record_set_id": None,
+            "approved_record_set_sha256": None,
+        }
+    )
+
+    class _Connection:
+        def __enter__(self) -> _Connection:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def execute(self, query: str, _params: object = None) -> Any:
+            class _Result:
+                def __init__(self, value: dict[str, Any]) -> None:
+                    self.value = value
+
+                def fetchone(self) -> dict[str, Any]:
+                    return self.value
+
+            if query.startswith("SELECT * FROM ai_annotation_campaigns"):
+                return _Result(campaign)
+            if "SELECT count(*) FILTER" in query:
+                return _Result({"invalid_count": 0, "example_turn_key": None})
+            assert "UPDATE ai_annotation_campaigns SET status='READY'" in query
+            return _Result({**campaign, "status": "READY"})
+
+    monkeypatch.setattr(
+        "hansard_annotator.web.campaigns.phase4e.psycopg.connect",
+        lambda *_args, **_kwargs: _Connection(),
+    )
+    authorized = authorize_full_production(
+        _settings(),
+        _principal(),
+        str(campaign["public_id"]),
+        confirmation="START FULL PRODUCTION",
+        spend_ceiling_usd=Decimal("3.50"),
+    )
+    assert authorized["status"] == "READY"
+    assert authorized["provider"] == "gemini"
+    assert authorized["generation_config"] == {"thinking_budget": 0}
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -139,10 +277,15 @@ def test_hostility_launch_guard_rejects_a_prepared_non_policy_member() -> None:
         _assert_hostility_policy_eligible(cast(Any, _Connection()), 9)
 
 
-def test_luna_pilot_uses_fixed_size_seed_and_deterministic_order(
+@pytest.mark.parametrize(
+    "configuration_id",
+    [LUNA_PRODUCTION_CONFIGURATION_ID, GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID],
+)
+def test_hostility_production_pilot_uses_fixed_size_seed_and_deterministic_order(
     monkeypatch: pytest.MonkeyPatch,
+    configuration_id: str,
 ) -> None:
-    configuration = approved_configuration(LUNA_PRODUCTION_CONFIGURATION_ID)
+    configuration = approved_configuration(configuration_id)
     candidates = [
         {
             "id": index,
@@ -395,6 +538,7 @@ def test_approved_campaign_registry_is_closed_and_frozen() -> None:
         POLICY_CONFIGURATION_ID,
         HOSTILITY_CONFIGURATION_ID,
         LUNA_PRODUCTION_CONFIGURATION_ID,
+        GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID,
     }
     policy = approved_configuration(POLICY_CONFIGURATION_ID)
     hostility = approved_configuration(HOSTILITY_CONFIGURATION_ID)
@@ -428,6 +572,21 @@ def test_approved_campaign_registry_is_closed_and_frozen() -> None:
     assert hostility.record_set_id == HELDOUT_SAMPLE_ID
     assert hostility.record_set_size == 100
     assert hostility.record_set_sha256 == HELDOUT_SAMPLE_SHA256
+
+    gemini_production = approved_configuration(
+        GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID
+    )
+    assert gemini_production.display_label == "Hostility Gemini 2.5 Flash Production"
+    assert gemini_production.provider == "gemini"
+    assert gemini_production.configured_model == "gemini-2.5-flash"
+    assert gemini_production.prompt_version == "hostility-prompt-v2"
+    assert gemini_production.prompt_sha256 == "185f5162348ae3b3d735ea43247da18cf6b3c1bb12f8a72cad57e38ce31cb1a8"
+    assert gemini_production.prediction_contract_sha256 == "dc716b49e0759ba7063973038b234f6696e778c4d90ee4a405d9600a2435b11d"
+    assert gemini_production.canonical_schema_sha256 == "959a51a987e0777cb72dc7ad12cd5b896429bef400b79f386764a20ddc3d5669"
+    assert gemini_production.provider_schema_sha256 == "acc89d3ec08d8767b572d70814de2306ddb2386bcd1747a6238245ac01ce2581"
+    assert gemini_production.generation_config == {"thinking_budget": 0}
+    assert gemini_production.execution_mode == "batch"
+    assert gemini_production.record_set_mode == "deterministic_selection"
 
     luna = approved_configuration(LUNA_PRODUCTION_CONFIGURATION_ID)
     assert luna.provider == "openai"
@@ -882,6 +1041,51 @@ def test_hostility_provider_plan_and_submission_use_hostility_contract_and_model
     assert gateway.submitted_models == ["gemini-2.5-flash"]
 
 
+def test_gemini_hostility_production_uses_existing_structured_batch_plan() -> None:
+    configuration = approved_configuration(
+        GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID
+    )
+    records = (
+        {
+            "record_id": "turn:production-key",
+            "speech": {
+                "date": "2026-01-01",
+                "chamber": "House",
+                "speaker_name": "Speaker",
+                "major_heading": "Debate",
+                "minor_heading": None,
+                "business_type": None,
+                "text": "They have betrayed the public trust.",
+            },
+        },
+    )
+    record_set_sha256 = canonical_hash([records[0]["record_id"]])
+    campaign_values = configuration.persistence_values()
+    campaign_values.update(
+        {
+            "record_set_id": None,
+            "approved_record_set_sha256": None,
+            "record_set_sha256": record_set_sha256,
+            "selection_definition": {
+                "eligibility_rule": HOSTILITY_POLICY_ELIGIBILITY_RULE
+            },
+            "cache_identifier": "cachedContents/gemini-hostility-production",
+            "public_id": "gemini-hostility-production",
+        }
+    )
+    campaign = _hostility_campaign_row(**campaign_values)
+
+    plan = _provider_plan(campaign, records)
+
+    assert plan["provenance"]["provider"] == "gemini"
+    assert plan["provenance"]["model"] == "gemini-2.5-flash"
+    assert plan["provenance"]["prompt_version"] == "hostility-prompt-v2"
+    assert plan["provenance"]["thinking_budget"] == 0
+    request = plan["request"]["batch"]["input_config"]["requests"]["requests"][0]["request"]
+    assert request["generationConfig"]["thinkingConfig"] == {"thinkingBudget": 0}
+    assert set(request["generationConfig"]["responseSchema"]["properties"]) == HOSTILITY_PREDICTION_FIELDS
+
+
 def test_hostility_collection_validation_and_import_use_hostility_adapter(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1208,8 +1412,11 @@ def test_webui_templates_render_task_aware_new_and_detail_views(
     assert 'name="prompt_version"' not in new_html
     assert 'name="configured_model"' not in new_html
     assert 'name="sample_sha256"' not in new_html
-    assert "hostility-luna-production-pilot-1000" in new_html
-    assert "policy-eligible records only" in new_html
+    assert "hostility-gemini-25-flash-production-pilot-1000" in new_html
+    assert "Recommended production workflow" in new_html
+    assert new_html.index("Hostility Gemini 2.5 Flash Production") < new_html.index(
+        "Historical / previous provider pilot"
+    )
 
     # Test get_campaign + detail.html for a READY hostility campaign.
     ready_row = _hostility_campaign_row(
@@ -1247,6 +1454,8 @@ def test_webui_templates_render_task_aware_new_and_detail_views(
 
             if "FROM ai_annotation_campaigns campaign" in query:
                 return _R(ready_row)
+            if "ai_annotation_campaign_is_deletable" in query:
+                return _R({"eligible": False})
             if "FROM ai_annotation_campaign_batches" in query and "count(*)" in query:
                 return _R({"chunks_total": 0})
             return _R([])
@@ -1284,23 +1493,38 @@ def test_webui_templates_render_task_aware_new_and_detail_views(
     assert "Already human annotated (exclusive)" not in detail_html
     assert "Phase 4E child Batch orchestration" not in detail_html
     assert "Deterministic structural repairs" not in detail_html
+    assert "provider or research activity" in detail_html
+    assert 'action="/ai-annotation/' + str(ready_row["public_id"]) + '/delete"' not in detail_html
+    eligible_detail_html = env.get_template("campaigns/detail.html").render(
+        principal=_principal(),
+        campaign={**detail_campaign, "deletion_eligible": True},
+        credentials=credential_status(),
+        notice_message=None,
+        phase4e_defaults={
+            "enqueued_token_ceiling": 10_000_000,
+            "safety_factor": 0.9,
+            "max_chunk_records": 1000,
+        },
+    )
+    assert "Delete unused campaign" in eligible_detail_html
+    assert "Delete " + str(ready_row["name"]) in eligible_detail_html
 
-    luna_config = approved_configuration(LUNA_PRODUCTION_CONFIGURATION_ID)
+    luna_config = approved_configuration(GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID)
     luna_draft = {
         **luna_config.persistence_values(),
-        "public_id": "luna-draft",
+        "public_id": "gemini-draft",
         "status": "DRAFT",
         "configuration_display_label": luna_config.display_label,
         "configuration_class": "APPROVED_PRODUCTION",
         "record_set_mode": "deterministic_selection",
         "corpus_name": "Australian Commonwealth Hansard 1998-2025",
         "corpus_run_name": "phase1-full-20260723-v4",
-        "luna_corpus_total_count": 160_577,
+        "hostility_corpus_total_count": 160_577,
         "latest_policy_count": 160_567,
         "policy_eligible_count": 117_893,
         "excluded_non_policy_count": 42_674,
         "missing_latest_policy_count": 10,
-        "luna_eligible_count": 117_893,
+        "hostility_eligible_count": 117_893,
         "preview": [],
         "operational_metadata": {},
         "recoveries": [],
@@ -1319,6 +1543,78 @@ def test_webui_templates_render_task_aware_new_and_detail_views(
     assert "Eligible policy records" in luna_html
     assert "117,893" in luna_html
     assert "Excluded non-policy" in luna_html
-    assert "Prepare 1,000-record Luna production pilot" in luna_html
+    assert "Prepare 1,000-record Gemini production pilot" in luna_html
     assert "hostility-luna-production-pilot-1000-v1" in luna_html
-    assert "Prepare full remaining Luna production set" in luna_html
+    assert "Prepare full remaining Gemini production set" in luna_html
+
+
+def test_hostility_gemini_recovery_ui_keeps_evidence_failures_terminal() -> None:
+    template = Environment(
+        loader=FileSystemLoader(ROOT / "src/hansard_annotator/web/templates"),
+        autoescape=select_autoescape(["html"]),
+    ).get_template("campaigns/detail.html")
+    campaign = {
+        **approved_configuration(GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID).persistence_values(),
+        "name": "Gemini production",
+        "public_id": "gemini-recovery",
+        "status": "COLLECTED",
+        "configuration_display_label": "Hostility Gemini 2.5 Flash Production",
+        "configuration_class": "APPROVED_PRODUCTION",
+        "corpus_name": "Australian Commonwealth Hansard",
+        "corpus_run_name": "phase1-full-20260723-v4",
+        "generation_config": {"thinking_budget": 0},
+        "record_set_mode": "deterministic_selection",
+        "preview": [],
+        "operational_metadata": {},
+        "recoveries": [],
+        "batch_progress": {},
+        "retryable_failure_count": 2,
+        "invalid_count": 3,
+        "structural_repair_available_count": 0,
+        "provider_refusal_available_count": 0,
+        "active_recovery": None,
+        "valid_count": 97,
+        "terminal_invalid_count": 0,
+        "planned_count": 100,
+        "provider_refusal_applied_count": 0,
+        "run_public_id": None,
+        "recovery_cost_usd": 0,
+        "campaign_total_cost_usd": 0,
+        "estimated_input_tokens": 0,
+        "estimated_cached_input_tokens": 0,
+        "estimated_uncached_input_tokens": 0,
+        "estimated_output_tokens": 0,
+        "estimated_processing_cost_usd": 0,
+        "estimated_cache_storage_cost_usd": 0,
+        "estimated_total_cost_usd": 0,
+        "provider": "gemini",
+        "authorized_at": "2026-10-30T00:00:00Z",
+        "cache_plan_status": "NOT_REQUIRED",
+        "cache_identifier": None,
+        "cache_model": None,
+        "cache_created_at": None,
+        "cache_expires_at": None,
+        "cache_content_sha256": None,
+        "cache_verified_at": None,
+        "orchestration_mode": "CHUNKED",
+        "orchestration_status": "RUNNING",
+        "chunk_page": 1,
+        "chunk_pages": 1,
+        "chunk_preview": [],
+        "chunk_planner_version": "phase4e-v1",
+        "enqueued_token_ceiling": 1,
+        "enqueued_token_safety_factor": 1,
+        "collected_at": None,
+        "validated_at": None,
+        "imported_at": None,
+        "structural_repair_applied_count": 0,
+    }
+    html = template.render(
+        campaign=campaign,
+        principal=_principal(),
+        credentials={"gemini": {"configured": False, "environment_variables": ("GEMINI_API_KEY",)}},
+        phase4e_defaults={"enqueued_token_ceiling": 1, "safety_factor": 1, "max_chunk_records": 1},
+        notice_message=None,
+    )
+    assert "Retry 2 records — paid Gemini provider action" in html
+    assert "Evidence-resolution failures remain terminal" in html

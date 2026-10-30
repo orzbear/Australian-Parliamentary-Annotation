@@ -26,6 +26,7 @@ from hansard_annotator.web.campaigns.service import (
     collect_recovery,
     create_campaign,
     credential_status,
+    delete_unused_campaign,
     get_campaign,
     import_campaign,
     list_campaigns,
@@ -82,6 +83,7 @@ def _notice_message(code: str | None, campaign: dict[str, object]) -> str | None
         "orchestration-resumed": "Child Batch orchestration resumed.",
         "orchestration-ticked": "One orchestration iteration completed.",
         "campaign-cancelled": "Campaign cancelled.",
+        "campaign-deleted": "Unused campaign deleted. Local planning rows were removed; provider and research history is preserved.",
     }
     if code == "validation-passed":
         return f"Validation passed: {campaign.get('valid_count', 0)} / {campaign.get('planned_count', 0)}."
@@ -95,6 +97,7 @@ def campaign_list(
     request: Request,
     settings: Annotated[WebSettings, Depends(get_settings)],
     principal: Annotated[Principal, Depends(require_admin)],
+    notice: str | None = None,
 ) -> object:
     return _templates(request).TemplateResponse(
         request,
@@ -103,6 +106,11 @@ def campaign_list(
             "principal": principal,
             "campaigns": list_campaigns(settings, principal),
             "credentials": credential_status(),
+            "notice_message": (
+                "Unused campaign deleted."
+                if notice == "campaign-deleted"
+                else None
+            ),
         },
     )
 
@@ -179,6 +187,29 @@ def campaign_detail(
                 "max_chunk_records": max_chunk_records,
             },
         },
+    )
+
+
+@router.post("/{campaign_id}/delete")
+async def campaign_delete(
+    request: Request,
+    campaign_id: str,
+    settings: Annotated[WebSettings, Depends(get_settings)],
+    principal: Annotated[Principal, Depends(require_admin)],
+    confirmation: Annotated[str, Form()],
+) -> RedirectResponse:
+    await enforce_csrf(request, principal, settings)
+    try:
+        delete_unused_campaign(
+            settings,
+            principal,
+            campaign_id,
+            confirmation=confirmation,
+        )
+    except (CampaignError, LookupError, PermissionError, ValueError) as error:
+        raise _http_error(error) from error
+    return RedirectResponse(
+        "/ai-annotation?notice=campaign-deleted", status_code=303
     )
 
 

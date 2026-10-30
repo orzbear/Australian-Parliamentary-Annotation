@@ -57,9 +57,10 @@ from hansard_annotator.llm_eval.prompt import (
     prompt_hash,
 )
 from hansard_annotator.llm_eval.providers import _http_json
+from hansard_annotator.web.audit.service import record_event
 from hansard_annotator.web.auth.models import Principal
 from hansard_annotator.web.campaigns.configurations import (
-    APPROVED_AI_CONFIGURATIONS,
+    GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID,
     LUNA_PRODUCTION_CONFIGURATION_ID,
     POLICY_CONFIGURATION_ID,
     ApprovedAIConfiguration,
@@ -94,8 +95,13 @@ PRODUCTION_EXECUTION_MODE = "batch"
 DEFAULT_EXCLUDE_HUMAN_ANNOTATED = True
 AI_ELIGIBILITY_RULE = "prompt_text_present_v1"
 HOSTILITY_POLICY_ELIGIBILITY_RULE = "latest_policy_is_non_policy_false_v1"
-LUNA_PRODUCTION_PILOT_SEED = "hostility-luna-production-pilot-1000-v1"
-LUNA_PRODUCTION_PILOT_SIZE = 1_000
+HOSTILITY_PRODUCTION_PILOT_SEED = "hostility-luna-production-pilot-1000-v1"
+HOSTILITY_PRODUCTION_PILOT_SIZE = 1_000
+LUNA_PRODUCTION_PILOT_SEED = HOSTILITY_PRODUCTION_PILOT_SEED
+LUNA_PRODUCTION_PILOT_SIZE = HOSTILITY_PRODUCTION_PILOT_SIZE
+HOSTILITY_PRODUCTION_CONFIGURATION_IDS = frozenset(
+    {GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID, LUNA_PRODUCTION_CONFIGURATION_ID}
+)
 OTHER_EXCLUSION_LABELS = {
     "missing_prompt_text": "No cleaned or raw speech text",
     "hostility_policy_eligibility": (
@@ -170,6 +176,12 @@ class CampaignError(ValueError):
     """Campaign state, identity, or lifecycle invariant failed."""
 
 
+def is_hostility_production_campaign(campaign: dict[str, Any]) -> bool:
+    return str(campaign.get("configuration_id") or "") in (
+        HOSTILITY_PRODUCTION_CONFIGURATION_IDS
+    )
+
+
 def validate_transition(current: str, target: str) -> None:
     if current not in STATES or target not in STATES:
         raise CampaignError("unknown campaign state")
@@ -191,11 +203,26 @@ def production_configuration() -> dict[str, Any]:
 
 
 def approved_campaign_configurations() -> list[dict[str, Any]]:
-    return [
-        value.persistence_values()
-        for value in APPROVED_AI_CONFIGURATIONS.values()
-        if value.execution_mode != "local_evaluation"
+    ordered_ids = (
+        GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID,
+        POLICY_CONFIGURATION_ID,
+        "hostility-v2",
+        LUNA_PRODUCTION_CONFIGURATION_ID,
+    )
+    configurations = [
+        approved_configuration(identifier).persistence_values()
+        for identifier in ordered_ids
     ]
+    luna = next(
+        item
+        for item in configurations
+        if item["configuration_id"] == LUNA_PRODUCTION_CONFIGURATION_ID
+    )
+    luna["display_label"] = "Historical / previous provider pilot — GPT-6 Luna"
+    luna["description"] = (
+        "Historical Luna configuration retained for review and audit; new paid Luna work is disabled."
+    )
+    return configurations
 
 
 def configuration_class(configuration: dict[str, Any]) -> str:
@@ -871,7 +898,7 @@ def create_campaign(
         )
     configuration = approved.persistence_values()
     with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
-        if approved.configuration_id == LUNA_PRODUCTION_CONFIGURATION_ID:
+        if approved.configuration_id in HOSTILITY_PRODUCTION_CONFIGURATION_IDS:
             corpus_run = connection.execute(
                 """
                 SELECT run.run_name FROM corpora corpus
@@ -883,7 +910,7 @@ def create_campaign(
             ).fetchone()
             if corpus_run is None or corpus_run["run_name"] != "phase1-full-20260723-v4":
                 raise CampaignError(
-                    "Luna production is restricted to the active phase1-full-20260723-v4 corpus"
+                    "hostility production is restricted to the active phase1-full-20260723-v4 corpus"
                 )
         reusable = connection.execute(
             """
@@ -988,6 +1015,81 @@ def list_campaigns(settings: WebSettings, principal: Principal) -> list[dict[str
                 """
             ).fetchall()
         ]
+
+
+def delete_unused_campaign(
+    settings: WebSettings,
+    principal: Principal,
+    public_id: str,
+    *,
+    confirmation: str,
+) -> None:
+    """Delete a campaign only when the database guard proves it is local-only."""
+    _require_admin(principal)
+    with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection, connection.transaction():
+        campaign = connection.execute(
+            """
+            SELECT * FROM ai_annotation_campaigns
+            WHERE public_id::text=%s FOR UPDATE
+            """,
+            (public_id,),
+        ).fetchone()
+        if campaign is None:
+            raise LookupError("AI annotation campaign not found")
+        if confirmation != f"Delete {campaign['name']}":
+            raise CampaignError("confirmation phrase does not match the campaign name")
+        campaign_id = int(campaign["id"])
+        children = connection.execute(
+            """
+            SELECT id FROM ai_annotation_campaign_batches
+            WHERE campaign_id=%s ORDER BY id FOR UPDATE
+            """,
+            (campaign_id,),
+        ).fetchall()
+        records = connection.execute(
+            """
+            SELECT id FROM ai_annotation_campaign_records
+            WHERE campaign_id=%s ORDER BY id FOR UPDATE
+            """,
+            (campaign_id,),
+        ).fetchall()
+        eligible = connection.execute(
+            "SELECT ai_annotation_campaign_is_deletable(%s) AS eligible",
+            (campaign_id,),
+        ).fetchone()
+        if eligible is None or eligible["eligible"] is not True:
+            raise CampaignError(
+                "This campaign cannot be deleted because it has provider or research activity. "
+                "Preserve it for audit history."
+            )
+        connection.execute(
+            "SELECT set_config('hansard.allow_unused_campaign_delete',%s,true)",
+            (str(campaign_id),),
+        )
+        connection.execute(
+            "DELETE FROM ai_annotation_campaign_batches WHERE campaign_id=%s",
+            (campaign_id,),
+        )
+        connection.execute(
+            "DELETE FROM ai_annotation_campaign_records WHERE campaign_id=%s",
+            (campaign_id,),
+        )
+        connection.execute(
+            "DELETE FROM ai_annotation_campaigns WHERE id=%s",
+            (campaign_id,),
+        )
+        record_event(
+            connection,
+            "unused_campaign_deleted",
+            "ai_annotation_campaign",
+            actor_user_id=principal.user_id,
+            entity_public_id=campaign["public_id"],
+            metadata={
+                "campaign_name": campaign["name"],
+                "deleted_batch_count": len(children),
+                "deleted_record_count": len(records),
+            },
+        )
 
 
 def _legacy_other_exclusion_breakdown(
@@ -1132,20 +1234,33 @@ def get_campaign(
             )
             result["approved_record_set_size"] = result.get("planned_count")
         result["cache_plan_status"] = cache_plan_status(result)
+        deletion_state = connection.execute(
+            "SELECT ai_annotation_campaign_is_deletable(%s) AS eligible",
+            (result["id"],),
+        ).fetchone()
+        result["deletion_eligible"] = bool(
+            deletion_state is not None and deletion_state["eligible"]
+        )
+        result["deletion_block_reason"] = (
+            None
+            if result["deletion_eligible"]
+            else "This campaign has provider or research activity, or its state cannot be proven local-only. Preserve it for audit history."
+        )
         if (
             approved is not None
-            and approved.configuration_id == LUNA_PRODUCTION_CONFIGURATION_ID
+            and approved.configuration_id in HOSTILITY_PRODUCTION_CONFIGURATION_IDS
             and result["status"] == "DRAFT"
         ):
-            luna_breakdown = _planning_breakdown(
+            hostility_breakdown = _planning_breakdown(
                 connection, result, exclude_human_annotated=False
             )
-            result["luna_eligible_count"] = int(luna_breakdown["eligible_count"])
-            result["luna_corpus_total_count"] = int(luna_breakdown["corpus_total_count"])
-            result["latest_policy_count"] = int(luna_breakdown["latest_policy_count"])
-            result["policy_eligible_count"] = int(luna_breakdown["policy_eligible_count"])
-            result["excluded_non_policy_count"] = int(luna_breakdown["excluded_non_policy_count"])
-            result["missing_latest_policy_count"] = int(luna_breakdown["missing_latest_policy_count"])
+            result["hostility_eligible_count"] = int(hostility_breakdown["eligible_count"])
+            result["luna_eligible_count"] = result["hostility_eligible_count"]
+            result["hostility_corpus_total_count"] = int(hostility_breakdown["corpus_total_count"])
+            result["latest_policy_count"] = int(hostility_breakdown["latest_policy_count"])
+            result["policy_eligible_count"] = int(hostility_breakdown["policy_eligible_count"])
+            result["excluded_non_policy_count"] = int(hostility_breakdown["excluded_non_policy_count"])
+            result["missing_latest_policy_count"] = int(hostility_breakdown["missing_latest_policy_count"])
         selection = cast(dict[str, Any], result.get("selection_definition") or {})
         other_reasons = selection.get("other_exclusion_reasons")
         if not isinstance(other_reasons, dict) and selection.get(
@@ -1241,7 +1356,7 @@ def get_campaign(
             (row["id"],),
         ).fetchone()
         result["batch_progress"] = dict(batch_progress) if batch_progress else {}
-        if result.get("configuration_id") == LUNA_PRODUCTION_CONFIGURATION_ID:
+        if is_hostility_production_campaign(result):
             progress = result["batch_progress"]
             result["retryable_failure_count"] = (
                 int(progress.get("chunk_invalid") or 0)
@@ -1369,7 +1484,10 @@ def plan_campaign(
             if limit != configuration.record_set_size:
                 raise CampaignError("frozen hostility sample requires planned_count=100")
             return _plan_frozen_sample_campaign(connection, dict(campaign), configuration)
-        if configuration.configuration_id == LUNA_PRODUCTION_CONFIGURATION_ID:
+        is_hostility_production = (
+            configuration.configuration_id in HOSTILITY_PRODUCTION_CONFIGURATION_IDS
+        )
+        if is_hostility_production:
             current_run = connection.execute(
                 """
                 SELECT run.run_name FROM corpora corpus
@@ -1380,34 +1498,34 @@ def plan_campaign(
                 (campaign["corpus_id"],),
             ).fetchone()
             if current_run is None or current_run["run_name"] != "phase1-full-20260723-v4":
-                raise CampaignError("Luna production corpus/run identity has changed")
+                raise CampaignError("hostility production corpus/run identity has changed")
             if exclude_human_annotated or retry_provider_refusals:
                 raise CampaignError(
-                    "Luna production must include human-annotated turns and cannot retry prior failures during selection"
+                    "hostility production must include human-annotated turns and cannot retry prior failures during selection"
                 )
-            if seed not in {
-                "hostility-luna-production-v1",
-                LUNA_PRODUCTION_PILOT_SEED,
-            }:
-                raise CampaignError("Luna production selection seed is frozen")
+            full_seed = (
+                "hostility-gemini-25-flash-production-v1"
+                if configuration.configuration_id
+                == GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID
+                else "hostility-luna-production-v1"
+            )
+            if seed not in {full_seed, HOSTILITY_PRODUCTION_PILOT_SEED}:
+                raise CampaignError("hostility production selection seed is frozen")
         breakdown = _planning_breakdown(
             connection,
             dict(campaign),
             exclude_human_annotated=exclude_human_annotated,
             retry_provider_refusals=retry_provider_refusals,
         )
-        luna_pilot = (
-            configuration.configuration_id == LUNA_PRODUCTION_CONFIGURATION_ID
-            and seed == LUNA_PRODUCTION_PILOT_SEED
-        )
-        if configuration.configuration_id == LUNA_PRODUCTION_CONFIGURATION_ID:
-            if luna_pilot and limit != LUNA_PRODUCTION_PILOT_SIZE:
-                raise CampaignError("Luna production pilot requires exactly 1,000 records")
-            if luna_pilot and int(breakdown["eligible_count"]) < LUNA_PRODUCTION_PILOT_SIZE:
+        hostility_pilot = is_hostility_production and seed == HOSTILITY_PRODUCTION_PILOT_SEED
+        if is_hostility_production:
+            if hostility_pilot and limit != HOSTILITY_PRODUCTION_PILOT_SIZE:
+                raise CampaignError("hostility production pilot requires exactly 1,000 records")
+            if hostility_pilot and int(breakdown["eligible_count"]) < HOSTILITY_PRODUCTION_PILOT_SIZE:
                 raise CampaignError("fewer than 1,000 policy-eligible hostility records are available")
-            if not luna_pilot and limit != int(breakdown["eligible_count"]):
+            if not hostility_pilot and limit != int(breakdown["eligible_count"]):
                 raise CampaignError(
-                    "Luna full-production plan must include every remaining eligible annotation-ready turn"
+                    "full hostility production plan must include every remaining eligible annotation-ready turn"
                 )
         record_set_hasher = _RecordSetHasher()
         selected_count = 0
@@ -1478,7 +1596,7 @@ def plan_campaign(
                 if configuration.prediction_task == "hostility"
                 else AI_ELIGIBILITY_RULE
             ),
-            "selection_kind": "production_pilot_1000" if luna_pilot else "full_eligible_population" if configuration.configuration_id == LUNA_PRODUCTION_CONFIGURATION_ID else "ordinary_deterministic_selection",
+            "selection_kind": "production_pilot_1000" if hostility_pilot else "full_eligible_population" if is_hostility_production else "ordinary_deterministic_selection",
             "exclude_human_annotated": exclude_human_annotated,
             "retry_provider_refusals": retry_provider_refusals,
             "human_annotated_count": breakdown["human_annotated_count"],
@@ -1838,6 +1956,10 @@ def ensure_campaign_cache(
         if row is None:
             raise LookupError("AI annotation campaign not found")
         campaign = dict(row)
+        if campaign.get("configuration_id") == LUNA_PRODUCTION_CONFIGURATION_ID:
+            raise CampaignError(
+                "Luna is retained as a historical pilot; no new provider work is allowed"
+            )
         if campaign["status"] != "READY" or campaign["provider_job_id"] is not None:
             raise CampaignError("campaign is not ready for cache preparation")
         if configuration_class(campaign) != "APPROVED_PRODUCTION":
@@ -1907,6 +2029,22 @@ def submit_campaign(
     _require_admin(principal)
     if confirmation != PAID_CONFIRMATION:
         raise CampaignError(f"paid submission requires typing {PAID_CONFIRMATION}")
+    with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
+        row = connection.execute(
+            "SELECT configuration_id FROM ai_annotation_campaigns WHERE public_id::text=%s",
+            (public_id,),
+        ).fetchone()
+    if row is None:
+        raise LookupError("AI annotation campaign not found")
+    configuration_id = str(row.get("configuration_id") or "")
+    if configuration_id == LUNA_PRODUCTION_CONFIGURATION_ID:
+        raise CampaignError(
+            "Luna is retained as a historical pilot; new provider submission is disabled"
+        )
+    if configuration_id == GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID:
+        raise CampaignError(
+            "Gemini hostility production must use authorized Phase 4E child Batches"
+        )
     provider = gateway or LiveGeminiGateway()
     ensure_campaign_cache(settings, principal, public_id, gateway=provider)
     with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
@@ -2283,14 +2421,19 @@ def _mark_recovery_failed(
         )
 
 
-def _recovery_retry_eligible(result: dict[str, Any], *, is_luna: bool) -> bool:
+def _recovery_retry_eligible(
+    result: dict[str, Any],
+    *,
+    is_luna: bool,
+    preserve_evidence_failures: bool = False,
+) -> bool:
     status = result.get("status")
     if status in {"provider_failure", "missing"}:
         return True
     if status != "invalid":
         return False
     return not (
-        is_luna
+        (is_luna or preserve_evidence_failures)
         and result.get("validation_error")
         == "hostility evidence must resolve uniquely to canonical text"
     )
@@ -2322,8 +2465,14 @@ def submit_recovery(
         if configuration_class(campaign) != "APPROVED_PRODUCTION":
             raise CampaignError("recovery requires the approved production configuration")
         is_luna = campaign.get("configuration_id") == LUNA_PRODUCTION_CONFIGURATION_ID
-        if is_luna and gateway is None:
-            provider = OpenAIBatchGateway()
+        if is_luna:
+            raise CampaignError(
+                "paid Luna recovery is disabled because Luna is retained as a historical pilot"
+            )
+        preserve_evidence_failures = (
+            campaign.get("configuration_id")
+            == GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID
+        )
         _original_coverage_complete(campaign)
         active = connection.execute(
             """
@@ -2342,7 +2491,11 @@ def submit_recovery(
         unresolved_digest = hashlib.sha256(b"[")
         unresolved_count = 0
         for result in iter_jsonl(source_path):
-            if not _recovery_retry_eligible(result, is_luna=is_luna):
+            if not _recovery_retry_eligible(
+                result,
+                is_luna=is_luna,
+                preserve_evidence_failures=preserve_evidence_failures,
+            ):
                 continue
             record_id = result.get("record_id")
             if not isinstance(record_id, str):
@@ -2409,7 +2562,11 @@ def submit_recovery(
         ).fetchone()
         assert recovery is not None
         for result in iter_jsonl(source_path):
-            if not _recovery_retry_eligible(result, is_luna=is_luna):
+            if not _recovery_retry_eligible(
+                result,
+                is_luna=is_luna,
+                preserve_evidence_failures=preserve_evidence_failures,
+            ):
                 continue
             record_id = str(result["record_id"])
             error = result.get("validation_error") or result.get("provider_error")
@@ -3230,7 +3387,7 @@ def validate_campaign(
                 directory, prediction_task=configuration.prediction_task,
                 terminal_recovery_history=recovery_history,
                 require_recovery_lineage=(
-                    configuration.configuration_id != LUNA_PRODUCTION_CONFIGURATION_ID
+                    not is_hostility_production_campaign(dict(campaign))
                 ),
             )
         )
@@ -3248,7 +3405,7 @@ def validate_campaign(
             raise CampaignError("validated result coverage does not equal planned records")
         if int(coverage.get("duplicate_mappings") or 0):
             raise CampaignError("unresolved provider results or mappings block import")
-        if configuration.configuration_id != LUNA_PRODUCTION_CONFIGURATION_ID and any(
+        if not is_hostility_production_campaign(dict(campaign)) and any(
             int(coverage.get(key) or 0)
             for key in ("failed_provider_responses", "missing_responses")
         ):
@@ -3305,7 +3462,7 @@ def import_campaign(
             expected_configuration=expected,
             terminal_recovery_history=terminal_recovery_history,
             require_terminal_recovery_lineage=(
-                configuration.configuration_id != LUNA_PRODUCTION_CONFIGURATION_ID
+                not is_hostility_production_campaign(dict(campaign))
             ),
             campaign_provenance={
                 "campaign_id": str(campaign["public_id"]),
