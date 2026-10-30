@@ -36,6 +36,7 @@ from hansard_annotator.web.campaigns.service import (
     collect_campaign,
     configuration_class,
     credential_status,
+    delete_unused_campaign,
     deterministic_selection,
     ensure_campaign_cache,
     estimate_plan,
@@ -1238,3 +1239,170 @@ def test_phase4d_services_reuse_phase4b_and_phase4c_instead_of_parallel_algorith
     assert "create_review_audit" in export_service
     assert "UPDATE model_predictions" not in export_service
     assert "INSERT INTO model_prediction_reviews" not in export_service
+
+
+class _CampaignDeleteResult:
+    def __init__(self, rows: list[dict[str, Any]] | None = None) -> None:
+        self.rows = rows or []
+
+    def fetchone(self) -> dict[str, Any] | None:
+        return self.rows[0] if self.rows else None
+
+    def fetchall(self) -> list[dict[str, Any]]:
+        return self.rows
+
+
+class _CampaignDeleteTransaction:
+    def __enter__(self) -> _CampaignDeleteTransaction:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+
+class _CampaignDeleteConnection:
+    def __init__(
+        self,
+        campaign: dict[str, Any],
+        *,
+        eligible: bool,
+        batch_count: int = 0,
+        record_count: int = 0,
+    ) -> None:
+        self.campaign = campaign
+        self.eligible = eligible
+        self.batch_count = batch_count
+        self.record_count = record_count
+        self.statements: list[tuple[str, object]] = []
+
+    def __enter__(self) -> _CampaignDeleteConnection:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def transaction(self) -> _CampaignDeleteTransaction:
+        return _CampaignDeleteTransaction()
+
+    def execute(self, query: str, parameters: object = None) -> _CampaignDeleteResult:
+        sql = " ".join(query.split())
+        self.statements.append((sql, parameters))
+        if "SELECT * FROM ai_annotation_campaigns" in sql:
+            return _CampaignDeleteResult([self.campaign])
+        if "SELECT id FROM ai_annotation_campaign_batches" in sql:
+            return _CampaignDeleteResult([{"id": value} for value in range(self.batch_count)])
+        if "SELECT id FROM ai_annotation_campaign_records" in sql:
+            return _CampaignDeleteResult([{"id": value} for value in range(self.record_count)])
+        if "ai_annotation_campaign_is_deletable" in sql:
+            return _CampaignDeleteResult([{"eligible": self.eligible}])
+        return _CampaignDeleteResult()
+
+
+def _unused_campaign() -> dict[str, Any]:
+    return {"id": 19, "public_id": UUID(int=19), "name": "Unused draft"}
+
+
+def test_admin_can_delete_unused_draft_and_local_planning_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hansard_annotator.web.campaigns import service as campaign_service
+
+    connection = _CampaignDeleteConnection(
+        {**_unused_campaign(), "status": "PLANNED"},
+        eligible=True,
+        batch_count=2,
+        record_count=5,
+    )
+    monkeypatch.setattr(campaign_service.psycopg, "connect", lambda *_args, **_kwargs: connection)
+
+    delete_unused_campaign(
+        _settings(), _principal(), str(connection.campaign["public_id"]),
+        confirmation="Delete Unused draft",
+    )
+
+    statements = [statement for statement, _ in connection.statements]
+    assert "FOR UPDATE" in statements[0]
+    assert statements.index("DELETE FROM ai_annotation_campaign_batches WHERE campaign_id=%s") < statements.index(
+        "DELETE FROM ai_annotation_campaign_records WHERE campaign_id=%s"
+    ) < statements.index("DELETE FROM ai_annotation_campaigns WHERE id=%s")
+    assert statements[-1].startswith("INSERT INTO audit_events")
+    assert all(parameters in ((19,),) for statement, parameters in connection.statements if "DELETE FROM" in statement)
+
+
+def test_campaign_delete_rejects_non_admin_bad_confirmation_and_forged_ineligible_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hansard_annotator.web.campaigns import service as campaign_service
+
+    with pytest.raises(PermissionError):
+        delete_unused_campaign(
+            _settings(), _principal(admin=False), "campaign-id",
+            confirmation="Delete Unused draft",
+        )
+
+    connection = _CampaignDeleteConnection(_unused_campaign(), eligible=False)
+    monkeypatch.setattr(campaign_service.psycopg, "connect", lambda *_args, **_kwargs: connection)
+    with pytest.raises(CampaignError, match="provider or research activity"):
+        delete_unused_campaign(
+            _settings(), _principal(), str(connection.campaign["public_id"]),
+            confirmation="Delete Unused draft",
+        )
+    assert not any("DELETE FROM" in statement for statement, _ in connection.statements)
+
+    with pytest.raises(CampaignError, match="confirmation phrase"):
+        delete_unused_campaign(
+            _settings(), _principal(), str(connection.campaign["public_id"]),
+            confirmation="Delete campaign",
+        )
+
+
+def test_campaign_deletion_migration_blocks_provider_and_research_provenance() -> None:
+    migration = (
+        ROOT / "migrations/versions/20261030_16_unused_campaign_deletion.py"
+    ).read_text(encoding="utf-8")
+    assert 'revision = "20261030_16"' in migration
+    assert 'down_revision = "20261029_15"' in migration
+    for guarded_state in (
+        "campaign.provider_job_id IS NULL",
+        "batch.provider_job_id IS NOT NULL",
+        "batch.provider_input_file_id IS NOT NULL",
+        "campaign.model_prediction_run_id IS NULL",
+        "ai_annotation_campaign_recoveries recovery",
+        "audit_events event",
+        "campaign.authorized_at IS NULL",
+        "batch.status<>'PENDING'",
+        "event.entity_public_id=campaign.public_id",
+    ):
+        assert guarded_state in migration
+    assert "ON DELETE CASCADE" not in migration
+    assert "hansard.allow_unused_campaign_delete" in migration
+
+
+def test_campaign_delete_route_requires_post_and_redirects_with_success_notice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    from hansard_annotator.web.campaigns import routes as campaign_routes
+
+    async def csrf_ok(*_args: object) -> None:
+        return None
+
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(campaign_routes, "enforce_csrf", csrf_ok)
+    monkeypatch.setattr(
+        campaign_routes,
+        "delete_unused_campaign",
+        lambda _settings, _principal, campaign_id, *, confirmation: calls.append(
+            (campaign_id, confirmation)
+        ),
+    )
+
+    response = asyncio.run(
+        campaign_routes.campaign_delete(
+            None, "unused-public-id", _settings(), _principal(), "Delete Test campaign"
+        )
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == "/ai-annotation?notice=campaign-deleted"
+    assert calls == [("unused-public-id", "Delete Test campaign")]

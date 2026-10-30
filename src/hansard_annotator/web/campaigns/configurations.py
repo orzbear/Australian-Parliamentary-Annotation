@@ -45,6 +45,7 @@ POLICY_CONFIGURATION_ID = "policy-v2"
 HOSTILITY_CONFIGURATION_ID = "hostility-v2"
 LUNA_CONFIRMATION_CONFIGURATION_ID = "hostility-luna-confirmation-100"
 LUNA_PRODUCTION_CONFIGURATION_ID = "hostility-luna-production-v1"
+GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID = "hostility-gemini-25-flash-production"
 HOSTILITY_SCHEMA_SHA256 = "959a51a987e0777cb72dc7ad12cd5b896429bef400b79f386764a20ddc3d5669"
 
 
@@ -85,6 +86,25 @@ class ApprovedAIConfiguration:
 
 
 APPROVED_AI_CONFIGURATIONS = {
+    GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID: ApprovedAIConfiguration(
+        GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID,
+        "Hostility Gemini 2.5 Flash Production",
+        "Policy-eligible full-corpus hostility classification using the held-out validated Gemini V2 configuration.",
+        "hostility",
+        "australian_partisan_hostility",
+        "0.2.0",
+        "gemini",
+        HOSTILITY_MODEL,
+        HOSTILITY_PROMPT_VERSION,
+        HOSTILITY_PROMPT_SHA256,
+        HOSTILITY_SCHEMA_SHA256,
+        HOSTILITY_CONTRACT_SHA256,
+        HOSTILITY_PROVIDER_SCHEMA_SHA256,
+        {"thinking_budget": 0},
+        "batch",
+        "hostility-gemini-25-flash-v2",
+        "deterministic_selection",
+    ),
     POLICY_CONFIGURATION_ID: ApprovedAIConfiguration(
         POLICY_CONFIGURATION_ID,
         "Policy classification — Frozen V2",

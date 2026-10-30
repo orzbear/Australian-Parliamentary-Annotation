@@ -34,7 +34,10 @@ from hansard_annotator.llm_eval.prompt import (
 )
 from hansard_annotator.llm_eval.providers import provider_prediction_schema_hash
 from hansard_annotator.web.auth.models import Principal
-from hansard_annotator.web.campaigns.configurations import LUNA_PRODUCTION_CONFIGURATION_ID
+from hansard_annotator.web.campaigns.configurations import (
+    GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID,
+    LUNA_PRODUCTION_CONFIGURATION_ID,
+)
 from hansard_annotator.web.campaigns.openai_batch import (
     MAX_OPENAI_BATCH_FILE_BYTES,
     MAX_OPENAI_BATCH_REQUESTS,
@@ -700,9 +703,14 @@ def plan_campaign_chunks(
             raise CampaignError("full production requires the approved frozen configuration")
         configuration = _campaign_configuration(dict(campaign))
         is_luna = configuration.configuration_id == LUNA_PRODUCTION_CONFIGURATION_ID
+        is_gemini_hostility = (
+            configuration.configuration_id
+            == GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID
+        )
+        is_hostility_production = is_luna or is_gemini_hostility
         if configuration.prediction_task == "hostility":
             _assert_hostility_policy_eligible(connection, int(campaign["id"]))
-        if configuration.prediction_task != "policy" and not is_luna:
+        if configuration.prediction_task != "policy" and not is_hostility_production:
             raise CampaignError("full production orchestration is only supported for policy campaigns")
         if is_luna and campaign["cache_status"] != "NOT_REQUIRED":
             raise CampaignError("Luna production must not use a Gemini cache")
@@ -882,9 +890,17 @@ def authorize_full_production(
         if confirmation != expected_confirmation:
             raise CampaignError(f"authorization requires typing {expected_confirmation}")
         if configuration.prediction_task != "policy" and (
-            configuration.configuration_id != LUNA_PRODUCTION_CONFIGURATION_ID
+            configuration.configuration_id
+            not in {
+                LUNA_PRODUCTION_CONFIGURATION_ID,
+                GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID,
+            }
         ):
             raise CampaignError("full production orchestration is only supported for policy campaigns")
+        if configuration.configuration_id == LUNA_PRODUCTION_CONFIGURATION_ID:
+            raise CampaignError(
+                "Luna is retained as a historical pilot; new paid Luna production authorization is disabled"
+            )
         if configuration.prediction_task == "hostility":
             _assert_hostility_policy_eligible(connection, int(campaign["id"]))
         estimate = Decimal(str(campaign["estimated_total_cost_usd"] or 0))
@@ -909,7 +925,15 @@ def authorize_full_production(
             "total_cost_usd": str(estimate),
         }
         identity["record_set_sha256"] = campaign["record_set_sha256"]
-        identity["corpus_run_name"] = "phase1-full-20260723-v4" if configuration.configuration_id == LUNA_PRODUCTION_CONFIGURATION_ID else None
+        identity["corpus_run_name"] = (
+            "phase1-full-20260723-v4"
+            if configuration.configuration_id
+            in {
+                LUNA_PRODUCTION_CONFIGURATION_ID,
+                GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID,
+            }
+            else None
+        )
         updated = connection.execute(
             """
             UPDATE ai_annotation_campaigns SET status='READY',orchestration_status='RUNNING',
@@ -1217,6 +1241,13 @@ def _orchestration_tick_locked(
             ).fetchone()
             wait_action: str | None = None
             if pending is not None:
+                if campaign.get("configuration_id") == LUNA_PRODUCTION_CONFIGURATION_ID:
+                    return TickResult(
+                        "historical-provider-paused",
+                        public_id,
+                        int(pending["chunk_number"]),
+                        "new Luna submissions are disabled",
+                    )
                 active_tokens = int(active["tokens"] if active else 0)
                 if not submission_fits(
                     active_tokens=active_tokens,
@@ -1273,6 +1304,13 @@ def _orchestration_tick_locked(
             return TickResult("idle", public_id)
         chunk = dict(chunk_row)
         is_luna = campaign.get("configuration_id") == LUNA_PRODUCTION_CONFIGURATION_ID
+        if is_luna and chunk["status"] == "SUBMITTING":
+            return TickResult(
+                "historical-provider-paused",
+                public_id,
+                int(chunk["chunk_number"]),
+                "unsubmitted Luna reservation preserved; no provider call made",
+            )
         provider: Any = gateway if gateway is not None else (OpenAIBatchGateway() if is_luna else LiveGeminiGateway())
 
         if chunk["status"] in {"SUBMITTED", "RUNNING"}:
@@ -1390,6 +1428,12 @@ def _orchestration_tick_locked(
                     results, coverage = collect_inline_batch(
                         batch_value=response, plan=plan,
                         domain_codes=_production_domain_codes(),
+                        prediction_task=str(campaign.get("prediction_task") or "policy"),
+                        records_by_id=(
+                            {str(record["record_id"]): record for record in records}
+                            if campaign.get("prediction_task") == "hostility"
+                            else None
+                        ),
                     )
                     directory.mkdir(parents=True, exist_ok=True)
                     pricing = load_pricing(ROOT / "config/llm_eval/pricing.yaml")

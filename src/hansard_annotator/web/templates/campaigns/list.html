@@ -10,6 +10,7 @@
   </div>
   <a class="btn btn-primary" href="/ai-annotation/new">New campaign</a>
 </div>
+{% if notice_message %}<div class="alert alert-success mt-5" role="status">{{ notice_message }}</div>{% endif %}
 <section class="surface mt-7 p-5">
   <h2 class="font-semibold">Server-side provider status</h2>
   <div class="mt-4 grid gap-3 md:grid-cols-2">
