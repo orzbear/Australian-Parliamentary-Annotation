@@ -57,7 +57,7 @@ def upgrade() -> None:
                 NOT (campaign.operational_metadata ? 'phase4e') OR
                 (
                   jsonb_typeof(campaign.operational_metadata->'phase4e')='object'
-                  AND campaign.operational_metadata->'phase4e' - ARRAY[
+                  AND (campaign.operational_metadata->'phase4e') - ARRAY[
                     'chunk_count','estimated_full_input_tokens',
                     'safe_active_token_ceiling','estimate_method',
                     'pricing_effective_date'
