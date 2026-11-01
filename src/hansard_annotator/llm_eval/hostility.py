@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import csv
 import json
+import unicodedata
 from pathlib import Path
 from typing import Any
 
+from hansard_annotator.llm_eval.failure_categories import FailureCategory
 from hansard_annotator.llm_eval.models import HostilityPrediction
 from hansard_annotator.llm_eval.prompt import (
     HOSTILITY_LUNA_PROMPT_VERSION,
@@ -35,6 +37,49 @@ ISSUE_TYPES = (
     "OTHER",
 )
 MAX_REASONING_LENGTH = 4000
+
+
+class HostilityValidationError(InvalidPrediction):
+    """A hostility response failed a specific structured or semantic contract."""
+
+    def __init__(self, message: str, category: FailureCategory) -> None:
+        super().__init__(message)
+        self.category = category
+
+
+_QUOTE_NORMALIZATION = str.maketrans(
+    {
+        "\u2018": "'", "\u2019": "'", "\u201a": "'", "\u201b": "'", "`": "'", "\u00b4": "'",
+        "\u201c": '"', "\u201d": '"', "\u201e": '"', "\u201f": '"',
+    }
+)
+_DASH_NORMALIZATION = str.maketrans(
+    {character: "-" for character in "\u2010\u2011\u2012\u2013\u2014\u2015\u2212\ufe58\ufe63\uff0d"}
+)
+
+
+def _normalized_evidence_with_offsets(value: str) -> tuple[str, list[tuple[int, int]]]:
+    """Normalize only quote/dash/space variants and retain source-codepoint bounds."""
+    normalized: list[str] = []
+    bounds: list[tuple[int, int]] = []
+    for offset, character in enumerate(value):
+        if character.isspace() or unicodedata.category(character) == "Zs":
+            if normalized and normalized[-1] == " ":
+                bounds[-1] = (bounds[-1][0], offset + 1)
+            else:
+                normalized.append(" ")
+                bounds.append((offset, offset + 1))
+            continue
+        mapped = character.translate(_QUOTE_NORMALIZATION).translate(_DASH_NORMALIZATION)
+        normalized.append(mapped)
+        bounds.append((offset, offset + 1))
+    if normalized and normalized[0] == " ":
+        normalized.pop(0)
+        bounds.pop(0)
+    if normalized and normalized[-1] == " ":
+        normalized.pop()
+        bounds.pop()
+    return "".join(normalized), bounds
 
 
 def prediction_json_schema(prompt_version: str = "hostility-prompt-v1.1") -> dict[str, Any]:
@@ -102,21 +147,34 @@ def validate_prediction_with_diagnostics(
     }:
         expected_fields.add("reasoning")
     if not isinstance(raw, dict) or set(raw) != expected_fields:
-        raise InvalidPrediction("response fields do not match the hostility schema")
+        raise HostilityValidationError(
+            "response fields do not match the hostility schema",
+            FailureCategory.STRUCTURED_OUTPUT_INVALID,
+        )
     presence, target = raw["hostility_present"], raw["target"]
     spans = raw["evidence_spans"]
     reasoning = raw.get("reasoning", "")
     if presence not in PRESENCE_CODES:
-        raise InvalidPrediction("hostility_present is unknown")
+        raise HostilityValidationError(
+            "hostility_present is unknown", FailureCategory.STRUCTURED_OUTPUT_INVALID
+        )
     if target not in MODEL_TARGET_CODES:
-        raise InvalidPrediction("target is unknown")
+        raise HostilityValidationError(
+            "target is unknown", FailureCategory.STRUCTURED_OUTPUT_INVALID
+        )
     if not isinstance(reasoning, str) or len(reasoning) > MAX_REASONING_LENGTH:
-        raise InvalidPrediction("reasoning must be a short string")
+        raise HostilityValidationError(
+            "reasoning must be a short string", FailureCategory.STRUCTURED_OUTPUT_INVALID
+        )
     if not isinstance(spans, list):
-        raise InvalidPrediction("evidence_spans must be a list")
+        raise HostilityValidationError(
+            "evidence_spans must be a list", FailureCategory.STRUCTURED_OUTPUT_INVALID
+        )
     validated: list[dict[str, object]] = []
     unmatched: list[str] = []
     ambiguous: list[str] = []
+    model_supplied: list[str] = []
+    normalized_text, text_bounds = _normalized_evidence_with_offsets(text)
     for span in spans:
         expected_fields = (
             {"start_offset", "end_offset", "text"}
@@ -124,10 +182,16 @@ def validate_prediction_with_diagnostics(
             else {"text"}
         )
         if not isinstance(span, dict) or set(span) != expected_fields:
-            raise InvalidPrediction("evidence span fields are invalid")
+            raise HostilityValidationError(
+                "evidence span fields are invalid", FailureCategory.STRUCTURED_OUTPUT_INVALID
+            )
         evidence = span["text"]
         if not isinstance(evidence, str) or not evidence:
-            raise InvalidPrediction("evidence text must be a non-empty exact string")
+            raise HostilityValidationError(
+                "evidence text must be a non-empty string",
+                FailureCategory.STRUCTURED_OUTPUT_INVALID,
+            )
+        model_supplied.append(evidence)
         if prompt_version == "hostility-prompt-v1":
             start, end = span["start_offset"], span["end_offset"]
             if (
@@ -140,22 +204,43 @@ def validate_prediction_with_diagnostics(
                 or end > len(text)
                 or text[start:end] != evidence
             ):
-                raise InvalidPrediction("evidence span offsets/text do not match canonical text")
+                raise HostilityValidationError(
+                    "evidence span offsets/text do not match canonical text",
+                    FailureCategory.EVIDENCE_RESOLUTION_FAILURE,
+                )
             validated.append({"start_offset": start, "end_offset": end, "text": evidence})
             continue
-        start = text.find(evidence)
+        normalized_evidence, _ = _normalized_evidence_with_offsets(evidence)
+        if not normalized_evidence:
+            unmatched.append(evidence)
+            continue
+        start = normalized_text.find(normalized_evidence)
         if start < 0:
             unmatched.append(evidence)
-        elif text.find(evidence, start + 1) >= 0:
+        elif normalized_text.find(normalized_evidence, start + 1) >= 0:
             ambiguous.append(evidence)
         else:
-            end = start + len(evidence)
-            assert text[start:end] == evidence
-            validated.append({"start_offset": start, "end_offset": end, "text": evidence})
+            end = start + len(normalized_evidence)
+            source_start = text_bounds[start][0]
+            source_end = text_bounds[end - 1][1]
+            canonical_span = text[source_start:source_end]
+            validated.append(
+                {
+                    "start_offset": source_start,
+                    "end_offset": source_end,
+                    "text": canonical_span,
+                }
+            )
     if presence == "NO" and (target != "N/A" or spans):
-        raise InvalidPrediction("NO requires target N/A and no evidence")
+        raise HostilityValidationError(
+            "NO requires target N/A and no evidence",
+            FailureCategory.SEMANTIC_CONTRACT_INVALID,
+        )
     if presence != "NO" and (target == "N/A" or not spans):
-        raise InvalidPrediction("YES/UNSURE requires a target and evidence text")
+        raise HostilityValidationError(
+            "YES/UNSURE requires a target and evidence text",
+            FailureCategory.SEMANTIC_CONTRACT_INVALID,
+        )
     diagnostics: dict[str, object] = {
         "classification_valid": True,
         "evidence_valid": not unmatched and not ambiguous,
@@ -163,6 +248,8 @@ def validate_prediction_with_diagnostics(
         "evidence_ambiguous": ambiguous,
         "evidence_requested_count": len(spans),
         "evidence_resolved_count": len(validated),
+        "evidence_model_supplied": model_supplied,
+        "evidence_verified_canonical": [item["text"] for item in validated],
     }
     return HostilityPrediction(presence, target, tuple(validated), reasoning), diagnostics
 

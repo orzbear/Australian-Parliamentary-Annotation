@@ -8,9 +8,17 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from hansard_annotator.llm_eval.failure_categories import (
+    FailureCategory,
+    json_failure_category,
+)
 from hansard_annotator.llm_eval.hostility import (
     HOSTILITY_PRODUCTION_CONTRACT_VERSION,
+    HostilityValidationError,
     validate_prediction_with_diagnostics,
+)
+from hansard_annotator.llm_eval.hostility_evidence_repair import (
+    validate_evidence_repair,
 )
 from hansard_annotator.llm_eval.hostility_validation import HELDOUT_SAMPLE_SHA256
 from hansard_annotator.llm_eval.prompt import (
@@ -213,6 +221,26 @@ def gemini_batch_schema(schema: dict[str, Any]) -> dict[str, Any]:
         if "reasoning" in properties:
             result["properties"]["reasoning"] = {"type": "STRING"}
         return result
+    if set(properties) == {"evidence_spans"}:
+        evidence = properties["evidence_spans"]["items"]
+        return {
+            "type": "OBJECT",
+            "properties": {
+                "evidence_spans": {
+                    "type": "ARRAY",
+                    "minItems": properties["evidence_spans"].get("minItems"),
+                    "maxItems": properties["evidence_spans"].get("maxItems"),
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {"text": {"type": "STRING"}},
+                        "required": evidence["required"],
+                        "propertyOrdering": evidence["required"],
+                    },
+                }
+            },
+            "required": schema["required"],
+            "propertyOrdering": schema["required"],
+        }
     primary = properties["primary_australian_domain"]
     secondary = properties["secondary_australian_domains"]
     return {
@@ -570,7 +598,8 @@ def _gemini_text(response: dict[str, Any]) -> object:
 def collect_inline_batch(
     *, batch_value: dict[str, Any], plan: dict[str, Any], domain_codes: tuple[str, ...],
     prediction_task: str = "policy", records_by_id: dict[str, dict[str, Any]] | None = None,
-) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    frozen_classifications_by_id: dict[str, dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     status = parse_batch_status(batch_value)
     if not status["terminal"]:
         raise ValueError(f"batch is not terminal: {status['state']}")
@@ -587,6 +616,7 @@ def collect_inline_batch(
         raise ValueError("successful inline batch contains no inline responses")
     seen: set[str] = set()
     duplicate_count = 0
+    unmapped_count = 0
     results: list[dict[str, Any]] = []
     for index, item in enumerate(responses):
         if not isinstance(item, dict):
@@ -594,12 +624,18 @@ def collect_inline_batch(
         metadata = item.get("metadata")
         key = metadata.get("key") if isinstance(metadata, dict) else None
         if not isinstance(key, str) or key not in set(planned_keys):
+            unmapped_count += 1
             results.append(
                 {
                     "record_id": key,
                     "request_index": None,
                     "response_index": index,
                     "status": "mapping_error",
+                    "failure_category": (
+                        FailureCategory.EVIDENCE_REPAIR_MAPPING_FAILURE.value
+                        if prediction_task == "hostility_evidence_repair"
+                        else FailureCategory.STRUCTURED_OUTPUT_INVALID.value
+                    ),
                     "provider_error": "missing or unknown metadata key",
                 }
             )
@@ -612,6 +648,11 @@ def collect_inline_batch(
                     "request_index": planned_indexes[key],
                     "response_index": index,
                     "status": "mapping_error",
+                    "failure_category": (
+                        FailureCategory.EVIDENCE_REPAIR_MAPPING_FAILURE.value
+                        if prediction_task == "hostility_evidence_repair"
+                        else FailureCategory.STRUCTURED_OUTPUT_INVALID.value
+                    ),
                     "provider_error": "duplicate metadata key",
                 }
             )
@@ -626,6 +667,11 @@ def collect_inline_batch(
                     "request_index": planned_indexes[key],
                     "response_index": index,
                     "status": "provider_failure",
+                    "failure_category": (
+                        FailureCategory.EVIDENCE_REPAIR_PROVIDER_FAILURE.value
+                        if prediction_task == "hostility_evidence_repair"
+                        else FailureCategory.PROVIDER_FAILURE.value
+                    ),
                     "provider_error": error or "missing response",
                 }
             )
@@ -635,9 +681,35 @@ def collect_inline_batch(
         raw_text = _gemini_text(response)
         prediction: object = None
         validation_error: str | None = None
+        failure_category: FailureCategory | None = None
+        diagnostics: dict[str, Any] = {}
+        frozen_classification: dict[str, Any] | None = None
+        model_supplied_evidence: list[Any] | None = None
         try:
-            parsed = json.loads(raw_text) if isinstance(raw_text, str) else raw_text
-            if prediction_task == "hostility":
+            try:
+                parsed = json.loads(raw_text) if isinstance(raw_text, str) else raw_text
+            except json.JSONDecodeError as json_error:
+                failure_category = (
+                    json_failure_category(json_error, raw_text)
+                    if isinstance(raw_text, str)
+                    else FailureCategory.STRUCTURED_OUTPUT_INVALID
+                )
+                raise
+            if prediction_task == "hostility_evidence_repair":
+                record = (records_by_id or {}).get(key)
+                frozen = (frozen_classifications_by_id or {}).get(key)
+                if record is None or frozen is None:
+                    raise InvalidPrediction("evidence repair lacks canonical text or frozen classification")
+                validated_prediction, diagnostics = validate_evidence_repair(
+                    parsed,
+                    canonical_text=str(record["speech"]["text"]),
+                    frozen_classification=frozen,
+                    prompt_version=str(plan.get("provenance", {}).get("prompt_version")),
+                )
+                frozen_classification = dict(frozen)
+                model_supplied_evidence = parsed.get("evidence_spans") if isinstance(parsed, dict) and isinstance(parsed.get("evidence_spans"), list) else None
+                prediction = validated_prediction
+            elif prediction_task == "hostility":
                 record = (records_by_id or {}).get(key)
                 prompt_version = str(plan.get("provenance", {}).get("prompt_version", "hostility-prompt-v2"))
                 if record is None and prompt_version == HOSTILITY_PRODUCTION_PROMPT_VERSION:
@@ -653,26 +725,43 @@ def collect_inline_batch(
                 validated, diagnostics = validate_prediction_with_diagnostics(
                     parsed, str(record["speech"]["text"]), prompt_version
                 )
+                if isinstance(parsed, dict):
+                    frozen_classification = {
+                        field: value for field, value in parsed.items()
+                        if field != "evidence_spans"
+                    }
+                    evidence_value = parsed.get("evidence_spans")
+                    if isinstance(evidence_value, list):
+                        model_supplied_evidence = evidence_value
                 if diagnostics["evidence_valid"] is not True:
-                    raise InvalidPrediction(
-                        "hostility evidence must resolve uniquely to canonical text"
-                    )
-                validated.to_dict()
-                prediction = (
+                    failure_category = FailureCategory.EVIDENCE_RESOLUTION_FAILURE
+                    validation_error = "hostility evidence must resolve uniquely to canonical text"
+                    result_status = "invalid"
+                    prediction = None
+                else:
                     validated.to_dict()
-                    if prompt_version == HOSTILITY_PRODUCTION_PROMPT_VERSION
-                    else parsed
-                )
-                if prompt_version == HOSTILITY_PRODUCTION_PROMPT_VERSION and isinstance(
-                    prediction, dict
-                ):
-                    prediction.pop("reasoning", None)
+                    prediction = (
+                        validated.to_dict()
+                        if prompt_version == HOSTILITY_PRODUCTION_PROMPT_VERSION
+                        else parsed
+                    )
+                    if prompt_version == HOSTILITY_PRODUCTION_PROMPT_VERSION and isinstance(
+                        prediction, dict
+                    ):
+                        prediction.pop("reasoning", None)
             else:
                 prediction = validate_prediction(parsed, domain_codes).to_dict()
-            result_status = "success"
+            if validation_error is None:
+                result_status = "success"
         except (json.JSONDecodeError, InvalidPrediction, TypeError) as error_value:
             result_status = "invalid"
             validation_error = str(error_value)
+            if failure_category is None:
+                failure_category = (
+                    error_value.category
+                    if isinstance(error_value, HostilityValidationError)
+                    else FailureCategory.STRUCTURED_OUTPUT_INVALID
+                )
         results.append(
             {
                 "record_id": key,
@@ -682,6 +771,12 @@ def collect_inline_batch(
                 "status": result_status,
                 "prediction": prediction,
                 "validation_error": validation_error,
+                "failure_category": (
+                    failure_category.value if failure_category is not None else None
+                ),
+                "diagnostics": diagnostics or None,
+                "frozen_classification": frozen_classification,
+                "model_supplied_evidence": model_supplied_evidence,
                 "provider_error": None,
                 "usage": {
                     "input_tokens": _coerce_int(usage.get("promptTokenCount")),
@@ -695,12 +790,26 @@ def collect_inline_batch(
             }
         )
     missing = len(set(planned_keys) - seen)
+    category_counts = {category.value: 0 for category in FailureCategory}
+    for result in results:
+        category = result.get("failure_category")
+        if isinstance(category, str) and category in category_counts:
+            category_counts[category] += 1
+    category_counts[
+        (
+            FailureCategory.EVIDENCE_REPAIR_MISSING_RESULT.value
+            if prediction_task == "hostility_evidence_repair"
+            else FailureCategory.MISSING_RESULT.value
+        )
+    ] = missing
     coverage = {
         "planned_requests": len(planned_keys),
         "provider_request_count": _coerce_int(status["total_request_count"]),
         "collected_responses": len(responses),
         "missing_responses": missing,
         "duplicate_mappings": duplicate_count,
+        "unmapped_responses": unmapped_count,
+        "failure_category_counts": category_counts,
     }
     return results, coverage
 

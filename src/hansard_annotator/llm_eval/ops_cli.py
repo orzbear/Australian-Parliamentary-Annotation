@@ -14,6 +14,13 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from hansard_annotator.llm_eval.costs import load_pricing
+from hansard_annotator.llm_eval.failure_categories import FailureCategory
+from hansard_annotator.llm_eval.hostility import (
+    HOSTILITY_PRODUCTION_CONTRACT_VERSION,
+)
+from hansard_annotator.llm_eval.hostility import (
+    prediction_json_schema as hostility_prediction_json_schema,
+)
 from hansard_annotator.llm_eval.operations import (
     audit_prompt_structure,
     build_batch_create_request,
@@ -31,6 +38,7 @@ from hansard_annotator.llm_eval.operations import (
 )
 from hansard_annotator.llm_eval.package import load_evaluation_package
 from hansard_annotator.llm_eval.prompt import (
+    HOSTILITY_PRODUCTION_PROMPT_VERSION,
     build_system_prompt,
     prediction_json_schema,
     prompt_hash,
@@ -47,6 +55,7 @@ def _parser() -> argparse.ArgumentParser:
         item.add_argument("--input", type=Path, required=True)
         item.add_argument("--output", type=Path, required=True)
         item.add_argument("--prompt-version", default="phase4a-policy-v2")
+        item.add_argument("--max-output-tokens", type=int, default=1000)
         item.add_argument("--limit", type=int)
         item.add_argument("--exclude-record-ids", type=Path)
     audit = sub.choices["audit"]
@@ -64,6 +73,7 @@ def _parser() -> argparse.ArgumentParser:
     production.add_argument("--limit", type=int, default=500)
     production.add_argument("--subset-seed", type=int, default=4_002)
     production.add_argument("--model", default="gemini-2.5-flash")
+    production.add_argument("--max-output-tokens", type=int, default=1000)
     production.add_argument("--cached-content")
     production.add_argument("--display-name", required=True)
     production.add_argument("--pricing", type=Path, default=Path("config/llm_eval/pricing.yaml"))
@@ -81,7 +91,8 @@ def _parser() -> argparse.ArgumentParser:
     cache.add_argument("--model", default="gemini-2.5-flash")
     cache.add_argument("--ttl-seconds", type=int, default=86400)
     cache.add_argument("--display-name", required=True)
-    cache.add_argument("--token-count", type=int, required=True)
+    cache.add_argument("--token-count", type=int)
+    cache.add_argument("--prompt-version", default="phase4a-policy-v2")
     submit = sub.add_parser("submit-plan")
     submit.add_argument("--plan", type=Path, required=True)
     submit.add_argument("--kind", choices=("batch", "cache"), required=True)
@@ -100,6 +111,11 @@ def _parser() -> argparse.ArgumentParser:
     collect.add_argument("--cache-submission", type=Path)
     collect.add_argument("--pricing", type=Path, default=Path("config/llm_eval/pricing.yaml"))
     collect.add_argument("--output", type=Path, required=True)
+    diagnose = sub.add_parser(
+        "diagnose-hostility-failures",
+        help="read-only category/count report for a collected hostility artifact",
+    )
+    diagnose.add_argument("--input", type=Path, required=True, help="artifact directory")
     return parser
 
 
@@ -117,6 +133,63 @@ def _batch_name(arguments: argparse.Namespace) -> str:
     if not name.startswith("batches/"):
         raise ValueError("Gemini batch name must begin with batches/")
     return name
+
+
+def _diagnose_hostility_failures(directory: Path) -> dict[str, Any]:
+    """Summarize already-collected failures without provider or database access."""
+    summary_path = directory / "operational_summary.json"
+    predictions_path = directory / "predictions.jsonl"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    if not isinstance(summary, dict):
+        raise ValueError("operational summary must be a JSON object")
+    rows: list[dict[str, Any]] = []
+    with predictions_path.open(encoding="utf-8") as source:
+        for line_number, line in enumerate(source, 1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if not isinstance(row, dict):
+                raise ValueError(f"prediction row {line_number} must be a JSON object")
+            rows.append(row)
+    failures: list[dict[str, Any]] = []
+    counts = {category.value: 0 for category in FailureCategory}
+    counts["UNCLASSIFIED"] = 0
+    for row in rows:
+        if row.get("status") == "success":
+            continue
+        category_value = row.get("failure_category")
+        category = (
+            category_value
+            if isinstance(category_value, str) and category_value in counts
+            else "UNCLASSIFIED"
+        )
+        counts[category] += 1
+        failures.append(
+            {
+                "record_id": row.get("record_id"),
+                "status": row.get("status"),
+                "failure_category": category,
+                "validation_error": row.get("validation_error"),
+            }
+        )
+    coverage_value = summary.get("coverage")
+    coverage = coverage_value if isinstance(coverage_value, dict) else {}
+    return {
+        "mode": "read_only_diagnosis",
+        "input_directory": str(directory),
+        "artifact_record_count": len(rows),
+        "category_counts_in_artifact": counts,
+        "coverage": {
+            "planned_requests": coverage.get("planned_requests"),
+            "successful_provider_responses": coverage.get("successful_provider_responses"),
+            "valid_structured_predictions": coverage.get("valid_structured_predictions"),
+            "invalid_structured_predictions": coverage.get("invalid_structured_predictions"),
+            "failed_provider_responses": coverage.get("failed_provider_responses"),
+            "missing_responses": coverage.get("missing_responses"),
+            "evidence_resolution_failures": coverage.get("evidence_resolution_failures"),
+        },
+        "failures": failures,
+    }
 
 
 def _get_gemini_resource(name: str, *, resource_label: str) -> dict[str, Any]:
@@ -167,7 +240,7 @@ def _collection_summary(
     batch_value: dict[str, Any],
     plan: dict[str, Any],
     results: list[dict[str, Any]],
-    coverage: dict[str, int],
+    coverage: dict[str, Any],
     pricing: dict[str, Any],
     cache_receipt: dict[str, Any] | None,
 ) -> dict[str, Any]:
@@ -192,6 +265,17 @@ def _collection_summary(
     valid = sum(result.get("status") == "success" for result in results)
     invalid = sum(result.get("status") == "invalid" for result in results)
     provider_failures = sum(result.get("status") == "provider_failure" for result in results)
+    category_counts_value = coverage.get("failure_category_counts")
+    category_counts = (
+        dict(category_counts_value) if isinstance(category_counts_value, dict) else {}
+    )
+    evidence_failures = int(
+        category_counts.get("EVIDENCE_RESOLUTION_FAILURE", 0)
+    )
+    non_success_results = sum(result.get("status") != "success" for result in results)
+    failure_count_reconciles = sum(int(value) for value in category_counts.values()) == (
+        non_success_results + int(coverage.get("missing_responses", 0))
+    )
     model = plan.get("provenance", {}).get("model")
     entry = pricing["models"].get(f"gemini:{model}")
     if not isinstance(entry, dict):
@@ -253,6 +337,12 @@ def _collection_summary(
             "valid_structured_predictions": valid,
             "invalid_structured_predictions": invalid,
             "provider_failures_collected": provider_failures,
+            "failure_category_counts": category_counts,
+            "evidence_resolution_failures": evidence_failures,
+            "categorized_unsuccessful_attempts": sum(
+                int(value) for value in category_counts.values()
+            ),
+            "failure_category_accounting_invariant_ok": failure_count_reconciles,
             "accounting_invariant_ok": (
                 coverage["planned_requests"]
                 == successful_count + failed_count
@@ -421,7 +511,15 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif args.command == "prepare-cache":
             package = load_evaluation_package(args.input)
-            system = build_system_prompt(package.context, "phase4a-policy-v2")
+            if (
+                package.task != "hostility"
+                or args.prompt_version != HOSTILITY_PRODUCTION_PROMPT_VERSION
+                or args.model != "gemini-2.5-flash"
+            ):
+                raise ValueError(
+                    "the optimization cache requires Gemini 2.5 Flash, a hostility package, and the production no-reasoning prompt"
+                )
+            system = build_system_prompt(package.context, args.prompt_version)
             request = build_cache_create_request(
                 model=args.model,
                 system_prompt=system,
@@ -482,9 +580,27 @@ def main(argv: list[str] | None = None) -> int:
                 package, records = _records(args)
                 prompt_version = args.prompt_version
             system = build_system_prompt(package.context, prompt_version)
-            schema = prediction_json_schema(package.domain_codes)
+            schema = (
+                hostility_prediction_json_schema(prompt_version)
+                if package.task == "hostility"
+                else prediction_json_schema(package.domain_codes)
+            )
             pricing = load_pricing(args.pricing)
             pricing_entry = pricing["models"][f"gemini:{args.model}"]
+            optimization_variant = None
+            if prompt_version == HOSTILITY_PRODUCTION_PROMPT_VERSION:
+                if args.model != "gemini-2.5-flash":
+                    raise ValueError("production hostility optimization requires gemini-2.5-flash")
+                if args.max_output_tokens == 1000 and args.cached_content is None:
+                    optimization_variant = "A"
+                elif args.max_output_tokens == 500 and args.cached_content is None:
+                    optimization_variant = "B"
+                elif args.max_output_tokens == 500 and args.cached_content is not None:
+                    optimization_variant = "C"
+                else:
+                    raise ValueError(
+                        "optimized hostility variants support only A=1000, B=500, or C=500 with explicit cache"
+                    )
             request = build_batch_create_request(
                 model=args.model,
                 system_prompt=system,
@@ -492,21 +608,41 @@ def main(argv: list[str] | None = None) -> int:
                 schema=schema,
                 display_name=args.display_name,
                 cached_content=args.cached_content,
+                generation={"thinking_budget": 0},
+                max_output_tokens=args.max_output_tokens,
             )
             provenance = {
                 "provider": "gemini",
                 "model": args.model,
+                "prediction_task": package.task,
+                "package_snapshot_sha256": str(package.manifest["snapshot_sha256"]),
                 "prompt_version": prompt_version,
                 "assembled_prompt_sha256": prompt_hash(system),
                 "canonical_schema_sha256": str(package.schema["content_sha256"]),
                 "prediction_contract_sha256": canonical_hash(schema),
+                "prediction_contract_version": (
+                    HOSTILITY_PRODUCTION_CONTRACT_VERSION
+                    if prompt_version == HOSTILITY_PRODUCTION_PROMPT_VERSION
+                    else None
+                ),
                 "provider_schema_sha256": canonical_hash(gemini_batch_schema(schema)),
                 "thinking_budget": 0,
+                "temperature": 0.0,
+                "max_output_tokens": args.max_output_tokens,
                 "execution_mode": "batch",
                 "cached_content": args.cached_content,
                 "record_count": len(records),
                 "record_ids_sha256": canonical_hash(
                     [str(record["record_id"]) for record in records]
+                ),
+                "benchmark_set_sha256": (
+                    package.manifest.get("benchmark", {}).get("set_sha256")
+                    if isinstance(package.manifest.get("benchmark"), dict)
+                    else None
+                ),
+                "optimization_variant": optimization_variant,
+                "cached_content_prefix_sha256": (
+                    prompt_hash(system) if optimization_variant == "C" else None
                 ),
                 "created_at": datetime.now(UTC).isoformat(),
                 "pricing_format_version": pricing["format_version"],
@@ -529,13 +665,18 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError(f"batch did not succeed: {status['state']}; {status['error']}")
             plan = json.loads(args.plan.read_text(encoding="utf-8"))
             planned = plan["request"]["batch"]["input_config"]["requests"]["requests"]
-            provider_schema = planned[0]["request"]["generationConfig"]["responseSchema"]
-            primary = provider_schema["properties"]["primary_australian_domain"]
-            domain_codes = tuple(value for value in primary["enum"] if isinstance(value, str))
+            prediction_task = str(plan.get("provenance", {}).get("prediction_task", "policy"))
+            if prediction_task == "hostility":
+                domain_codes: tuple[str, ...] = ()
+            else:
+                provider_schema = planned[0]["request"]["generationConfig"]["responseSchema"]
+                primary = provider_schema["properties"]["primary_australian_domain"]
+                domain_codes = tuple(value for value in primary["enum"] if isinstance(value, str))
             results, coverage = collect_inline_batch(
                 batch_value=batch_value,
                 plan=plan,
                 domain_codes=domain_codes,
+                prediction_task=prediction_task,
             )
             provenance = plan["provenance"]
             for result in results:
@@ -568,6 +709,8 @@ def main(argv: list[str] | None = None) -> int:
             _write(args.output / "operational_summary.json", summary)
             (args.output / "operational_report.md").write_text(_report(summary), encoding="utf-8")
             print(json.dumps(summary, indent=2, sort_keys=True))
+        elif args.command == "diagnose-hostility-failures":
+            print(json.dumps(_diagnose_hostility_failures(args.input), indent=2, sort_keys=True))
         else:
             if not args.confirm_paid_submit:
                 raise ValueError("submission blocked; pass --confirm-paid-submit explicitly")

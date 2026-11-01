@@ -4,13 +4,25 @@ from typing import Any
 
 import pytest
 
+from hansard_annotator.llm_eval.hostility import (
+    HOSTILITY_PRODUCTION_CONTRACT_VERSION,
+)
+from hansard_annotator.llm_eval.hostility import (
+    prediction_json_schema as hostility_schema,
+)
+from hansard_annotator.llm_eval.hostility_validation import HELDOUT_SAMPLE_SHA256
 from hansard_annotator.llm_eval.operations import (
     APPROVED_PRODUCTION_GENERATION,
     APPROVED_PRODUCTION_MODEL,
     FROZEN_CANONICAL_SCHEMA_SHA256,
+    FROZEN_HOSTILITY_CANONICAL_SCHEMA_SHA256,
     FROZEN_MODEL,
     FROZEN_PROMPT_SHA256,
     FROZEN_PROMPT_VERSION,
+    OPTIMIZED_HOSTILITY_CONTRACT_SHA256,
+    OPTIMIZED_HOSTILITY_PROMPT_SHA256,
+    OPTIMIZED_HOSTILITY_PROVIDER_SCHEMA_SHA256,
+    OPTIMIZED_HOSTILITY_RECORD_IDS_SHA256,
     PREDICTION_FIELDS,
     audit_prompt_structure,
     build_batch_create_request,
@@ -26,7 +38,11 @@ from hansard_annotator.llm_eval.operations import (
     validate_batch_mapping,
     validate_production_plan,
 )
-from hansard_annotator.llm_eval.prompt import build_user_prompt, prediction_json_schema
+from hansard_annotator.llm_eval.prompt import (
+    HOSTILITY_PRODUCTION_PROMPT_VERSION,
+    build_user_prompt,
+    prediction_json_schema,
+)
 from hansard_annotator.llm_eval.providers import gemini_request_payload
 
 
@@ -397,6 +413,64 @@ def test_paid_batch_guard_accepts_only_frozen_canonical_contract() -> None:
         validate_production_plan(old_schema)
 
 
+@pytest.mark.parametrize(("variant", "limit", "cache"), [("A", 1000, None), ("B", 500, None), ("C", 500, "cachedContents/opt")])
+def test_paid_batch_guard_accepts_only_frozen_hostility_optimization_variants(
+    variant: str, limit: int, cache: str | None
+) -> None:
+    import json
+    from pathlib import Path
+
+    sample = json.loads(
+        Path("config/research_samples/hostility-heldout-100.json").read_text(encoding="utf-8")
+    )
+    records = tuple(
+        {
+            "record_id": f"turn:{turn['turn_key']}",
+            "speech": {"text": "Example speech."},
+        }
+        for turn in sample["turns"]
+    )
+    schema = hostility_schema(HOSTILITY_PRODUCTION_PROMPT_VERSION)
+    batch = build_batch_create_request(
+        model=FROZEN_MODEL,
+        system_prompt="fixed hostility system prompt",
+        records=records,
+        schema=schema,
+        display_name=f"hostility-optimization-{variant}",
+        cached_content=cache,
+        generation={"thinking_budget": 0},
+        max_output_tokens=limit,
+    )
+    plan = {
+        "provenance": {
+            "model": FROZEN_MODEL,
+            "provider": "gemini",
+            "prediction_task": "hostility",
+            "prompt_version": HOSTILITY_PRODUCTION_PROMPT_VERSION,
+            "assembled_prompt_sha256": OPTIMIZED_HOSTILITY_PROMPT_SHA256,
+            "canonical_schema_sha256": FROZEN_HOSTILITY_CANONICAL_SCHEMA_SHA256,
+            "prediction_contract_sha256": OPTIMIZED_HOSTILITY_CONTRACT_SHA256,
+            "prediction_contract_version": HOSTILITY_PRODUCTION_CONTRACT_VERSION,
+            "provider_schema_sha256": OPTIMIZED_HOSTILITY_PROVIDER_SCHEMA_SHA256,
+            "max_output_tokens": limit,
+            "optimization_variant": variant,
+            "cached_content": cache,
+            "cached_content_prefix_sha256": (
+                OPTIMIZED_HOSTILITY_PROMPT_SHA256 if variant == "C" else None
+            ),
+            "thinking_budget": 0,
+            "temperature": 0.0,
+            "record_count": 100,
+            "record_ids_sha256": OPTIMIZED_HOSTILITY_RECORD_IDS_SHA256,
+            "benchmark_set_sha256": HELDOUT_SAMPLE_SHA256,
+        },
+        "request": batch,
+    }
+    validate_production_plan(plan)
+    if variant == "C":
+        assert "cachedContent" in batch["batch"]["input_config"]["requests"]["requests"][0]["request"]
+
+
 def test_batch_semantics_derive_from_phase4a_prediction_contract() -> None:
     schema = prediction_json_schema(("AU01", "AU02", "AU_OTHER_REVIEW"))
     batch = build_batch_create_request(
@@ -427,6 +501,218 @@ def test_batch_semantics_derive_from_phase4a_prediction_contract() -> None:
         "AU02",
         "AU_OTHER_REVIEW",
     ]
+
+
+def test_batch_collection_validates_no_reasoning_hostility_and_preserves_evidence() -> None:
+    import json
+
+    from hansard_annotator.llm_eval.prompt import build_system_prompt
+
+    speech = "The government is incompetent."
+    record = {
+        **_record(1),
+        "record_id": "turn:production-test",
+        "speech": {**_record(1)["speech"], "text": speech},
+    }
+    schema = hostility_schema(HOSTILITY_PRODUCTION_PROMPT_VERSION)
+    system = build_system_prompt(
+        {
+            "schema": {"slug": "australian_partisan_hostility"},
+            "taxonomies": [],
+        },
+        HOSTILITY_PRODUCTION_PROMPT_VERSION,
+    )
+    plan = {
+        "provenance": {
+            "prediction_task": "hostility",
+            "prompt_version": HOSTILITY_PRODUCTION_PROMPT_VERSION,
+        },
+        "request": build_batch_create_request(
+            model=FROZEN_MODEL,
+            system_prompt=system,
+            records=(record,),
+            schema=schema,
+            display_name="production-output-contract-test",
+            max_output_tokens=500,
+        ),
+    }
+    batch = {
+        "response": {
+            "state": "BATCH_STATE_SUCCEEDED",
+            "batchStats": {"requestCount": "1", "successfulRequestCount": "1"},
+            "output": {
+                "inlinedResponses": {
+                    "inlinedResponses": [
+                        {
+                            "metadata": {"key": "turn:production-test"},
+                            "response": {
+                                "modelVersion": FROZEN_MODEL,
+                                "candidates": [
+                                    {
+                                        "content": {
+                                            "parts": [
+                                                {
+                                                    "text": json.dumps(
+                                                        {
+                                                            "hostility_present": "YES",
+                                                            "target": "OPPOSING_PARTISAN_TARGET",
+                                                            "evidence_spans": [
+                                                                {"text": "government is incompetent"}
+                                                            ],
+                                                        }
+                                                    )
+                                                }
+                                            ]
+                                        }
+                                    }
+                                ],
+                                "usageMetadata": {"promptTokenCount": 2000},
+                            },
+                        }
+                    ]
+                }
+            },
+        }
+    }
+    results, _ = collect_inline_batch(
+        batch_value=batch,
+        plan=plan,
+        domain_codes=(),
+        prediction_task="hostility",
+    )
+    assert results[0]["status"] == "success"
+    prediction = results[0]["prediction"]
+    assert isinstance(prediction, dict)
+    assert set(prediction) == {"hostility_present", "target", "evidence_spans"}
+    assert list(prediction["evidence_spans"]) == [
+        {"start_offset": 4, "end_offset": 29, "text": "government is incompetent"}
+    ]
+    assert results[0]["failure_category"] is None
+    assert results[0]["diagnostics"]["evidence_model_supplied"] == [
+        "government is incompetent"
+    ]
+    assert results[0]["diagnostics"]["evidence_verified_canonical"] == [
+        "government is incompetent"
+    ]
+
+
+def test_failure_category_distinguishes_truncation_from_invalid_json() -> None:
+    import json
+
+    from hansard_annotator.llm_eval.failure_categories import (
+        FailureCategory,
+        json_failure_category,
+    )
+
+    with pytest.raises(json.JSONDecodeError) as truncated:
+        json.loads('{"hostility_present":"YES"')
+    assert json_failure_category(truncated.value, '{"hostility_present":"YES"') == (
+        FailureCategory.JSON_TRUNCATION
+    )
+    with pytest.raises(json.JSONDecodeError) as malformed:
+        json.loads("{not json}")
+    assert json_failure_category(malformed.value, "{not json}") == (
+        FailureCategory.STRUCTURED_OUTPUT_INVALID
+    )
+
+
+def test_evidence_repair_collector_merges_only_frozen_classification() -> None:
+    import json
+
+    from hansard_annotator.llm_eval.hostility_evidence_repair import (
+        EVIDENCE_REPAIR_SCHEMA,
+        EVIDENCE_REPAIR_SYSTEM_PROMPT,
+    )
+
+    record = _record(1)
+    record["record_id"] = "turn:turn-1"
+    record["speech"]["text"] = "They are deceitful liars."
+    plan = {
+        "provenance": {
+            "prediction_task": "hostility_evidence_repair",
+            "prompt_version": HOSTILITY_PRODUCTION_PROMPT_VERSION,
+        },
+        "request": build_batch_create_request(
+            model=FROZEN_MODEL,
+            system_prompt=EVIDENCE_REPAIR_SYSTEM_PROMPT,
+            records=(record,),
+            schema=EVIDENCE_REPAIR_SCHEMA,
+            display_name="evidence-repair-test",
+            max_output_tokens=500,
+        ),
+    }
+    batch = {
+        "response": {
+            "state": "BATCH_STATE_SUCCEEDED",
+            "batchStats": {"requestCount": "1", "successfulRequestCount": "1"},
+            "output": {
+                "inlinedResponses": {
+                    "inlinedResponses": [
+                        {
+                            "metadata": {"key": "turn:turn-1"},
+                            "response": {
+                                "candidates": [{
+                                    "content": {"parts": [{"text": json.dumps({"evidence_spans": [{"text": "deceitful liars"}]})}]}
+                                }],
+                                "usageMetadata": {"promptTokenCount": 30, "candidatesTokenCount": 4},
+                            },
+                        }
+                    ]
+                }
+            },
+        }
+    }
+    frozen = {
+        "turn:turn-1": {
+            "hostility_present": "YES",
+            "target": "OPPOSING_PARTISAN_TARGET",
+        }
+    }
+    results, coverage = collect_inline_batch(
+        batch_value=batch,
+        plan=plan,
+        domain_codes=(),
+        prediction_task="hostility_evidence_repair",
+        records_by_id={"turn:turn-1": record},
+        frozen_classifications_by_id=frozen,
+    )
+    assert results[0]["status"] == "success"
+    assert results[0]["prediction"]["hostility_present"] == "YES"
+    assert results[0]["prediction"]["target"] == "OPPOSING_PARTISAN_TARGET"
+    assert results[0]["prediction"]["evidence_spans"][0]["text"] == "deceitful liars"
+    assert coverage["failure_category_counts"]["EVIDENCE_REPAIR_VALIDATION_FAILURE"] == 0
+
+
+def test_read_only_hostility_failure_diagnosis_counts_categories(tmp_path: Any) -> None:
+    import json
+    from pathlib import Path
+
+    from hansard_annotator.llm_eval.ops_cli import _diagnose_hostility_failures
+
+    directory = Path(tmp_path) / "artifact"
+    directory.mkdir()
+    (directory / "operational_summary.json").write_text(
+        json.dumps({"coverage": {"planned_requests": 2, "evidence_resolution_failures": 1}}),
+        encoding="utf-8",
+    )
+    (directory / "predictions.jsonl").write_text(
+        json.dumps(
+            {
+                "record_id": "turn:1",
+                "status": "invalid",
+                "failure_category": "EVIDENCE_RESOLUTION_FAILURE",
+                "validation_error": "evidence could not be resolved",
+            }
+        )
+        + "\n"
+        + json.dumps({"record_id": "turn:2", "status": "success"})
+        + "\n",
+        encoding="utf-8",
+    )
+    result = _diagnose_hostility_failures(directory)
+    assert result["mode"] == "read_only_diagnosis"
+    assert result["category_counts_in_artifact"]["EVIDENCE_RESOLUTION_FAILURE"] == 1
+    assert result["failures"][0]["record_id"] == "turn:1"
 
 
 def test_collector_rejects_old_annotation_field_shape() -> None:

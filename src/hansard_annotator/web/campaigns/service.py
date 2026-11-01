@@ -21,6 +21,13 @@ from psycopg.types.json import Jsonb
 
 from hansard_annotator.llm_eval.costs import load_pricing
 from hansard_annotator.llm_eval.hostility import prediction_json_schema as hostility_schema
+from hansard_annotator.llm_eval.hostility_evidence_repair import (
+    EVIDENCE_REPAIR_SCHEMA,
+    EVIDENCE_REPAIR_SYSTEM_PROMPT,
+    EVIDENCE_REPAIR_VERSION,
+    build_evidence_repair_user_prompt,
+    frozen_classification_is_repairable,
+)
 from hansard_annotator.llm_eval.import_predictions import (
     import_predictions,
     inspect_prediction_artifact,
@@ -37,6 +44,7 @@ from hansard_annotator.llm_eval.operations import (
     canonical_hash,
     collect_inline_batch,
     gemini_batch_schema,
+    gemini_generation_config,
     parse_batch_status,
     production_record_from_turn,
     simulate_costs,
@@ -90,6 +98,8 @@ PREDICTION_CONTRACT_SHA256 = "99cafa6c473293dc076793ee6baeca44b6961d7cb11de8f917
 GEMINI_BATCH_SCHEMA_SHA256 = "980b0ed6d6002a8eadd326f84942ba60dcdf8f2abd9e70ea6aaecf7d78de3c22"
 PAID_CONFIRMATION = "START AI CAMPAIGN"
 RECOVERY_CONFIRMATION = "RETRY INVALID RECORDS"
+MAX_CAMPAIGN_RECOVERY_ATTEMPTS = 3
+EVIDENCE_RECOVERY_CONFIRMATION = "REPAIR HOSTILITY EVIDENCE ONLY"
 PRODUCTION_GENERATION_CONFIG = APPROVED_PRODUCTION_GENERATION
 PRODUCTION_EXECUTION_MODE = "batch"
 DEFAULT_EXCLUDE_HUMAN_ANNOTATED = True
@@ -808,7 +818,10 @@ class LiveGeminiGateway:
         return _get_cache(cache_identifier)
 
     def submit(self, plan: dict[str, Any], model: str) -> str:
-        validate_production_plan(plan)
+        if plan.get("provenance", {}).get("recovery_mode") == "evidence_only":
+            validate_evidence_repair_plan(plan)
+        else:
+            validate_production_plan(plan)
         response = _http_json(
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:batchGenerateContent",
             {"x-goog-api-key": self._key(), "Content-Type": "application/json"},
@@ -1364,6 +1377,16 @@ def get_campaign(
                 + int(progress.get("chunk_provider_failures") or 0)
                 + int(progress.get("chunk_missing") or 0)
             )
+            result["evidence_repair_preview"] = {
+                "eligible_count": 0,
+                "ineligible_count": 0,
+                "already_repaired_count": 0,
+                "remaining_attempt_budget": 0,
+                "estimated_provider_calls": 0,
+                "eligible_record_ids_preview": [],
+                "ineligible_records_preview": [],
+                "ineligible_reasons": {},
+            }
         result["chunk_preview"] = [
             dict(value)
             for value in connection.execute(
@@ -1431,6 +1454,67 @@ def get_campaign(
                 result["provider_refusal_available_count"] = provider_refusal_count(
                     iter_jsonl(current_directory / "predictions.jsonl")
                 )
+            if (
+                is_hostility_production_campaign(result)
+                and result["status"] == "COLLECTED"
+            ):
+                attempts = {
+                    str(value["record_id"]): int(value["attempt_count"])
+                    for value in connection.execute(
+                        """SELECT recovery_record.record_id,count(*) AS attempt_count
+                           FROM ai_annotation_campaign_recovery_records recovery_record
+                           JOIN ai_annotation_campaign_recoveries recovery
+                             ON recovery.id=recovery_record.recovery_id
+                           WHERE recovery.campaign_id=%s
+                           GROUP BY recovery_record.record_id""",
+                        (row["id"],),
+                    ).fetchall()
+                }
+                evidence_preview = cast(dict[str, Any], result["evidence_repair_preview"])
+                eligible_ids = cast(list[str], evidence_preview["eligible_record_ids_preview"])
+                ineligible_ids = cast(
+                    list[dict[str, str]], evidence_preview["ineligible_records_preview"]
+                )
+                ineligible_reasons = cast(dict[str, int], evidence_preview["ineligible_reasons"])
+                for prediction_row in iter_jsonl(current_directory / "predictions.jsonl"):
+                    if (
+                        prediction_row.get("status") == "success"
+                        and prediction_row.get("recovery_mode") == "evidence_only"
+                    ):
+                        evidence_preview["already_repaired_count"] += 1
+                    if not _evidence_failure_for_repair(prediction_row):
+                        continue
+                    record_id = prediction_row.get("record_id")
+                    has_frozen_classification = _stored_frozen_classification(prediction_row) is not None
+                    original_evidence = _stored_model_evidence(prediction_row)
+                    has_original_evidence = isinstance(original_evidence, list) and bool(original_evidence)
+                    attempts_remaining = max(
+                        0,
+                        MAX_CAMPAIGN_RECOVERY_ATTEMPTS - attempts.get(str(record_id), 0),
+                    )
+                    remaining = max(
+                        0,
+                        MAX_CAMPAIGN_RECOVERY_ATTEMPTS
+                        - attempts.get(str(record_id), 0),
+                    )
+                    evidence_preview["remaining_attempt_budget"] += remaining
+                    if has_frozen_classification and has_original_evidence and attempts_remaining:
+                        evidence_preview["eligible_count"] += 1
+                        if len(eligible_ids) < 20 and isinstance(record_id, str):
+                            eligible_ids.append(record_id)
+                    else:
+                        evidence_preview["ineligible_count"] += 1
+                        reason = (
+                            "frozen_classification_invalid"
+                            if not has_frozen_classification
+                            else "original_evidence_missing"
+                            if not has_original_evidence
+                            else "attempt_limit_reached"
+                        )
+                        ineligible_reasons[reason] = ineligible_reasons.get(reason, 0) + 1
+                        if len(ineligible_ids) < 20 and isinstance(record_id, str):
+                            ineligible_ids.append({"record_id": record_id, "reason": reason})
+                evidence_preview["estimated_provider_calls"] = evidence_preview["eligible_count"]
         original_metadata = cast(
             dict[str, Any], result.get("operational_metadata") or {}
         )
@@ -1861,6 +1945,145 @@ def _provider_plan(
     if canonical_hash(gemini_batch_schema(schema)) != campaign["provider_schema_sha256"]:
         raise CampaignError("provider schema no longer matches campaign")
     return plan
+
+
+def _evidence_repair_plan(
+    campaign: dict[str, Any],
+    records: tuple[dict[str, Any], ...],
+    frozen_by_id: dict[str, dict[str, Any]],
+    original_evidence_by_id: dict[str, object],
+    *,
+    display_name: str,
+) -> dict[str, Any]:
+    configuration = _campaign_configuration(campaign)
+    if (
+        configuration.prediction_task != "hostility"
+        or configuration.configuration_id != GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID
+        or configuration.provider != "gemini"
+    ):
+        raise CampaignError("evidence-only recovery requires the approved Gemini hostility campaign")
+    generation = dict(configuration.generation_config)
+    codebook_context = _configuration_context(configuration)
+    request_items: list[dict[str, Any]] = []
+    for record in records:
+        record_id = str(record["record_id"])
+        frozen = frozen_by_id.get(record_id)
+        if not frozen_classification_is_repairable(frozen):
+            raise CampaignError("evidence repair input has an invalid frozen classification")
+        assert frozen is not None
+        user_prompt = build_evidence_repair_user_prompt(
+            canonical_text=str(record["speech"]["text"]),
+            frozen_classification=frozen,
+            original_evidence=original_evidence_by_id.get(record_id),
+            codebook_context=codebook_context,
+        )
+        request_items.append(
+            {
+                "request": {
+                    "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+                    "systemInstruction": {"parts": [{"text": EVIDENCE_REPAIR_SYSTEM_PROMPT}]},
+                    "generationConfig": gemini_generation_config(
+                        EVIDENCE_REPAIR_SCHEMA,
+                        generation=generation,
+                        max_output_tokens=500,
+                    ),
+                },
+                "metadata": {"key": record_id},
+            }
+        )
+    provider_schema = gemini_batch_schema(EVIDENCE_REPAIR_SCHEMA)
+    prompt_sha = hashlib.sha256(EVIDENCE_REPAIR_SYSTEM_PROMPT.encode("utf-8")).hexdigest()
+    provenance = {
+        "recovery_mode": "evidence_only",
+        "recovery_contract_version": EVIDENCE_REPAIR_VERSION,
+        "provider": "gemini",
+        "model": configuration.configured_model,
+        "prediction_task": "hostility_evidence_repair",
+        "prompt_version": configuration.prompt_version,
+        "assembled_prompt_sha256": prompt_sha,
+        "source_prompt_sha256": configuration.prompt_sha256,
+        "canonical_schema_sha256": configuration.canonical_schema_sha256,
+        "prediction_contract_sha256": canonical_hash(EVIDENCE_REPAIR_SCHEMA),
+        "source_prediction_contract_sha256": configuration.prediction_contract_sha256,
+        "provider_schema_sha256": canonical_hash(provider_schema),
+        "thinking_budget": generation.get("thinking_budget", 0),
+        "max_output_tokens": 500,
+        "temperature": 0.0,
+        "execution_mode": "batch",
+        "record_count": len(records),
+        "record_ids_sha256": canonical_hash([record["record_id"] for record in records]),
+    }
+    plan = {
+        "provenance": provenance,
+        "request": {"batch": {"display_name": display_name, "input_config": {"requests": {"requests": request_items}}}},
+    }
+    validate_evidence_repair_plan(plan)
+    return plan
+
+
+def validate_evidence_repair_plan(plan: dict[str, Any]) -> None:
+    provenance = plan.get("provenance")
+    frozen = approved_configuration(GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID)
+    if not isinstance(provenance, dict) or provenance.get("recovery_mode") != "evidence_only":
+        raise CampaignError("invalid evidence-repair plan provenance")
+    if (
+        provenance.get("recovery_contract_version") != EVIDENCE_REPAIR_VERSION
+        or provenance.get("provider") != "gemini"
+        or provenance.get("model") != "gemini-2.5-flash"
+        or provenance.get("prediction_task") != "hostility_evidence_repair"
+        or provenance.get("prompt_version")
+        != frozen.prompt_version
+        or provenance.get("source_prompt_sha256") != frozen.prompt_sha256
+        or provenance.get("source_prediction_contract_sha256") != frozen.prediction_contract_sha256
+        or provenance.get("canonical_schema_sha256") != frozen.canonical_schema_sha256
+        or provenance.get("prediction_contract_sha256") != canonical_hash(EVIDENCE_REPAIR_SCHEMA)
+        or provenance.get("provider_schema_sha256")
+        != canonical_hash(gemini_batch_schema(EVIDENCE_REPAIR_SCHEMA))
+        or provenance.get("max_output_tokens") != 500
+        or provenance.get("temperature") != 0.0
+        or provenance.get("assembled_prompt_sha256")
+        != hashlib.sha256(EVIDENCE_REPAIR_SYSTEM_PROMPT.encode("utf-8")).hexdigest()
+        or not isinstance(provenance.get("source_prompt_sha256"), str)
+        or not isinstance(provenance.get("source_prediction_contract_sha256"), str)
+    ):
+        raise CampaignError("evidence-repair plan differs from its frozen contract")
+    request = plan.get("request")
+    batch = request.get("batch") if isinstance(request, dict) else None
+    config = batch.get("input_config") if isinstance(batch, dict) else None
+    requests = config.get("requests") if isinstance(config, dict) else None
+    entries = requests.get("requests") if isinstance(requests, dict) else None
+    if not isinstance(entries, list) or len(entries) != provenance.get("record_count") or not entries:
+        raise CampaignError("evidence-repair plan request count is invalid")
+    request_ids: list[str] = []
+    for item in entries:
+        metadata = item.get("metadata") if isinstance(item, dict) else None
+        record_id = metadata.get("key") if isinstance(metadata, dict) else None
+        if not isinstance(record_id, str) or not record_id.startswith("turn:"):
+            raise CampaignError("evidence-repair request has an invalid turn key")
+        request_ids.append(record_id)
+        request_value = item.get("request") if isinstance(item, dict) else None
+        generation = request_value.get("generationConfig") if isinstance(request_value, dict) else None
+        schema = generation.get("responseSchema") if isinstance(generation, dict) else None
+        system = request_value.get("systemInstruction") if isinstance(request_value, dict) else None
+        system_parts = system.get("parts") if isinstance(system, dict) else None
+        system_text = system_parts[0].get("text") if isinstance(system_parts, list) and system_parts and isinstance(system_parts[0], dict) else None
+        if (
+            not isinstance(generation, dict)
+            or not isinstance(schema, dict)
+            or schema != gemini_batch_schema(EVIDENCE_REPAIR_SCHEMA)
+            or generation.get("maxOutputTokens") != 500
+            or generation.get("temperature") != 0.0
+            or generation.get("thinkingConfig") != {"thinkingBudget": 0}
+            or system_text != EVIDENCE_REPAIR_SYSTEM_PROMPT
+        ):
+            raise CampaignError("evidence-repair request can only return evidence spans")
+        contents = request_value.get("contents") if isinstance(request_value, dict) else None
+        parts = contents[0].get("parts") if isinstance(contents, list) and contents and isinstance(contents[0], dict) else None
+        user_text = parts[0].get("text") if isinstance(parts, list) and parts and isinstance(parts[0], dict) else None
+        if not isinstance(user_text, str) or "FROZEN CLASSIFICATION" not in user_text or "CANONICAL SPEECH" not in user_text:
+            raise CampaignError("evidence-repair request is missing frozen input context")
+    if len(request_ids) != len(set(request_ids)) or canonical_hash(request_ids) != provenance.get("record_ids_sha256"):
+        raise CampaignError("evidence-repair request record set hash is invalid")
 
 
 def _persist_cache_fields(
@@ -2432,11 +2655,73 @@ def _recovery_retry_eligible(
         return True
     if status != "invalid":
         return False
-    return not (
-        (is_luna or preserve_evidence_failures)
+    category = result.get("failure_category")
+    evidence_failure = category == "EVIDENCE_RESOLUTION_FAILURE" or (
+        category is None
         and result.get("validation_error")
         == "hostility evidence must resolve uniquely to canonical text"
     )
+    return not ((is_luna or preserve_evidence_failures) and evidence_failure)
+
+
+def _stored_frozen_classification(result: dict[str, Any]) -> dict[str, Any] | None:
+    frozen = result.get("frozen_classification")
+    if frozen_classification_is_repairable(frozen):
+        return cast(dict[str, Any], frozen)
+    # Backward-compatible recovery for immutable artifacts collected before the
+    # diagnostics fields were added. Parse the preserved raw provider response;
+    # never infer from a prose validation message.
+    response = result.get("provider_response")
+    candidates = response.get("candidates") if isinstance(response, dict) else None
+    candidate = candidates[0] if isinstance(candidates, list) and candidates else None
+    content = candidate.get("content") if isinstance(candidate, dict) else None
+    parts = content.get("parts") if isinstance(content, dict) else None
+    text = parts[0].get("text") if isinstance(parts, list) and parts and isinstance(parts[0], dict) else None
+    if not isinstance(text, str):
+        return None
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    frozen = {
+        key: parsed[key]
+        for key in ("hostility_present", "target", "reasoning")
+        if key in parsed
+    }
+    return frozen if frozen_classification_is_repairable(frozen) else None
+
+
+def _evidence_failure_for_repair(result: dict[str, Any]) -> bool:
+    return result.get("status") == "invalid" and (
+        result.get("failure_category") == "EVIDENCE_RESOLUTION_FAILURE"
+        or (
+            result.get("failure_category") is None
+            and result.get("validation_error")
+            == "hostility evidence must resolve uniquely to canonical text"
+        )
+    )
+
+
+def _stored_model_evidence(result: dict[str, Any]) -> object:
+    stored = result.get("model_supplied_evidence")
+    if isinstance(stored, list):
+        return stored
+    response = result.get("provider_response")
+    candidates = response.get("candidates") if isinstance(response, dict) else None
+    candidate = candidates[0] if isinstance(candidates, list) and candidates else None
+    content = candidate.get("content") if isinstance(candidate, dict) else None
+    parts = content.get("parts") if isinstance(content, dict) else None
+    text = parts[0].get("text") if isinstance(parts, list) and parts and isinstance(parts[0], dict) else None
+    if not isinstance(text, str):
+        return None
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    evidence = parsed.get("evidence_spans") if isinstance(parsed, dict) else None
+    return evidence if isinstance(evidence, list) else None
 
 
 def submit_recovery(
@@ -2446,11 +2731,19 @@ def submit_recovery(
     confirmation: str,
     *,
     gateway: Any | None = None,
+    recovery_mode: str = "classification_retry",
 ) -> dict[str, Any]:
     """Submit only unresolved invalid/provider-failed records under frozen provenance."""
     _require_admin(principal)
-    if confirmation != RECOVERY_CONFIRMATION:
-        raise CampaignError(f"paid recovery requires typing {RECOVERY_CONFIRMATION}")
+    expected_confirmation = (
+        EVIDENCE_RECOVERY_CONFIRMATION
+        if recovery_mode == "evidence_only"
+        else RECOVERY_CONFIRMATION
+    )
+    if recovery_mode not in {"classification_retry", "evidence_only"}:
+        raise CampaignError("unknown campaign recovery mode")
+    if confirmation != expected_confirmation:
+        raise CampaignError(f"paid recovery requires typing {expected_confirmation}")
     provider = gateway or LiveGeminiGateway()
     with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
         row = connection.execute(
@@ -2473,6 +2766,8 @@ def submit_recovery(
             campaign.get("configuration_id")
             == GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID
         )
+        if recovery_mode == "evidence_only" and not preserve_evidence_failures:
+            raise CampaignError("evidence-only recovery requires Gemini hostility production")
         _original_coverage_complete(campaign)
         active = connection.execute(
             """
@@ -2488,14 +2783,40 @@ def submit_recovery(
         collected = _collected_recoveries(connection, int(campaign["id"]))
         source_directory = _current_effective_artifact_directory(campaign, collected)
         source_path = source_directory / "predictions.jsonl"
-        unresolved_digest = hashlib.sha256(b"[")
-        unresolved_count = 0
-        for result in iter_jsonl(source_path):
-            if not _recovery_retry_eligible(
+        previous_record_attempts = {
+            str(item["record_id"]): int(item["attempt_count"])
+            for item in connection.execute(
+                """SELECT recovery_record.record_id,count(*) AS attempt_count
+                   FROM ai_annotation_campaign_recovery_records recovery_record
+                   JOIN ai_annotation_campaign_recoveries recovery
+                     ON recovery.id=recovery_record.recovery_id
+                   WHERE recovery.campaign_id=%s GROUP BY recovery_record.record_id""",
+                (campaign["id"],),
+            ).fetchall()
+        }
+        selected_source_rows: dict[str, dict[str, Any]] = {}
+
+        def eligible_result(result: dict[str, Any]) -> bool:
+            if recovery_mode == "evidence_only":
+                record_id = result.get("record_id")
+                return (
+                    _evidence_failure_for_repair(result)
+                    and _stored_frozen_classification(result) is not None
+                    and isinstance(_stored_model_evidence(result), list)
+                    and bool(_stored_model_evidence(result))
+                    and isinstance(record_id, str)
+                    and previous_record_attempts.get(record_id, 0) < MAX_CAMPAIGN_RECOVERY_ATTEMPTS
+                )
+            return _recovery_retry_eligible(
                 result,
                 is_luna=is_luna,
                 preserve_evidence_failures=preserve_evidence_failures,
-            ):
+            )
+
+        unresolved_digest = hashlib.sha256(b"[")
+        unresolved_count = 0
+        for result in iter_jsonl(source_path):
+            if not eligible_result(result):
                 continue
             record_id = result.get("record_id")
             if not isinstance(record_id, str):
@@ -2508,6 +2829,7 @@ def submit_recovery(
                 )
             )
             unresolved_count += 1
+            selected_source_rows[record_id] = result
         unresolved_digest.update(b"]")
         if not unresolved_count:
             raise CampaignError("campaign has no unresolved retry-eligible records")
@@ -2521,8 +2843,13 @@ def submit_recovery(
         ).fetchone()
         assert attempt_row is not None
         attempt_number = int(attempt_row["attempt_number"])
-        if is_luna and attempt_number > 3:
-            raise CampaignError("Luna production allows at most three append-only recovery attempts")
+        if (
+            recovery_mode != "evidence_only"
+            and attempt_number > MAX_CAMPAIGN_RECOVERY_ATTEMPTS
+        ):
+            raise CampaignError(
+                f"campaign recovery allows at most {MAX_CAMPAIGN_RECOVERY_ATTEMPTS} append-only attempts"
+            )
         if is_luna:
             if campaign.get("authorized_at") is None or campaign.get("authorized_spend_ceiling_usd") is None:
                 raise CampaignError("Luna recovery requires the original spend authorization")
@@ -2549,8 +2876,8 @@ def submit_recovery(
             """
             INSERT INTO ai_annotation_campaign_recoveries
               (campaign_id,attempt_number,unresolved_set_sha256,request_count,status,
-               submission_display_name)
-            VALUES (%s,%s,%s,%s,'PREPARING',%s) RETURNING *
+              submission_display_name,operational_metadata)
+            VALUES (%s,%s,%s,%s,'PREPARING',%s,%s) RETURNING *
             """,
             (
                 campaign["id"],
@@ -2558,15 +2885,12 @@ def submit_recovery(
                 unresolved_hash,
                 unresolved_count,
                 display_name,
+                Jsonb({"recovery_mode": recovery_mode}),
             ),
         ).fetchone()
         assert recovery is not None
         for result in iter_jsonl(source_path):
-            if not _recovery_retry_eligible(
-                result,
-                is_luna=is_luna,
-                preserve_evidence_failures=preserve_evidence_failures,
-            ):
+            if not eligible_result(result):
                 continue
             record_id = str(result["record_id"])
             error = result.get("validation_error") or result.get("provider_error")
@@ -2602,11 +2926,68 @@ def submit_recovery(
 
     submission_may_exist = False
     try:
-        cache, cache_created = _recovery_cache(campaign, provider)
+        cache: dict[str, Any] | None = None
+        cache_created = False
+        if recovery_mode != "evidence_only":
+            cache, cache_created = _recovery_cache(campaign, provider)
         with psycopg.connect(
             settings.database.psycopg_url, row_factory=dict_row
         ) as connection:
             records = _records_for_recovery(connection, int(recovery["id"]))
+            if recovery_mode == "evidence_only":
+                frozen_by_id = {
+                    record_id: cast(dict[str, Any], _stored_frozen_classification(source_row))
+                    for record_id, source_row in selected_source_rows.items()
+                    if _stored_frozen_classification(source_row) is not None
+                }
+                original_evidence_by_id = {
+                    record_id: _stored_model_evidence(source_row)
+                    for record_id, source_row in selected_source_rows.items()
+                }
+                plan = _evidence_repair_plan(
+                    campaign,
+                    records,
+                    frozen_by_id,
+                    original_evidence_by_id,
+                    display_name=display_name,
+                )
+                directory = _recovery_directory(public_id, attempt_number)
+                directory.mkdir(parents=True, exist_ok=False)
+                (directory / "plan.json").write_text(
+                    json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+                )
+                request_config = plan["request"]["batch"]["input_config"]["requests"]["requests"]
+                (directory / "requests.jsonl").write_text(
+                    "".join(
+                        json.dumps(
+                            {
+                                "campaign_id": public_id,
+                                "recovery_attempt_number": attempt_number,
+                                "record_id": str(record["record_id"]),
+                                "original_request_index": int(selected_source_rows[str(record["record_id"])]["request_index"]),
+                                "frozen_classification": frozen_by_id[str(record["record_id"])],
+                                "provider_request": item["request"],
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        )
+                        + "\n"
+                        for record, item in zip(records, request_config, strict=True)
+                    ),
+                    encoding="utf-8",
+                )
+                connection.commit()
+                submission_may_exist = True
+                provider_job_id = provider.submit(plan, str(campaign["configured_model"]))
+                updated = connection.execute(
+                    """UPDATE ai_annotation_campaign_recoveries SET status='SUBMITTED',
+                       provider_job_id=%s,provider_state='BATCH_STATE_PENDING',submitted_at=now()
+                       WHERE id=%s AND status='PREPARING' AND provider_job_id IS NULL RETURNING *""",
+                    (provider_job_id, recovery["id"]),
+                ).fetchone()
+                if updated is None:
+                    raise CampaignError("evidence-repair submission identity could not be persisted")
+                return dict(updated)
             if is_luna:
                 configuration = _campaign_configuration(campaign)
                 context = _configuration_context(configuration)
@@ -2677,6 +3058,7 @@ def submit_recovery(
                 if updated is None:
                     raise CampaignError("recovery submission identity could not be persisted")
                 return dict(updated)
+            assert cache is not None
             plan = _provider_plan(
                 {**campaign, "cache_identifier": cache["cache_identifier"]},
                 records,
@@ -3033,6 +3415,32 @@ def recover_recovery_submission(
             raise CampaignError("campaign has no pending recovery submission to recover")
         is_luna = recovery["configuration_id"] == LUNA_PRODUCTION_CONFIGURATION_ID
         provider = gateway or (OpenAIBatchGateway() if is_luna else LiveGeminiGateway())
+        recovery_metadata = recovery.get("operational_metadata")
+        if isinstance(recovery_metadata, dict) and recovery_metadata.get("recovery_mode") == "evidence_only":
+            directory = _recovery_directory(
+                str(recovery["campaign_public_id"]), int(recovery["attempt_number"])
+            )
+            plan_path = directory / "plan.json"
+            try:
+                pending_plan = json.loads(plan_path.read_text(encoding="utf-8"))
+                validate_evidence_repair_plan(pending_plan)
+            except (OSError, ValueError, CampaignError) as error:
+                connection.execute(
+                    """UPDATE ai_annotation_campaign_recoveries
+                       SET status='FAILED',failure_metadata=failure_metadata || %s
+                       WHERE id=%s AND status='PREPARING'""",
+                    (
+                        Jsonb({
+                            "preparation_checkpoint_error": str(error)[:1000],
+                            "recovery_mode": "evidence_only",
+                        }),
+                        recovery["id"],
+                    ),
+                )
+                connection.commit()
+                raise CampaignError(
+                    "evidence-repair checkpoint is missing or invalid; the attempt was preserved as failed without a provider call"
+                ) from error
         finder = getattr(provider, "find_batch", None)
         if not callable(finder):
             raise CampaignError("provider gateway cannot recover submitted Batch jobs")
@@ -3078,7 +3486,8 @@ def collect_recovery(
                    recovery.provider_input_file_sha256 AS recovery_input_file_sha256,
                    recovery.provider_output_file_id AS recovery_output_file_id,
                    recovery.provider_error_file_id AS recovery_error_file_id,
-                   recovery.unresolved_set_sha256
+                   recovery.unresolved_set_sha256,
+                   recovery.operational_metadata AS recovery_operational_metadata
             FROM ai_annotation_campaigns campaign
             JOIN ai_annotation_campaign_recoveries recovery
               ON recovery.campaign_id=campaign.id
@@ -3137,6 +3546,7 @@ def collect_recovery(
                 details = lineage[str(result["record_id"])]
                 result.update(
                     campaign_id=public_id,
+                    recovery_mode="classification_retry",
                     recovery_attempt_number=int(combined["attempt_number"]),
                     recovery_provider_job_id=combined["recovery_provider_job_id"],
                     original_request_index=details["original_request_index"],
@@ -3170,24 +3580,48 @@ def collect_recovery(
             coverage = summary["coverage"]
         else:
             directory = _recovery_directory(public_id, int(combined["attempt_number"]))
-            plan = _provider_plan(
-                {**combined, "cache_identifier": combined["recovery_cache_identifier"]},
-                records,
-                expected_record_set_sha256=str(combined["unresolved_set_sha256"]),
-                cache_identifier=str(combined["recovery_cache_identifier"]),
-                display_name=f"phase4d-recovery-{public_id}-{int(combined['attempt_number']):03d}",
-            )
+            recovery_metadata = combined.get("recovery_operational_metadata")
+            recovery_metadata = recovery_metadata if isinstance(recovery_metadata, dict) else {}
+            recovery_mode = recovery_metadata.get("recovery_mode", "classification_retry")
+            if recovery_mode == "evidence_only":
+                plan = json.loads((directory / "plan.json").read_text(encoding="utf-8"))
+            else:
+                plan = _provider_plan(
+                    {**combined, "cache_identifier": combined["recovery_cache_identifier"]},
+                    records,
+                    expected_record_set_sha256=str(combined["unresolved_set_sha256"]),
+                    cache_identifier=str(combined["recovery_cache_identifier"]),
+                    display_name=f"phase4d-recovery-{public_id}-{int(combined['attempt_number']):03d}",
+                )
             gemini_provider = cast(LiveGeminiGateway, provider)
             batch_value = gemini_provider.status(str(combined["recovery_provider_job_id"]))
             configuration = _campaign_configuration(combined)
+            frozen_by_id: dict[str, dict[str, Any]] = {}
+            if recovery_mode == "evidence_only":
+                previous_recoveries = _collected_recoveries(connection, int(combined["id"]))
+                source_directory = _current_effective_artifact_directory(combined, previous_recoveries)
+                frozen_by_id = {
+                    str(value["record_id"]): cast(
+                        dict[str, Any], _stored_frozen_classification(value)
+                    )
+                    for value in iter_jsonl(source_directory / "predictions.jsonl")
+                    if _evidence_failure_for_repair(value)
+                    and _stored_frozen_classification(value) is not None
+                }
+            task = (
+                "hostility_evidence_repair"
+                if recovery_mode == "evidence_only"
+                else configuration.prediction_task
+            )
             domain_codes = (
                 tuple(label.code for label in production_codebook()["taxonomy"].labels)
-                if configuration.prediction_task == "policy" else ()
+                if task == "policy" else ()
             )
             results, coverage = collect_inline_batch(
                 batch_value=batch_value, plan=plan, domain_codes=domain_codes,
-                prediction_task=configuration.prediction_task,
+                prediction_task=task,
                 records_by_id={str(record["record_id"]): record for record in records},
+                frozen_classifications_by_id=frozen_by_id,
             )
             directory = _recovery_directory(public_id, int(combined["attempt_number"]))
         if not is_luna:
@@ -3203,6 +3637,7 @@ def collect_recovery(
                 details = lineage[str(result["record_id"])]
                 result.update(
                     campaign_id=public_id,
+                    recovery_mode=recovery_mode,
                     recovery_attempt_number=int(combined["attempt_number"]),
                     recovery_provider_job_id=combined["recovery_provider_job_id"],
                     original_request_index=details["original_request_index"],
@@ -3268,6 +3703,9 @@ def collect_recovery(
             "valid_count": summary["coverage"]["valid_structured_predictions"],
             "invalid_count": summary["coverage"]["invalid_structured_predictions"],
             "operational_metadata": {
+                "recovery_mode": (
+                    recovery_mode if not is_luna else "classification_retry"
+                ),
                 "coverage": summary["coverage"],
                 "tokens": summary["tokens"],
                 "cost": summary["cost"],
