@@ -54,7 +54,10 @@ from hansard_annotator.web.campaigns.phase4e import (
     authorize_full_production,
     plan_campaign_chunks,
 )
-from hansard_annotator.web.campaigns.routes import campaign_create
+from hansard_annotator.web.campaigns.routes import (
+    campaign_create,
+    campaign_evidence_repair_preview,
+)
 from hansard_annotator.web.campaigns.service import (
     HOSTILITY_POLICY_ELIGIBILITY_RULE,
     LUNA_PRODUCTION_PILOT_SEED,
@@ -62,6 +65,7 @@ from hansard_annotator.web.campaigns.service import (
     PAID_CONFIRMATION,
     CampaignError,
     _assert_hostility_policy_eligible,
+    _evidence_repair_plan,
     _provider_plan,
     _recovery_retry_eligible,
     _selection_query,
@@ -77,6 +81,7 @@ from hansard_annotator.web.campaigns.service import (
     require_current_ai_selection,
     submit_campaign,
     validate_campaign,
+    validate_evidence_repair_plan,
 )
 from hansard_annotator.web.config import WebSettings
 from hansard_annotator.web.tasks.frozen_samples import load_frozen_sample
@@ -90,7 +95,8 @@ def test_luna_recovery_never_retries_success_or_evidence_resolution_failures() -
     assert not _recovery_retry_eligible(
         {
             "status": "invalid",
-            "validation_error": "hostility evidence must resolve uniquely to canonical text",
+            "failure_category": "EVIDENCE_RESOLUTION_FAILURE",
+            "validation_error": "normalized evidence did not uniquely match canonical text",
         },
         is_luna=True,
     )
@@ -122,11 +128,78 @@ def test_gemini_hostility_recovery_retries_operational_failures_but_not_evidence
     assert not _recovery_retry_eligible(
         {
             "status": "invalid",
-            "validation_error": "hostility evidence must resolve uniquely to canonical text",
+            "failure_category": "EVIDENCE_RESOLUTION_FAILURE",
+            "validation_error": "normalized evidence did not uniquely match canonical text",
         },
         is_luna=False,
         preserve_evidence_failures=True,
     )
+
+
+def test_evidence_repair_plan_is_evidence_only_and_frozen_provenance() -> None:
+    configuration = approved_configuration(GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID)
+    campaign = {
+        **configuration.persistence_values(),
+        "public_id": "hostility-evidence-repair-test",
+        "cache_identifier": None,
+    }
+    record_id = "turn:turn-evidence-test"
+    records = (
+        {
+            "record_id": record_id,
+            "speech": {"text": "They are contemptible liars."},
+        },
+    )
+    plan = _evidence_repair_plan(
+        campaign,
+        records,
+        {
+            record_id: {
+                "hostility_present": "YES",
+                "target": "OPPOSING_PARTISAN_TARGET",
+            }
+        },
+        {record_id: ["unresolved model phrase"]},
+        display_name="evidence-repair-test",
+    )
+    validate_evidence_repair_plan(plan)
+    provider_request = plan["request"]["batch"]["input_config"]["requests"]["requests"][0]["request"]
+    assert set(provider_request["generationConfig"]["responseSchema"]["properties"]) == {
+        "evidence_spans"
+    }
+    assert plan["provenance"]["source_prompt_sha256"] == configuration.prompt_sha256
+    assert "They are contemptible liars." in provider_request["contents"][0]["parts"][0]["text"]
+    assert "unresolved model phrase" in provider_request["contents"][0]["parts"][0]["text"]
+
+
+def test_evidence_repair_preview_is_read_only_and_admin_gated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hansard_annotator.web.campaigns.routes as routes
+
+    preview = {
+        "eligible_count": 2,
+        "ineligible_count": 1,
+        "already_repaired_count": 0,
+        "remaining_attempt_budget": 5,
+        "estimated_provider_calls": 2,
+    }
+    monkeypatch.setattr(
+        routes,
+        "get_campaign",
+        lambda _settings, _principal, campaign_id: {
+            "public_id": campaign_id,
+            "evidence_repair_preview": preview,
+        },
+    )
+    response = campaign_evidence_repair_preview(
+        "campaign-test", _settings(), _principal(admin=True)
+    )
+    assert json.loads(response.body) == {
+        "mode": "read_only_preview",
+        "campaign_public_id": "campaign-test",
+        "evidence_repair_preview": preview,
+    }
 
 
 @pytest.mark.parametrize(
@@ -1572,6 +1645,13 @@ def test_hostility_gemini_recovery_ui_keeps_evidence_failures_terminal() -> None
         "invalid_count": 3,
         "structural_repair_available_count": 0,
         "provider_refusal_available_count": 0,
+        "evidence_repair_preview": {
+            "eligible_count": 2,
+            "ineligible_count": 1,
+            "already_repaired_count": 0,
+            "remaining_attempt_budget": 5,
+            "estimated_provider_calls": 2,
+        },
         "active_recovery": None,
         "valid_count": 97,
         "terminal_invalid_count": 0,
@@ -1618,3 +1698,6 @@ def test_hostility_gemini_recovery_ui_keeps_evidence_failures_terminal() -> None
     )
     assert "Retry 2 records — paid Gemini provider action" in html
     assert "Evidence-resolution failures remain terminal" in html
+    assert "Hostility evidence-only repair preview" in html
+    assert "REPAIR HOSTILITY EVIDENCE ONLY" in html
+    assert "Only evidence spans will be requested" in html

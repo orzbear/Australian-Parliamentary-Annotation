@@ -17,8 +17,15 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from hansard_annotator.llm_eval.costs import load_pricing
+from hansard_annotator.llm_eval.failure_categories import (
+    FailureCategory,
+    json_failure_category,
+)
+from hansard_annotator.llm_eval.hostility import (
+    HostilityValidationError,
+    validate_prediction_with_diagnostics,
+)
 from hansard_annotator.llm_eval.hostility import prediction_json_schema as hostility_schema
-from hansard_annotator.llm_eval.hostility import validate_prediction_with_diagnostics
 from hansard_annotator.llm_eval.operations import (
     canonical_hash,
     collect_inline_batch,
@@ -163,6 +170,7 @@ def _collect_openai_chunk(
             rows.append({
                 "record_id": record_id, "turn_key": record_id.removeprefix("turn:"),
                 "request_index": request_index, "status": "provider_failure",
+                "failure_category": FailureCategory.PROVIDER_FAILURE.value,
                 "prediction": None, "provider_error": error or response.get("status_code") or "OpenAI response missing",
                 "provider_response": item,
             })
@@ -196,31 +204,64 @@ def _collect_openai_chunk(
             output_items = body.get("output")
             if isinstance(output_items, list):
                 output_text = next((part.get("text") for message in output_items if isinstance(message, dict) and message.get("type") == "message" for part in message.get("content", []) if isinstance(part, dict) and part.get("type") == "output_text" and isinstance(part.get("text"), str)), None)
+        diagnostics: dict[str, Any] = {}
+        failure_category: FailureCategory | None = None
+        frozen_classification: dict[str, Any] | None = None
+        model_supplied_evidence: list[Any] | None = None
         try:
-            parsed = json.loads(output_text) if isinstance(output_text, str) else None
+            try:
+                parsed = json.loads(output_text) if isinstance(output_text, str) else None
+            except json.JSONDecodeError as json_error:
+                failure_category = (
+                    json_failure_category(json_error, output_text)
+                    if isinstance(output_text, str)
+                    else FailureCategory.STRUCTURED_OUTPUT_INVALID
+                )
+                raise
+            if isinstance(parsed, dict):
+                frozen_classification = {
+                    key: value for key, value in parsed.items() if key != "evidence_spans"
+                }
+                evidence_value = parsed.get("evidence_spans")
+                if isinstance(evidence_value, list):
+                    model_supplied_evidence = evidence_value
             prediction, diagnostics = validate_prediction_with_diagnostics(
                 parsed, str(record["speech"]["text"]), HOSTILITY_LUNA_PROMPT_VERSION
             )
             if diagnostics.get("evidence_valid") is not True:
-                raise ValueError("hostility evidence must resolve uniquely to canonical text")
-            status = "success"
-            output = prediction.to_dict()
-            output.pop("reasoning", None)
-            evidence_spans = output.get("evidence_spans")
-            output["evidence_spans"] = (
-                list(evidence_spans) if isinstance(evidence_spans, (list, tuple)) else []
-            )
-            validation_error = None
+                status = "invalid"
+                output = None
+                validation_error = "hostility evidence must resolve uniquely to canonical text"
+                failure_category = FailureCategory.EVIDENCE_RESOLUTION_FAILURE
+                invalid += 1
+                evidence_failures += 1
+            else:
+                status = "success"
+                output = prediction.to_dict()
+                output.pop("reasoning", None)
+                evidence_spans = output.get("evidence_spans")
+                output["evidence_spans"] = (
+                    list(evidence_spans) if isinstance(evidence_spans, (list, tuple)) else []
+                )
+                validation_error = None
         except (json.JSONDecodeError, TypeError, ValueError) as validation_error_value:
             status = "invalid"
             output = None
             validation_error = str(validation_error_value)
             invalid += 1
-            if validation_error == "hostility evidence must resolve uniquely to canonical text":
-                evidence_failures += 1
+            if failure_category is None:
+                failure_category = (
+                    validation_error_value.category
+                    if isinstance(validation_error_value, HostilityValidationError)
+                    else FailureCategory.STRUCTURED_OUTPUT_INVALID
+                )
         rows.append({
             "record_id": record_id, "turn_key": record_id.removeprefix("turn:"),
             "request_index": request_index, "status": status, "prediction": output,
+            "failure_category": failure_category.value if failure_category else None,
+            "diagnostics": diagnostics or None,
+            "frozen_classification": frozen_classification,
+            "model_supplied_evidence": model_supplied_evidence,
             "validation_error": validation_error, "provider_error": None,
             "usage": values, "returned_model": body.get("model"),
             "provider_response": item,
@@ -241,6 +282,13 @@ def _collect_openai_chunk(
         "valid_structured_predictions": sum(row["status"] == "success" for row in rows),
         "invalid_structured_predictions": invalid,
         "evidence_resolution_failures": evidence_failures,
+        "failure_category_counts": {
+            category.value: sum(
+                row.get("failure_category") == category.value for row in rows
+            )
+            + (len(planned_id_map) - len(responses) if category is FailureCategory.MISSING_RESULT else 0)
+            for category in FailureCategory
+        },
         "accounting_invariant_ok": len(responses) + len(planned_id_map) - len(responses) == len(planned_id_map) and duplicate_count == 0,
     }
     summary = {
@@ -546,6 +594,7 @@ def build_campaign_effective_artifact(
                                 "chunk_number": chunk_number,
                                 "chunk_request_index": local_index,
                                 "status": "missing",
+                                "failure_category": FailureCategory.MISSING_RESULT.value,
                                 "prediction": None,
                                 "provider_error": "provider response missing",
                             },
@@ -570,6 +619,7 @@ def build_campaign_effective_artifact(
                                 "chunk_number": chunk_number,
                                 "chunk_request_index": local_index,
                                 "status": "missing",
+                                "failure_category": FailureCategory.MISSING_RESULT.value,
                                 "prediction": None,
                                 "provider_error": "provider response mapped to another record",
                             },

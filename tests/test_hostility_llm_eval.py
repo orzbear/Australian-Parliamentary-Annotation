@@ -23,6 +23,12 @@ from hansard_annotator.llm_eval.hostility_comparison import (
     compare_hostility_runs,
     write_hostility_comparison,
 )
+from hansard_annotator.llm_eval.hostility_evidence_repair import (
+    EVIDENCE_REPAIR_SCHEMA,
+    build_evidence_repair_user_prompt,
+    frozen_classification_is_repairable,
+    validate_evidence_repair,
+)
 from hansard_annotator.llm_eval.models import ProviderResponse
 from hansard_annotator.llm_eval.package import load_evaluation_package
 from hansard_annotator.llm_eval.prompt import (
@@ -193,6 +199,115 @@ def test_production_no_reasoning_contract_preserves_rules_and_evidence_resolutio
         )
 
 
+@pytest.mark.parametrize(
+    ("canonical", "model_span"),
+    [
+        ("He called them \u2018liars\u2019.", "He called them 'liars'."),
+        ("The policy\u2014however flawed\u2014failed.", "The policy-however flawed-failed."),
+        ("They\u00a0betrayed\nour trust.", "They betrayed our trust."),
+    ],
+)
+def test_evidence_resolution_normalizes_quotes_dashes_and_whitespace(
+    canonical: str, model_span: str
+) -> None:
+    evidence = model_span.removeprefix("He called them ").removesuffix(".") if canonical.startswith("He") else (
+        "policy-however flawed-failed" if canonical.startswith("The policy") else "betrayed our trust"
+    )
+    raw = {
+        "hostility_present": "YES",
+        "target": "OPPOSING_PARTISAN_TARGET",
+        "evidence_spans": [{"text": evidence}],
+    }
+    prediction, diagnostics = validate_prediction_with_diagnostics(
+        raw, canonical, HOSTILITY_PRODUCTION_PROMPT_VERSION
+    )
+    assert diagnostics["evidence_valid"] is True
+    span = prediction.evidence_spans[0]
+    assert canonical[span["start_offset"] : span["end_offset"]] == span["text"]
+
+
+def test_ambiguous_normalized_evidence_is_not_resolved_arbitrarily() -> None:
+    raw = {
+        "hostility_present": "YES",
+        "target": "OPPOSING_PARTISAN_TARGET",
+        "evidence_spans": [{"text": "liars"}],
+    }
+    prediction, diagnostics = validate_prediction_with_diagnostics(
+        raw, "They are \u2018liars\u2019, those \u2018liars\u2019.", HOSTILITY_PRODUCTION_PROMPT_VERSION
+    )
+    assert prediction.hostility_present == "YES"
+    assert diagnostics["evidence_valid"] is False
+    assert diagnostics["evidence_ambiguous"] == ["liars"]
+
+
+def test_evidence_only_repair_preserves_frozen_classification() -> None:
+    frozen = {
+        "hostility_present": "YES",
+        "target": "OPPOSING_PARTISAN_TARGET",
+    }
+    prompt = build_evidence_repair_user_prompt(
+        canonical_text="They are contemptible liars.",
+        frozen_classification=frozen,
+        original_evidence=["deceitful opposition"],
+        codebook_context={"evidence_required_for": ["YES", "UNSURE"]},
+    )
+    assert '"target": "OPPOSING_PARTISAN_TARGET"' in prompt
+    assert set(EVIDENCE_REPAIR_SCHEMA["properties"]) == {"evidence_spans"}
+    repaired, diagnostics = validate_evidence_repair(
+        {"evidence_spans": [{"text": "contemptible liars"}]},
+        canonical_text="They are contemptible liars.",
+        frozen_classification=frozen,
+    )
+    assert repaired["hostility_present"] == "YES"
+    assert repaired["target"] == "OPPOSING_PARTISAN_TARGET"
+    assert repaired["evidence_spans"][0]["text"] == "contemptible liars"
+    assert diagnostics["evidence_valid"] is True
+
+
+def test_evidence_repair_preserves_reasoning_for_original_v2_contract() -> None:
+    frozen = {
+        "hostility_present": "YES",
+        "target": "OPPOSING_PARTISAN_TARGET",
+        "reasoning": "The language is directly hostile.",
+    }
+    repaired, _ = validate_evidence_repair(
+        {"evidence_spans": [{"text": "contemptible liars"}]},
+        canonical_text="They are contemptible liars.",
+        frozen_classification=frozen,
+        prompt_version=HOSTILITY_PROMPT_V2,
+    )
+    assert repaired["reasoning"] == frozen["reasoning"]
+
+
+@pytest.mark.parametrize(
+    "frozen",
+    [
+        None,
+        {"hostility_present": "NO", "target": "N/A"},
+        {"hostility_present": "YES", "target": "N/A"},
+        {"hostility_present": "YES"},
+    ],
+)
+def test_ineligible_frozen_classifications_cannot_be_repaired(frozen: object) -> None:
+    assert frozen_classification_is_repairable(frozen) is False
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    ["fabricated paraphrase", "liars"],
+)
+def test_unresolved_or_ambiguous_evidence_repair_is_rejected(replacement: str) -> None:
+    with pytest.raises(InvalidPrediction):
+        validate_evidence_repair(
+            {"evidence_spans": [{"text": replacement}]},
+            canonical_text="They are \u2018liars\u2019. Those are also liars.",
+            frozen_classification={
+                "hostility_present": "YES",
+                "target": "OPPOSING_PARTISAN_TARGET",
+            },
+        )
+
+
 def test_luna_prompt_v1_is_distinct_and_uses_reasoning_free_structured_contract(
     tmp_path: Path,
 ) -> None:
@@ -203,7 +318,7 @@ def test_luna_prompt_v1_is_distinct_and_uses_reasoning_free_structured_contract(
     prompt = build_system_prompt(context, HOSTILITY_LUNA_PROMPT_VERSION)
     schema = prediction_json_schema(HOSTILITY_LUNA_PROMPT_VERSION)
     assert HOSTILITY_LUNA_PROMPT_VERSION == "hostility-prompt-luna-v1"
-    assert "DECISION PROCEDURE — FOLLOW IN ORDER" in prompt
+    assert "DECISION PROCEDURE \u2014 FOLLOW IN ORDER" in prompt
     for required in (
         "Routine adversarial parliamentary criticism",
         "ordinary partisan contrast",
@@ -449,7 +564,7 @@ def test_reasoning_telemetry_has_a_larger_but_finite_runtime_limit() -> None:
 
 
 def test_evidence_text_resolution_unique_unicode_and_multiline() -> None:
-    text = "Opening — naïve claim.\nSecond line is cruel. Closing."
+    text = "Opening \u2014 naïve claim.\nSecond line is cruel. Closing."
     quote = "naïve claim.\nSecond line is cruel."
     prediction, diagnostics = validate_prediction_with_diagnostics(
         _raw("YES", "OTHER_POLITICAL_TARGET", quote), text

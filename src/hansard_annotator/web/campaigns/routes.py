@@ -6,7 +6,7 @@ from decimal import Decimal
 from typing import Annotated, cast
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from hansard_annotator.web.auth.models import Principal
@@ -69,6 +69,7 @@ def _notice_message(code: str | None, campaign: dict[str, object]) -> str | None
         "status-refreshed": "Provider status refreshed.",
         "results-collected": "Results collected.",
         "recovery-submitted": "Paid targeted recovery submitted.",
+        "evidence-repair-submitted": "Paid hostility evidence-only repair submitted.",
         "recovery-status-refreshed": "Recovery provider status refreshed.",
         "recovery-collected": "Recovery results collected and effective validation refreshed.",
         "structural-repair-applied": (
@@ -187,6 +188,25 @@ def campaign_detail(
                 "max_chunk_records": max_chunk_records,
             },
         },
+    )
+
+
+@router.get("/{campaign_id}/evidence-repair-preview")
+def campaign_evidence_repair_preview(
+    campaign_id: str,
+    settings: Annotated[WebSettings, Depends(get_settings)],
+    principal: Annotated[Principal, Depends(require_admin)],
+) -> JSONResponse:
+    try:
+        campaign = get_campaign(settings, principal, campaign_id)
+    except (CampaignError, LookupError, PermissionError, ValueError) as error:
+        raise _http_error(error) from error
+    return JSONResponse(
+        {
+            "mode": "read_only_preview",
+            "campaign_public_id": campaign["public_id"],
+            "evidence_repair_preview": campaign.get("evidence_repair_preview", {}),
+        }
     )
 
 
@@ -341,6 +361,14 @@ async def _action(
             import_campaign(settings, principal, campaign_id)
         elif operation == "retry-invalid":
             submit_recovery(settings, principal, campaign_id, confirmation or "")
+        elif operation == "repair-evidence":
+            submit_recovery(
+                settings,
+                principal,
+                campaign_id,
+                confirmation or "",
+                recovery_mode="evidence_only",
+            )
         elif operation == "recovery-refresh":
             refresh_recovery(settings, principal, campaign_id)
         elif operation == "recovery-resume":
@@ -363,6 +391,7 @@ async def _action(
         "orchestration-tick": "orchestration-ticked",
         "import": "predictions-imported",
         "retry-invalid": "recovery-submitted",
+        "repair-evidence": "evidence-repair-submitted",
         "recovery-refresh": "recovery-status-refreshed",
         "recovery-resume": "recovery-submitted",
         "recovery-collect": "recovery-collected",
@@ -554,6 +583,19 @@ async def campaign_retry_invalid(
 ) -> RedirectResponse:
     return await _action(
         request, settings, principal, campaign_id, "retry-invalid", confirmation
+    )
+
+
+@router.post("/{campaign_id}/repair-evidence")
+async def campaign_repair_evidence(
+    request: Request,
+    campaign_id: str,
+    settings: Annotated[WebSettings, Depends(get_settings)],
+    principal: Annotated[Principal, Depends(require_admin)],
+    confirmation: Annotated[str, Form()],
+) -> RedirectResponse:
+    return await _action(
+        request, settings, principal, campaign_id, "repair-evidence", confirmation
     )
 
 
