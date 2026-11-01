@@ -65,12 +65,14 @@ from hansard_annotator.web.campaigns.service import (
     PAID_CONFIRMATION,
     CampaignError,
     _assert_hostility_policy_eligible,
+    _complete_recovery_plan_pricing,
     _evidence_repair_plan,
     _provider_plan,
     _recovery_retry_eligible,
     _selection_query,
     approved_campaign_configurations,
     collect_campaign,
+    collect_recovery,
     create_campaign,
     credential_status,
     get_campaign,
@@ -168,8 +170,89 @@ def test_evidence_repair_plan_is_evidence_only_and_frozen_provenance() -> None:
         "evidence_spans"
     }
     assert plan["provenance"]["source_prompt_sha256"] == configuration.prompt_sha256
+    assert plan["provenance"]["pricing_format_version"] == 1
+    assert plan["provenance"]["pricing_effective_date"] == "2026-10-09"
+    assert "Google Gemini Developer API pricing" in plan["provenance"]["pricing_source"]
     assert "They are contemptible liars." in provider_request["contents"][0]["parts"][0]["text"]
     assert "unresolved model phrase" in provider_request["contents"][0]["parts"][0]["text"]
+
+
+def test_legacy_evidence_repair_plan_gets_authoritative_pricing_without_mutation() -> None:
+    from hansard_annotator.llm_eval.costs import load_pricing
+
+    legacy_plan = {
+        "provenance": {
+            "recovery_mode": "evidence_only",
+            "provider": "gemini",
+            "model": "gemini-2.5-flash",
+        },
+        "request": {"batch": {}},
+    }
+    original = json.loads(json.dumps(legacy_plan))
+    pricing = load_pricing(ROOT / "config/llm_eval/pricing.yaml")
+
+    completed = _complete_recovery_plan_pricing(legacy_plan, pricing)
+
+    assert legacy_plan == original
+    assert completed is not legacy_plan
+    assert completed["provenance"]["pricing_effective_date"] == "2026-10-09"
+    assert completed["provenance"]["pricing_source"] == pricing["models"][
+        "gemini:gemini-2.5-flash"
+    ]["source"]
+
+    del pricing["models"]["gemini:gemini-2.5-flash"]["modes"]["batch"][
+        "output_per_million_usd"
+    ]
+    with pytest.raises(CampaignError, match="rates are incomplete"):
+        _complete_recovery_plan_pricing(legacy_plan, pricing)
+
+
+def test_recovery_collection_of_collected_attempt_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    collected = {
+        "recovery_id": 7,
+        "attempt_number": 2,
+        "recovery_status": "COLLECTED",
+        "artifact_sha256": "already-collected",
+    }
+    query_count = 0
+
+    class _Connection:
+        def __enter__(self) -> _Connection:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def execute(self, _query: str, _params: object = None) -> Any:
+            nonlocal query_count
+            query_count += 1
+
+            class _Result:
+                def fetchone(self) -> dict[str, Any]:
+                    return collected
+
+            return _Result()
+
+    class _Gateway:
+        def status(self, _job_id: str) -> dict[str, Any]:
+            raise AssertionError("already-collected recovery must not contact the provider")
+
+    monkeypatch.setattr(
+        "hansard_annotator.web.campaigns.service.psycopg.connect",
+        lambda *_args, **_kwargs: _Connection(),
+    )
+
+    first = collect_recovery(
+        _settings(), _principal(admin=True), "campaign-id", gateway=_Gateway()
+    )
+    second = collect_recovery(
+        _settings(), _principal(admin=True), "campaign-id", gateway=_Gateway()
+    )
+
+    assert first == second == collected
+    assert query_count == 2
 
 
 def test_evidence_repair_preview_is_read_only_and_admin_gated(

@@ -1947,6 +1947,63 @@ def _provider_plan(
     return plan
 
 
+def _configured_batch_pricing_metadata(
+    provider: str, model: str, pricing: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    pricing_value = (
+        pricing if pricing is not None else load_pricing(ROOT / "config/llm_eval/pricing.yaml")
+    )
+    if pricing_value.get("format_version") != 1:
+        raise CampaignError("batch pricing format version is unsupported")
+    models = pricing_value.get("models")
+    entry = models.get(f"{provider}:{model}") if isinstance(models, dict) else None
+    modes = entry.get("modes") if isinstance(entry, dict) else None
+    rates = modes.get("batch") if isinstance(modes, dict) else None
+    required_rates = (
+        "input_per_million_usd",
+        "cached_input_per_million_usd",
+        "output_per_million_usd",
+    )
+    if not isinstance(entry, dict) or not isinstance(rates, dict):
+        raise CampaignError(f"batch pricing is not configured for {provider}:{model}")
+    if any(
+        isinstance(rates.get(key), bool) or not isinstance(rates.get(key), int | float)
+        for key in required_rates
+    ):
+        raise CampaignError(f"batch pricing rates are incomplete for {provider}:{model}")
+    effective_date = entry.get("effective_date", pricing_value.get("effective_date"))
+    source = entry.get("source", pricing_value.get("source"))
+    if not isinstance(effective_date, str) or not effective_date:
+        raise CampaignError(f"batch pricing effective date is missing for {provider}:{model}")
+    if not isinstance(source, str) or not source:
+        raise CampaignError(f"batch pricing source is missing for {provider}:{model}")
+    return {
+        "pricing_format_version": pricing_value.get("format_version"),
+        "pricing_effective_date": effective_date,
+        "pricing_source": source,
+    }
+
+
+def _complete_recovery_plan_pricing(
+    plan: dict[str, Any], pricing: dict[str, Any]
+) -> dict[str, Any]:
+    provenance_value = plan.get("provenance")
+    if not isinstance(provenance_value, dict):
+        raise CampaignError("recovery plan provenance is missing")
+    provider = provenance_value.get("provider")
+    model = provenance_value.get("model")
+    if not isinstance(provider, str) or not isinstance(model, str):
+        raise CampaignError("recovery plan provider/model provenance is missing")
+    authoritative = _configured_batch_pricing_metadata(provider, model, pricing)
+    provenance = dict(provenance_value)
+    for key, value in authoritative.items():
+        recorded = provenance.get(key)
+        if recorded is not None and recorded != value:
+            raise CampaignError(f"recovery plan {key} differs from configured pricing")
+        provenance[key] = value
+    return {**plan, "provenance": provenance}
+
+
 def _evidence_repair_plan(
     campaign: dict[str, Any],
     records: tuple[dict[str, Any], ...],
@@ -2012,6 +2069,7 @@ def _evidence_repair_plan(
         "execution_mode": "batch",
         "record_count": len(records),
         "record_ids_sha256": canonical_hash([record["record_id"] for record in records]),
+        **_configured_batch_pricing_metadata("gemini", configuration.configured_model),
     }
     plan = {
         "provenance": provenance,
@@ -3583,8 +3641,19 @@ def collect_recovery(
             recovery_metadata = combined.get("recovery_operational_metadata")
             recovery_metadata = recovery_metadata if isinstance(recovery_metadata, dict) else {}
             recovery_mode = recovery_metadata.get("recovery_mode", "classification_retry")
+            pricing = load_pricing(ROOT / "config/llm_eval/pricing.yaml")
             if recovery_mode == "evidence_only":
-                plan = json.loads((directory / "plan.json").read_text(encoding="utf-8"))
+                try:
+                    stored_plan = json.loads(
+                        (directory / "plan.json").read_text(encoding="utf-8")
+                    )
+                except (OSError, ValueError) as error:
+                    raise CampaignError(
+                        "evidence-repair request artifact is missing or invalid"
+                    ) from error
+                if not isinstance(stored_plan, dict):
+                    raise CampaignError("evidence-repair request artifact is invalid")
+                plan = _complete_recovery_plan_pricing(stored_plan, pricing)
             else:
                 plan = _provider_plan(
                     {**combined, "cache_identifier": combined["recovery_cache_identifier"]},
@@ -3662,7 +3731,6 @@ def collect_recovery(
                         "usageMetadata": cache_metadata.get("usageMetadata", {}),
                     }
                 }
-            pricing = load_pricing(ROOT / "config/llm_eval/pricing.yaml")
             summary = _collection_summary(
                 batch_value, plan, results, coverage, pricing, cache_receipt
             )
