@@ -62,8 +62,18 @@ test-results/
 .vscode/
 .DS_Store
 Thumbs.db
-.pytest-temp-run/
 phase4b-validation-100.tar.gz
 
+# Root-level generated pytest/test-run directories. Keep these patterns
+# directory-specific so source, fixtures, and research artifacts remain visible.
+/.pytest-ci-luna-98bd70/
+/.pytest-full-tmp/
+/.pytest-local-eligibility*/
+/.pytest-local-tmp/
+/.pytest-temp-run/
+/.pytest-tmp/
+/.ci-fix-test-tmp/
+/.hostility-eval-test-tmp/
+/.hostility-offset-test-tmp/
 /.hostility-sample-test-tmp/
 /.policy-frame-test-tmp/
