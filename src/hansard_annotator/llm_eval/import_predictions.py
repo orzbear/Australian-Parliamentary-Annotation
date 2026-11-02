@@ -248,9 +248,10 @@ def iter_terminal_invalid_artifact(
             if history:
                 normalized_history: list[dict[str, Any]] = []
                 previous_attempt = 0
-                original_errors: set[str] = set()
                 for attempt in history:
                     attempt_number = attempt.get("attempt_number")
+                    replacement_status = attempt.get("replacement_validation_result")
+                    replacement_error = attempt.get("replacement_validation_error")
                     if (
                         not isinstance(attempt_number, int)
                         or attempt_number <= previous_attempt
@@ -258,23 +259,26 @@ def iter_terminal_invalid_artifact(
                         or not attempt.get("recovery_id")
                         or not isinstance(attempt.get("provider_job_id"), str)
                         or not attempt.get("provider_job_id")
-                        or attempt.get("replacement_validation_result") != "invalid"
-                        or attempt.get("replacement_validation_error")
-                        != value["validation_error"]
+                        or replacement_status not in {"invalid", "provider_failure", "missing"}
+                        or (
+                            replacement_status == "invalid"
+                            and not isinstance(replacement_error, str)
+                        )
+                        or (
+                            replacement_status == "provider_failure"
+                            and not isinstance(replacement_error, str)
+                        )
+                        or attempt.get("recovery_mode", "classification_retry")
+                        not in {"classification_retry", "evidence_only"}
                         or not isinstance(attempt.get("original_validation_error"), str)
                         or not attempt.get("original_validation_error")
-                        or attempt.get("lineage_consistent") is False
+                        or attempt.get("lineage_consistent") is not True
                     ):
                         raise ValueError(
                             f"prediction line {number} has inconsistent recovery provenance"
                         )
                     previous_attempt = attempt_number
-                    original_errors.add(str(attempt["original_validation_error"]))
                     normalized_history.append(dict(attempt))
-                if len(original_errors) != 1:
-                    raise ValueError(
-                        f"prediction line {number} has conflicting original validation errors"
-                    )
                 latest = normalized_history[-1]
                 value = {
                     **value,
@@ -283,7 +287,9 @@ def iter_terminal_invalid_artifact(
                     "attempt_count": len(normalized_history),
                     "recovery_attempt_number": latest["attempt_number"],
                     "recovery_provider_job_id": latest["provider_job_id"],
-                    "original_validation_error": next(iter(original_errors)),
+                    "original_validation_error": normalized_history[0][
+                        "original_validation_error"
+                    ],
                     "replacement_validation_result": latest[
                         "replacement_validation_result"
                     ],

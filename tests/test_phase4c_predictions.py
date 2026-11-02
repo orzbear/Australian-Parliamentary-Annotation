@@ -214,6 +214,7 @@ def test_historical_hostility_invalid_row_uses_four_recovery_attempts(
                 "original_validation_error": "hostility evidence must resolve uniquely to canonical text",
                 "replacement_validation_result": "invalid",
                 "replacement_validation_error": "hostility evidence must resolve uniquely to canonical text",
+                "lineage_consistent": True,
             }
             for attempt in range(1, 5)
         ]
@@ -254,6 +255,115 @@ def test_terminal_invalid_campaign_requires_recoverable_lineage(tmp_path: Path) 
             iter_terminal_invalid_artifact(
                 artifact,
                 prediction_task="hostility",
+                require_recovery_lineage=True,
+            )
+        )
+
+
+def test_terminal_validation_accepts_attempt_specific_recovery_provenance(
+    tmp_path: Path,
+) -> None:
+    artifact = tmp_path / "hostility-mixed-recovery-history"
+    _write_artifact(artifact)
+    invalid = {
+        "record_id": "turn:invalid-key",
+        "status": "invalid",
+        "prediction": None,
+        "validation_error": "hostility evidence must resolve uniquely to canonical text",
+        "provider_response": {"responseId": "final-response"},
+    }
+    with (artifact / "predictions.jsonl").open("a", encoding="utf-8") as target:
+        target.write(json.dumps(invalid) + "\n")
+    history = {
+        "turn:invalid-key": [
+            {
+                "attempt_number": 1,
+                "recovery_id": "recovery-1",
+                "provider_job_id": "batches/recovery-1",
+                "recovery_mode": "classification_retry",
+                "original_validation_error": "truncated JSON on original attempt",
+                "replacement_validation_result": "invalid",
+                "replacement_validation_error": "truncated JSON in retry one",
+                "lineage_consistent": True,
+            },
+            {
+                "attempt_number": 2,
+                "recovery_id": "recovery-2",
+                "provider_job_id": "batches/recovery-2",
+                "recovery_mode": "classification_retry",
+                "original_validation_error": "truncated JSON in retry one",
+                "replacement_validation_result": "invalid",
+                "replacement_validation_error": "truncated JSON in retry two",
+                "lineage_consistent": True,
+            },
+            {
+                "attempt_number": 3,
+                "recovery_id": "recovery-3",
+                "provider_job_id": "batches/recovery-3",
+                "recovery_mode": "evidence_only",
+                "original_validation_error": invalid["validation_error"],
+                "replacement_validation_result": "invalid",
+                "replacement_validation_error": "repaired evidence did not resolve uniquely",
+                "lineage_consistent": True,
+            },
+        ]
+    }
+
+    terminal = list(
+        iter_terminal_invalid_artifact(
+            artifact,
+            prediction_task="hostility",
+            terminal_recovery_history=history,
+            require_recovery_lineage=True,
+        )
+    )
+
+    assert len(terminal) == 1
+    assert terminal[0]["validation_error"] == invalid["validation_error"]
+    assert terminal[0]["original_validation_error"] == (
+        "truncated JSON on original attempt"
+    )
+    assert terminal[0]["recovery_attempt_count"] == 3
+    assert terminal[0]["recovery_attempt_history"][0]["replacement_validation_error"] == (
+        "truncated JSON in retry one"
+    )
+    assert terminal[0]["recovery_attempt_history"][2]["recovery_mode"] == "evidence_only"
+
+
+def test_terminal_validation_still_rejects_contradictory_attempt_lineage(
+    tmp_path: Path,
+) -> None:
+    artifact = tmp_path / "hostility-contradictory-recovery-history"
+    _write_artifact(artifact)
+    invalid = {
+        "record_id": "turn:invalid-key",
+        "status": "invalid",
+        "prediction": None,
+        "validation_error": "hostility evidence must resolve uniquely to canonical text",
+        "provider_response": {"responseId": "final-response"},
+    }
+    with (artifact / "predictions.jsonl").open("a", encoding="utf-8") as target:
+        target.write(json.dumps(invalid) + "\n")
+    history = {
+        "turn:invalid-key": [
+            {
+                "attempt_number": 1,
+                "recovery_id": "recovery-1",
+                "provider_job_id": "batches/recovery-1",
+                "recovery_mode": "evidence_only",
+                "original_validation_error": "evidence failed",
+                "replacement_validation_result": "invalid",
+                "replacement_validation_error": "other error",
+                "lineage_consistent": False,
+            }
+        ]
+    }
+    with pytest.raises(ValueError, match="inconsistent recovery provenance"):
+        list(
+            iter_terminal_invalid_artifact(
+                artifact,
+                prediction_task="hostility",
+                terminal_recovery_history=history,
                 require_recovery_lineage=True,
             )
         )
