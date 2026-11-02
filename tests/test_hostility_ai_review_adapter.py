@@ -52,6 +52,74 @@ def test_hostility_v2_adapter_rejects_ambiguous_evidence() -> None:
         )
 
 
+def test_hostility_v2_adapter_accepts_verified_canonical_artifact_spans() -> None:
+    text = "The minister is hopeless. The bill is ordinary."
+    original = adapt_hostility_prediction(
+        {
+            "hostility_present": "YES",
+            "target": "OPPOSING_PARTISAN_TARGET",
+            "evidence_spans": [{"text": "minister is hopeless"}],
+            "reasoning": "Direct competence attack.",
+        },
+        text,
+    )
+    evidence_repair_artifact = {
+        **original.values,
+        "reasoning": "Direct competence attack.",
+    }
+    imported = adapt_hostility_prediction(evidence_repair_artifact, text)
+    assert imported.values == original.values
+    assert imported.values["evidence_spans"] == [
+        {"start_offset": 4, "end_offset": 24, "text": "minister is hopeless"}
+    ]
+
+
+def test_hostility_v2_adapter_checks_canonical_offsets_and_no_evidence_contract() -> None:
+    text = "The minister is hopeless."
+    no_prediction = adapt_hostility_prediction(
+        {
+            "hostility_present": "NO",
+            "target": "N/A",
+            "evidence_spans": [],
+            "reasoning": "No hostile evaluation.",
+        },
+        text,
+    )
+    assert no_prediction.values["evidence_spans"] == []
+
+    with pytest.raises(ValueError, match="canonical evidence offsets"):
+        adapt_hostility_prediction(
+            {
+                "hostility_present": "YES",
+                "target": "OPPOSING_PARTISAN_TARGET",
+                "evidence_spans": [
+                    {"start_offset": 0, "end_offset": 8, "text": "minister"}
+                ],
+                "reasoning": "Direct competence attack.",
+            },
+            text,
+        )
+    with pytest.raises(ValueError, match="evidence span fields are invalid"):
+        adapt_hostility_prediction(
+            {
+                "hostility_present": "YES",
+                "target": "OPPOSING_PARTISAN_TARGET",
+                "evidence_spans": [{"text": "minister", "start_offset": 4}],
+                "reasoning": "Direct competence attack.",
+            },
+            text,
+        )
+    with pytest.raises(ValueError, match="response fields do not match"):
+        adapt_hostility_prediction(
+            {
+                "hostility_present": "YES",
+                "target": "OPPOSING_PARTISAN_TARGET",
+                "reasoning": "Direct competence attack.",
+            },
+            text,
+        )
+
+
 def test_hostility_changes_are_derived() -> None:
     suggested = {"hostility_present": "NO", "target": None, "evidence_span": []}
     human = {"hostility_present": "UNSURE", "target": "UNCLEAR", "evidence_span": []}

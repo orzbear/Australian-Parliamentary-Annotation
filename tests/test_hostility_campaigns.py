@@ -45,6 +45,7 @@ from hansard_annotator.llm_eval.operations import (
     gemini_batch_schema,
     validate_production_plan,
 )
+from hansard_annotator.llm_eval.prediction_tasks import adapt_hostility_prediction
 from hansard_annotator.llm_eval.prompt import build_system_prompt, prompt_hash
 from hansard_annotator.web.auth.models import Principal
 from hansard_annotator.web.campaigns.configurations import (
@@ -1733,15 +1734,26 @@ def test_hostility_collection_validation_and_import_use_hostility_adapter(
     assert collected["invalid_count"] == 0
 
     artifact_dir = Path(str(collected["artifact_reference"]))
-    first_prediction_row = json.loads(
-        (artifact_dir / "predictions.jsonl").read_text(encoding="utf-8").splitlines()[0]
-    )
+    prediction_path = artifact_dir / "predictions.jsonl"
+    prediction_lines = prediction_path.read_text(encoding="utf-8").splitlines()
+    first_prediction_row = json.loads(prediction_lines[0])
     pred = first_prediction_row["prediction"]
     assert pred["hostility_present"] == "YES"
     assert pred["target"] == "OPPOSING_PARTISAN_TARGET"
     assert pred["evidence_spans"] == [{"text": "those opposite failed Australians."}]
     assert "is_non_policy" not in pred
     assert "primary_australian_domain" not in pred
+    normalized_prediction = adapt_hostility_prediction(
+        pred,
+        cast(dict[str, Any], records[0]["speech"])["text"],
+        str(campaign["prompt_version"]),
+    )
+    first_prediction_row["prediction"] = {
+        **normalized_prediction.values,
+        "reasoning": normalized_prediction.reasoning,
+    }
+    prediction_lines[0] = json.dumps(first_prediction_row, ensure_ascii=False)
+    prediction_path.write_text("\n".join(prediction_lines) + "\n", encoding="utf-8")
 
     insert_values = _prediction_insert_values(
         run_id=777,
@@ -1767,6 +1779,23 @@ def test_hostility_collection_validation_and_import_use_hostility_adapter(
     assert canonical_values["evidence_spans"][0]["text"] == "those opposite failed Australians."
     assert isinstance(canonical_values["evidence_spans"][0]["start_offset"], int)
     assert isinstance(canonical_values["evidence_spans"][0]["end_offset"], int)
+
+    span = first_prediction_row["prediction"]["evidence_spans"][0]
+    first_prediction_row["prediction"]["evidence_spans"][0] = {
+        **span,
+        "start_offset": span["start_offset"] + 1,
+    }
+    prediction_lines[0] = json.dumps(first_prediction_row, ensure_ascii=False)
+    prediction_path.write_text("\n".join(prediction_lines) + "\n", encoding="utf-8")
+    with pytest.raises(
+        CampaignError,
+        match=r"prediction turn:key-000 field prediction\.evidence_spans",
+    ):
+        validate_campaign(_settings(), _principal(), str(campaign["public_id"]))
+
+    first_prediction_row["prediction"]["evidence_spans"][0] = span
+    prediction_lines[0] = json.dumps(first_prediction_row, ensure_ascii=False)
+    prediction_path.write_text("\n".join(prediction_lines) + "\n", encoding="utf-8")
 
     validated = validate_campaign(_settings(), _principal(), str(campaign["public_id"]))
     assert validated["status"] == "VALIDATED"
@@ -1801,6 +1830,36 @@ def test_hostility_collection_validation_and_import_use_hostility_adapter(
     assert imported_calls[0]["prediction_task"] == "hostility"
     assert imported_calls[0]["annotation_schema_slug"] == "australian_partisan_hostility"
     assert imported_calls[0]["annotation_schema_version"] == "0.2.0"
+
+
+def test_hostility_import_error_identifies_record_and_evidence_field() -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"prediction turn:bad-evidence field prediction\.evidence_spans",
+    ):
+        _prediction_insert_values(
+            run_id=1,
+            directory=Path("effective-artifact"),
+            rows=[
+                {
+                    "record_id": "turn:bad-evidence",
+                    "prediction": {
+                        "hostility_present": "YES",
+                        "target": "OPPOSING_PARTISAN_TARGET",
+                        "evidence_spans": [
+                            {"start_offset": 0, "end_offset": 4, "text": "wrong"}
+                        ],
+                    },
+                }
+            ],
+            turns={
+                "bad-evidence": {
+                    "id": 7,
+                    "text_clean": "The speech has exact evidence.",
+                }
+            },
+            prediction_task="hostility",
+        )
 
 
 def test_policy_only_repair_and_phase4e_reject_hostility_campaigns(

@@ -32,6 +32,7 @@ from hansard_annotator.llm_eval.hostility_evidence_repair import (
 from hansard_annotator.llm_eval.import_predictions import (
     import_predictions,
     inspect_prediction_artifact,
+    iter_prediction_artifact,
     iter_terminal_invalid_artifact,
     load_prediction_artifact,
 )
@@ -58,6 +59,7 @@ from hansard_annotator.llm_eval.ops_cli import (
     _get_cache,
     _get_gemini_resource,
 )
+from hansard_annotator.llm_eval.prediction_tasks import adapt_hostility_prediction
 from hansard_annotator.llm_eval.prompt import (
     HOSTILITY_LUNA_PROMPT_VERSION,
     build_system_prompt,
@@ -4283,6 +4285,30 @@ def validate_campaign(
                 expected_configuration=expected,
             )
             row_count = len(rows)
+        if configuration.prediction_task == "hostility":
+            canonical_text_by_id = {
+                str(record["record_id"]): str(record["speech"].get("text") or "")
+                for record in _records_for_campaign(connection, int(campaign["id"]))
+            }
+            for prediction_row in iter_prediction_artifact(
+                directory, prediction_task="hostility"
+            ):
+                record_id = str(prediction_row["record_id"])
+                canonical_text = canonical_text_by_id.get(record_id)
+                if canonical_text is None:
+                    raise CampaignError(
+                        f"prediction {record_id} has no canonical speech record"
+                    )
+                try:
+                    adapt_hostility_prediction(
+                        prediction_row["prediction"],
+                        canonical_text,
+                        configuration.prompt_version,
+                    )
+                except (TypeError, ValueError) as error:
+                    raise CampaignError(
+                        f"prediction {record_id} field prediction.evidence_spans: {error}"
+                    ) from error
         coverage = summary["coverage"]
         valid_count = int(coverage.get("valid_structured_predictions") or 0)
         refusal_count = int(coverage.get("provider_refused") or 0)

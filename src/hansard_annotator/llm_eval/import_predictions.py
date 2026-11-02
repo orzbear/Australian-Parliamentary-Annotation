@@ -442,7 +442,12 @@ def _prediction_insert_values(
         turn_key = str(row["record_id"]).removeprefix("turn:")
         if prediction_task == "hostility":
             text = str(turns[turn_key].get("text_clean") or turns[turn_key].get("text_raw") or "")
-            adapted = adapt_hostility_prediction(prediction, text)
+            try:
+                adapted = adapt_hostility_prediction(prediction, text)
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    f"prediction {row['record_id']} field prediction.evidence_spans: {error}"
+                ) from error
             policy_values: tuple[object, object, object] = (None, None, None)
             canonical_values = adapted.values
             reasoning = adapted.reasoning
