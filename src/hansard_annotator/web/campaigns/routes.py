@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import csv
+import io
+import json
 from decimal import Decimal
 from typing import Annotated, cast
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
 from hansard_annotator.web.auth.models import Principal
@@ -22,6 +25,7 @@ from hansard_annotator.web.campaigns.service import (
     DEFAULT_EXCLUDE_HUMAN_ANNOTATED,
     CampaignError,
     approved_campaign_configurations,
+    campaign_unresolved_records,
     collect_campaign,
     collect_recovery,
     create_campaign,
@@ -210,6 +214,58 @@ def campaign_evidence_repair_preview(
     )
 
 
+@router.get("/{campaign_id}/unresolved.csv")
+def campaign_unresolved_export(
+    campaign_id: str,
+    settings: Annotated[WebSettings, Depends(get_settings)],
+    principal: Annotated[Principal, Depends(require_admin)],
+) -> Response:
+    try:
+        records = campaign_unresolved_records(settings, principal, campaign_id)
+    except (CampaignError, LookupError, PermissionError) as error:
+        raise _http_error(error) from error
+    output = io.StringIO(newline="")
+    writer = csv.writer(output, lineterminator="\r\n")
+    writer.writerow(
+        (
+            "record_id",
+            "turn_key",
+            "speech_date",
+            "speaker",
+            "canonical_text",
+            "failure_category",
+            "reason",
+            "attempt_count",
+            "terminal",
+            "attempt_history_json",
+        )
+    )
+    for record in records:
+        writer.writerow(
+            (
+                record.get("record_id"),
+                record.get("turn_key"),
+                record.get("speech_date"),
+                record.get("speaker_name_raw"),
+                record.get("canonical_text"),
+                record.get("failure_category"),
+                record.get("reason"),
+                record.get("attempt_count"),
+                record.get("terminal"),
+                json.dumps(record.get("attempt_history", []), ensure_ascii=False, sort_keys=True),
+            )
+        )
+    return Response(
+        output.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{campaign_id}-unresolved.csv"',
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
 @router.post("/{campaign_id}/delete")
 async def campaign_delete(
     request: Request,
@@ -358,7 +414,7 @@ async def _action(
         elif operation == "orchestration-tick":
             orchestration_tick(settings, campaign_id)
         elif operation == "import":
-            import_campaign(settings, principal, campaign_id)
+            import_campaign(settings, principal, campaign_id, confirmation or "")
         elif operation == "retry-invalid":
             submit_recovery(settings, principal, campaign_id, confirmation or "")
         elif operation == "repair-evidence":
@@ -569,8 +625,11 @@ async def campaign_import(
     campaign_id: str,
     settings: Annotated[WebSettings, Depends(get_settings)],
     principal: Annotated[Principal, Depends(require_admin)],
+    confirmation: Annotated[str, Form()],
 ) -> RedirectResponse:
-    return await _action(request, settings, principal, campaign_id, "import")
+    return await _action(
+        request, settings, principal, campaign_id, "import", confirmation
+    )
 
 
 @router.post("/{campaign_id}/retry-invalid")

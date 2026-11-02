@@ -548,10 +548,14 @@ def test_recovery_ui_resets_progress_state_and_labels_paid_action() -> None:
     javascript = Path("src/hansard_annotator/web/static/src/app.js").read_text(
         encoding="utf-8"
     )
-    assert "Retry {{ campaign.invalid_count }} invalid record" in detail
-    assert "paid provider action" in detail
+    assert "Retry {{ campaign.retryable_failure_count }} eligible records" in detail
+    assert "Current unresolved:" in detail
+    assert "paid Gemini Batch" in detail
     assert "RETRY INVALID RECORDS" in detail
-    assert "remove_primary_from_secondary_v1" in detail
+    recovery = Path("src/hansard_annotator/web/campaigns/recovery.py").read_text(
+        encoding="utf-8"
+    )
+    assert "remove_primary_from_secondary_v1" in recovery
     assert "Apply deterministic structural repair" in detail
     assert "/repair-structural" in detail
     assert 'window.addEventListener("pageshow", resetProgressForms)' in javascript

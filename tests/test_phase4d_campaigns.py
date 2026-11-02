@@ -1095,6 +1095,8 @@ def test_import_links_existing_phase4c_run_and_repeated_import_is_idempotent(
     class ImportConnection(_Connection):
         def execute(self, query: str, _parameters: object = None) -> _Result:
             self.queries.append(query)
+            if "FROM ai_annotation_campaign_recoveries" in query:
+                return _Result(None)
             if "FROM model_prediction_runs" in query:
                 return _Result({"id": 99})
             if query.lstrip().startswith("UPDATE"):
@@ -1118,13 +1120,13 @@ def test_import_links_existing_phase4c_run_and_repeated_import_is_idempotent(
     monkeypatch.setattr(
         "hansard_annotator.web.campaigns.service.import_predictions", fake_import
     )
-    result = import_campaign(_settings(), _principal(), "campaign")
+    result = import_campaign(_settings(), _principal(), "campaign", "IMPORT VALID RECORDS")
     assert result["status"] == "IMPORTED"
     assert result["model_prediction_run_id"] == 99
     assert imports == [tmp_path / "artifact"]
 
     connection.campaign = result
-    second = import_campaign(_settings(), _principal(), "campaign")
+    second = import_campaign(_settings(), _principal(), "campaign", "IMPORT VALID RECORDS")
     assert second["status"] == "IMPORTED"
     assert imports == [tmp_path / "artifact"]
 

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import csv
 import hashlib
 import inspect
+import io
 import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -26,7 +28,12 @@ from hansard_annotator.llm_eval.hostility_validation import (
 from hansard_annotator.llm_eval.hostility_validation import (
     PROMPT_VERSION as HOSTILITY_PROMPT_VERSION,
 )
-from hansard_annotator.llm_eval.import_predictions import _prediction_insert_values
+from hansard_annotator.llm_eval.import_predictions import (
+    _prediction_artifact_summary,
+    _prediction_insert_values,
+    iter_prediction_artifact,
+    iter_terminal_invalid_artifact,
+)
 from hansard_annotator.llm_eval.operations import (
     APPROVED_PRODUCTION_GENERATION,
     APPROVED_PRODUCTION_MODEL,
@@ -57,6 +64,7 @@ from hansard_annotator.web.campaigns.phase4e import (
 from hansard_annotator.web.campaigns.routes import (
     campaign_create,
     campaign_evidence_repair_preview,
+    campaign_unresolved_export,
 )
 from hansard_annotator.web.campaigns.service import (
     HOSTILITY_POLICY_ELIGIBILITY_RULE,
@@ -68,6 +76,8 @@ from hansard_annotator.web.campaigns.service import (
     _complete_recovery_plan_pricing,
     _evidence_repair_plan,
     _provider_plan,
+    _recovery_eligibility_summary,
+    _recovery_record_eligible,
     _recovery_retry_eligible,
     _selection_query,
     approved_campaign_configurations,
@@ -82,6 +92,7 @@ from hansard_annotator.web.campaigns.service import (
     repair_campaign_results,
     require_current_ai_selection,
     submit_campaign,
+    submit_recovery,
     validate_campaign,
     validate_evidence_repair_plan,
 )
@@ -117,6 +128,61 @@ def test_gemini_hostility_recovery_retries_operational_failures_but_not_evidence
         is_luna=False,
         preserve_evidence_failures=True,
     )
+
+
+def test_recovery_eligibility_uses_latest_effective_rows_for_preview_and_execution() -> None:
+    rows = [
+        {"record_id": "turn:repaired", "status": "success", "recovery_mode": "evidence_only"},
+        {"record_id": "turn:provider", "status": "provider_failure"},
+        {
+            "record_id": "turn:evidence",
+            "status": "invalid",
+            "failure_category": "EVIDENCE_RESOLUTION_FAILURE",
+            "model_supplied_evidence": [{"text": "lying"}],
+            "frozen_classification": {
+                "hostility_present": "YES",
+                "target": "OPPOSING_PARTISAN_TARGET",
+            },
+        },
+        {"record_id": "turn:exhausted", "status": "missing"},
+    ]
+    attempts = {"turn:provider": 1, "turn:evidence": 1, "turn:exhausted": 3}
+
+    summary = _recovery_eligibility_summary(
+        rows,
+        attempts,
+        is_luna=False,
+        preserve_evidence_failures=True,
+        full_retry_attempt_available=True,
+    )
+
+    assert summary["current_unresolved_count"] == 3
+    assert summary["already_repaired_count"] == 1
+    assert summary["full_retry_record_ids"] == ["turn:provider"]
+    assert summary["evidence_repair_record_ids"] == ["turn:evidence"]
+    assert summary["terminal_record_ids"] == ["turn:exhausted"]
+    assert summary["remaining_attempt_capacity"] == 4
+    for row in rows:
+        record_id = str(row["record_id"])
+        execution_selected = _recovery_record_eligible(
+            row,
+            recovery_mode="classification_retry",
+            record_attempts=attempts.get(record_id, 0),
+            is_luna=False,
+            preserve_evidence_failures=True,
+            full_retry_attempt_available=True,
+        ) or _recovery_record_eligible(
+            row,
+            recovery_mode="evidence_only",
+            record_attempts=attempts.get(record_id, 0),
+            is_luna=False,
+            preserve_evidence_failures=True,
+            full_retry_attempt_available=True,
+        )
+        assert execution_selected == (
+            record_id in summary["full_retry_record_ids"]
+            or record_id in summary["evidence_repair_record_ids"]
+        )
     assert _recovery_retry_eligible(
         {"status": "missing"},
         is_luna=False,
@@ -255,6 +321,43 @@ def test_recovery_collection_of_collected_attempt_is_idempotent(
     assert query_count == 2
 
 
+def test_unresolved_export_includes_canonical_text_and_prior_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hansard_annotator.web.campaigns import routes
+
+    monkeypatch.setattr(
+        routes,
+        "campaign_unresolved_records",
+        lambda *_args: [
+            {
+                "record_id": "turn:key-1",
+                "turn_key": "key-1",
+                "speech_date": "2025-01-02",
+                "speaker_name_raw": "Sample Speaker",
+                "canonical_text": "Exact canonical speech.",
+                "failure_category": "EVIDENCE_RESOLUTION_FAILED",
+                "reason": "ambiguous canonical evidence",
+                "attempt_count": 2,
+                "terminal": True,
+                "attempt_history": [{"attempt_number": 1, "status": "invalid"}],
+            }
+        ],
+    )
+
+    response = campaign_unresolved_export(
+        "campaign-public-id", _settings(), _principal(admin=True)
+    )
+
+    rendered = response.body.decode("utf-8")
+    assert response.media_type == "text/csv; charset=utf-8"
+    assert "turn:key-1" in rendered
+    assert "Exact canonical speech." in rendered
+    assert "ambiguous canonical evidence" in rendered
+    row = next(csv.DictReader(io.StringIO(rendered)))
+    assert json.loads(row["attempt_history_json"])[0]["attempt_number"] == 1
+
+
 def test_evidence_repair_preview_is_read_only_and_admin_gated(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -283,6 +386,193 @@ def test_evidence_repair_preview_is_read_only_and_admin_gated(
         "campaign_public_id": "campaign-test",
         "evidence_repair_preview": preview,
     }
+
+
+@pytest.mark.parametrize(("valid_count", "unresolved_count"), [(997, 3), (0, 3), (3, 0)])
+def test_partial_hostility_import_artifact_separates_valid_from_unresolved(
+    tmp_path: Path, valid_count: int, unresolved_count: int
+) -> None:
+    configuration = approved_configuration(GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID)
+    directory = tmp_path / f"artifact-{valid_count}-{unresolved_count}"
+    directory.mkdir()
+    planned = valid_count + unresolved_count
+    provenance = {
+        "provider": configuration.provider,
+        "model": configuration.configured_model,
+        "prompt_version": configuration.prompt_version,
+        "assembled_prompt_sha256": configuration.prompt_sha256,
+        "canonical_schema_sha256": configuration.canonical_schema_sha256,
+        "execution_mode": configuration.execution_mode,
+        **configuration.generation_config,
+    }
+    coverage = {
+        "planned_requests": planned,
+        "collected_responses": planned,
+        "valid_structured_predictions": valid_count,
+        "invalid_structured_predictions": unresolved_count,
+        "failed_provider_responses": 0,
+        "missing_responses": 0,
+        "provider_refused": 0,
+        "duplicate_mappings": 0,
+        "accounting_invariant_ok": unresolved_count == 0,
+    }
+    (directory / "operational_summary.json").write_text(
+        json.dumps({"provenance": provenance, "coverage": coverage}), encoding="utf-8"
+    )
+    rows = [
+        {
+            "record_id": f"turn:valid-{index}",
+            "status": "success",
+            "prediction": {"hostility_present": "NO", "target": "N/A", "evidence_spans": []},
+        }
+        for index in range(valid_count)
+    ]
+    rows.extend(
+        {
+            "record_id": f"turn:unresolved-{index}",
+            "status": "invalid",
+            "prediction": None,
+            "failure_category": "EVIDENCE_RESOLUTION_FAILURE",
+            "validation_error": "hostility evidence must resolve uniquely to canonical text",
+            "provider_response": {"candidates": [{"content": {"parts": [{"text": "raw"}]}}]},
+            "attempt_count": 1,
+        }
+        for index in range(unresolved_count)
+    )
+    (directory / "predictions.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+
+    summary = _prediction_artifact_summary(
+        directory,
+        {
+            "provider": configuration.provider,
+            "model": configuration.configured_model,
+            "prompt_version": configuration.prompt_version,
+            "assembled_prompt_sha256": configuration.prompt_sha256,
+            "canonical_schema_sha256": configuration.canonical_schema_sha256,
+            "execution_mode": configuration.execution_mode,
+        },
+        prediction_task="hostility",
+    )
+    predictions = list(iter_prediction_artifact(directory, prediction_task="hostility"))
+    terminal = list(iter_terminal_invalid_artifact(directory, prediction_task="hostility"))
+
+    assert len(predictions) == valid_count
+    assert len(terminal) == unresolved_count
+    assert all(row["prediction"] is None for row in terminal)
+    assert all(row["provider_response"] == rows[valid_count]["provider_response"] for row in terminal) if terminal else True
+    assert summary["coverage"]["valid_structured_predictions"] == valid_count
+
+
+@pytest.mark.parametrize("valid_count", [997, 0])
+def test_partial_campaign_import_resumes_idempotently_and_blocks_later_recovery(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, valid_count: int
+) -> None:
+    configuration = approved_configuration(GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID)
+    campaign: dict[str, Any] = {
+        **configuration.persistence_values(),
+        "id": 72,
+        "public_id": "campaign-partial-import",
+        "name": "Partial import test",
+        "status": "VALIDATED",
+        "model_prediction_run_id": None,
+        "record_set_sha256": "a" * 64,
+        "planned_count": 1000,
+        "valid_count": valid_count,
+        "terminal_invalid_count": 3,
+        "provider_job_id": "batches/hostility-test",
+        "artifact_reference": str(tmp_path / "artifact"),
+    }
+    (tmp_path / "artifact").mkdir()
+
+    class _Result:
+        def __init__(self, value: Any = None, values: list[Any] | None = None) -> None:
+            self.value = value
+            self.values = values or []
+
+        def fetchone(self) -> Any:
+            return self.value
+
+        def fetchall(self) -> list[Any]:
+            return self.values
+
+    class _Connection:
+        def __init__(self) -> None:
+            self.row = campaign
+            self.updates = 0
+            self.locked = False
+
+        def __enter__(self) -> _Connection:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def execute(self, query: str, params: object = None) -> _Result:
+            if "FROM ai_annotation_campaigns WHERE" in query:
+                self.locked = "FOR UPDATE" in query
+                return _Result(self.row)
+            if "FROM ai_annotation_campaign_recoveries" in query:
+                return _Result(None, [])
+            if "FROM model_prediction_runs" in query:
+                return _Result({"id": 991})
+            if query.lstrip().startswith("UPDATE ai_annotation_campaigns"):
+                self.updates += 1
+                if self.updates == 1:
+                    return _Result(None)  # Importer committed; campaign link was interrupted.
+                assert isinstance(params, tuple)
+                self.row = {
+                    **self.row,
+                    "status": params[0],
+                    "model_prediction_run_id": params[1],
+                }
+                return _Result(self.row)
+            return _Result(self.row, [])
+
+    connection = _Connection()
+    monkeypatch.setattr(
+        "hansard_annotator.web.campaigns.service.psycopg.connect",
+        lambda *_args, **_kwargs: connection,
+    )
+    monkeypatch.setattr(
+        "hansard_annotator.web.campaigns.service._current_effective_artifact_directory",
+        lambda *_args: tmp_path / "artifact",
+    )
+    imports: list[Path] = []
+
+    def _idempotent_import(path: Path, *_args: Any, **_kwargs: Any) -> dict[str, str]:
+        imports.append(path)
+        return {"artifact_sha256": "b" * 64}
+
+    monkeypatch.setattr(
+        "hansard_annotator.web.campaigns.service.import_predictions", _idempotent_import
+    )
+    with pytest.raises(CampaignError, match="already linked"):
+        import_campaign(_settings(), _principal(), str(campaign["public_id"]), "IMPORT VALID RECORDS")
+    partial = import_campaign(
+        _settings(), _principal(), str(campaign["public_id"]), "IMPORT VALID RECORDS"
+    )
+    again = import_campaign(
+        _settings(), _principal(), str(campaign["public_id"]), "IMPORT VALID RECORDS"
+    )
+
+    assert connection.locked is True
+    assert partial["status"] == "PARTIALLY_IMPORTED"
+    assert partial["valid_count"] == valid_count
+    assert partial["model_prediction_run_id"] == 991
+    assert again == partial
+    assert imports == [tmp_path / "artifact", tmp_path / "artifact"]
+
+    class _Provider:
+        def submit(self, *_args: Any) -> str:
+            raise AssertionError("recovery must not run after partial import")
+
+    with pytest.raises(CampaignError, match="not eligible for targeted recovery"):
+        submit_recovery(
+            _settings(), _principal(), str(campaign["public_id"]), "RETRY INVALID RECORDS",
+            gateway=_Provider(),
+        )
 
 
 @pytest.mark.parametrize(
@@ -1390,14 +1680,16 @@ def test_hostility_collection_validation_and_import_use_hostility_adapter(
                     "invalid_count": params[1],
                 }
                 return _Res(self.row)
+            if "FROM ai_annotation_campaign_recoveries" in query:
+                return _Res(None)
             if "FROM model_prediction_runs" in query:
                 return _Res({"id": 777})
-            if "SET status='IMPORTED'" in query:
+            if "SET status=%s" in query and "model_prediction_run_id" in query:
                 assert isinstance(params, tuple)
                 self.row = {
                     **self.row,
-                    "status": "IMPORTED",
-                    "model_prediction_run_id": params[0],
+                    "status": params[0],
+                    "model_prediction_run_id": params[1],
                 }
                 return _Res(self.row)
             return _Res(self.row)
@@ -1475,7 +1767,9 @@ def test_hostility_collection_validation_and_import_use_hostility_adapter(
     monkeypatch.setattr(
         "hansard_annotator.web.campaigns.service.import_predictions", _fake_import
     )
-    imported = import_campaign(_settings(), _principal(), str(campaign["public_id"]))
+    imported = import_campaign(
+        _settings(), _principal(), str(campaign["public_id"]), "IMPORT VALID RECORDS"
+    )
     assert imported["status"] == "IMPORTED"
     assert imported["model_prediction_run_id"] == 777
     assert len(imported_calls) == 1
@@ -1725,6 +2019,10 @@ def test_hostility_gemini_recovery_ui_keeps_evidence_failures_terminal() -> None
         "recoveries": [],
         "batch_progress": {},
         "retryable_failure_count": 2,
+        "recovery_eligibility": {
+            "current_unresolved_count": 2,
+            "remaining_attempt_capacity": 6,
+        },
         "invalid_count": 3,
         "structural_repair_available_count": 0,
         "provider_refusal_available_count": 0,
@@ -1779,8 +2077,43 @@ def test_hostility_gemini_recovery_ui_keeps_evidence_failures_terminal() -> None
         phase4e_defaults={"enqueued_token_ceiling": 1, "safety_factor": 1, "max_chunk_records": 1},
         notice_message=None,
     )
-    assert "Retry 2 records — paid Gemini provider action" in html
-    assert "Evidence-resolution failures remain terminal" in html
-    assert "Hostility evidence-only repair preview" in html
+    assert "Retry 2 eligible records" in html
+    assert "Current unresolved: 2" in html
+    assert "Recovery options" in html
     assert "REPAIR HOSTILITY EVIDENCE ONLY" in html
     assert "Only evidence spans will be requested" in html
+
+    partial_html = template.render(
+        campaign={
+            **campaign,
+            "status": "PARTIALLY_IMPORTED",
+            "run_public_id": "partial-run",
+            "campaign_coverage": {
+                "planned": 1000,
+                "collected": 1000,
+                "valid": 997,
+                "imported": 997,
+                "unresolved": 3,
+                "manually_completed": 0,
+                "excluded": 0,
+                "coverage_percent": 100.0,
+            },
+            "unresolved_records_preview": [
+                {
+                    "record_id": "turn:unresolved-1",
+                    "failure_category": "EVIDENCE_RESOLUTION_FAILED",
+                    "reason": "ambiguous evidence",
+                    "attempt_count": 1,
+                    "terminal": True,
+                }
+            ],
+        },
+        principal=_principal(),
+        credentials={"gemini": {"configured": False, "environment_variables": ("GEMINI_API_KEY",)}},
+        phase4e_defaults={},
+        notice_message=None,
+    )
+    assert "PARTIALLY IMPORTED" in partial_html
+    assert "997 / 997" in partial_html
+    assert "3 records remain unresolved" in partial_html
+    assert "/ai-review/partial-run?hostility_failure=invalid" in partial_html
