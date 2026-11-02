@@ -30,6 +30,8 @@ from hansard_annotator.web.annotations.ai_review import (
     _domain_display,
     ai_review_run,
     ai_review_runs,
+    prepare_terminal_human_payload,
+    record_outcome_review,
 )
 from hansard_annotator.web.tasks.routes import (
     _accepted_ai_payload,
@@ -571,9 +573,49 @@ def test_ai_review_and_queue_render_without_inline_styles() -> None:
     )
     terminal_invalid = templates.get_template("annotations/ai_workspace.html").render(
         **context,
-        prediction=base_prediction,
+        prediction={
+            **base_prediction,
+            "failure_category": "EVIDENCE_RESOLUTION_FAILED",
+            "resolution_reason": "EVIDENCE_RESOLUTION_FAILED",
+            "validation_message": "evidence did not match canonical speech",
+            "turn_key": "turn-key",
+            "frozen_classification": {
+                "hostility_present": "YES",
+                "target": "OPPOSING_PARTISAN_TARGET",
+            },
+            "model_supplied_evidence": [{"text": "original unparsable span"}],
+            "recovery_attempt_history": [
+                {"attempt_number": 4, "replacement_validation_result": "invalid"}
+            ],
+        },
         ai_unavailable=True,
         effective_review=None,
+        resolution_method=None,
+    )
+    resolved_context = {
+        **context,
+        "human_annotation": {
+            "values": {"hostility_present": "NO", "target": None},
+            "revision_number": 1,
+            "display_name": "Human Reviewer",
+            "changed_fields": [],
+        },
+    }
+    resolved_terminal = templates.get_template("annotations/ai_workspace.html").render(
+        **resolved_context,
+        prediction={
+            **base_prediction,
+            "failure_category": "INVALID_STRUCTURED_OUTPUT",
+            "resolution_reason": "INVALID_STRUCTURED_OUTPUT",
+            "ai_unavailable": True,
+        },
+        ai_unavailable=True,
+        effective_review={
+            "review_status": "human_annotated_after_ai_failure",
+            "resolution_method": "INDEPENDENT_HUMAN_CLASSIFICATION",
+            "reviewer_name": "Human Reviewer",
+            "reviewed_at": "2026-11-02T12:00:00Z",
+        },
     )
     policy_prediction = {
         **base_prediction,
@@ -612,7 +654,7 @@ def test_ai_review_and_queue_render_without_inline_styles() -> None:
         principal=principal,
         runs=[selected_run],
     )
-    for rendered in (valid_hostility, terminal_invalid, policy, queue, selector):
+    for rendered in (valid_hostility, terminal_invalid, resolved_terminal, policy, queue, selector):
         assert "style=" not in rendered
         assert "<style" not in rendered
     assert "Hostility: NO" in valid_hostility
@@ -629,11 +671,121 @@ def test_ai_review_and_queue_render_without_inline_styles() -> None:
     assert "Annotate from scratch" in terminal_invalid
     assert 'action="/ai-reviews/prediction-id/edit"' in terminal_invalid
     assert 'name="hostility_present"' in terminal_invalid
-    assert "Save edited annotation &amp; next" in terminal_invalid
+    assert "Save human resolution &amp; next" in terminal_invalid
+    assert "Explicit resolution decision" in terminal_invalid
+    assert "Make an independent human classification" in terminal_invalid
+    assert "Confirm the frozen AI hostility label and target" in terminal_invalid
+    assert "original unparsable span" in terminal_invalid
+    assert "evidence did not match canonical speech" in terminal_invalid
+    assert "Attempt 4" in terminal_invalid
+    assert "Human resolution recorded" in resolved_terminal
+    assert "Human Reviewer" in resolved_terminal
+    assert "name=\"resolution_method\"" not in resolved_terminal
     assert "AU04 — Education" in policy
     assert '<progress class="progress"' in queue
     assert "Continue review" in selector
     assert "/ai-review/run-id" in selector
+
+
+def test_terminal_resolution_requires_explicit_method_and_preserves_human_choice() -> None:
+    frozen = {
+        "hostility_present": "YES",
+        "target": "OPPOSING_PARTISAN_TARGET",
+    }
+    evidence_workspace = {
+        "prediction": {
+            "ai_unavailable": True,
+            "resolution_reason": "EVIDENCE_RESOLUTION_FAILED",
+            "frozen_classification": frozen,
+        }
+    }
+    corrected_evidence = [{"start_offset": 0, "end_offset": 8, "text": "condemn!"}]
+    confirmed = prepare_terminal_human_payload(
+        evidence_workspace,
+        {"hostility_present": "NO", "target": None, "evidence_span": corrected_evidence},
+        "CONFIRMED_FROZEN_CLASSIFICATION",
+    )
+    assert confirmed == {
+        "hostility_present": "YES",
+        "target": "OPPOSING_PARTISAN_TARGET",
+        "evidence_span": corrected_evidence,
+    }
+    independently_revised = {
+        "hostility_present": "NO",
+        "target": None,
+        "evidence_span": [],
+    }
+    assert prepare_terminal_human_payload(
+        evidence_workspace,
+        independently_revised,
+        "INDEPENDENT_HUMAN_CLASSIFICATION",
+    ) is independently_revised
+    truncated_workspace = {
+        "prediction": {
+            "ai_unavailable": True,
+            "resolution_reason": "INVALID_STRUCTURED_OUTPUT",
+            "frozen_classification": None,
+        }
+    }
+    with pytest.raises(ValueError, match="only be resolved by an independent"):
+        prepare_terminal_human_payload(
+            truncated_workspace,
+            independently_revised,
+            "CONFIRMED_FROZEN_CLASSIFICATION",
+        )
+    with pytest.raises(ValueError):
+        prepare_terminal_human_payload(evidence_workspace, independently_revised, "")
+
+
+def test_terminal_outcome_review_method_is_audited_and_duplicate_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hansard_annotator.web.annotations import ai_review
+
+    class _Result:
+        def __init__(self, row: dict[str, object] | None) -> None:
+            self.row = row
+
+        def fetchone(self) -> dict[str, object] | None:
+            return self.row
+
+    class _Connection:
+        def __enter__(self) -> _Connection:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def execute(self, query: str, _params: object = None) -> _Result:
+            if "FROM model_prediction_abstentions" in query:
+                assert "FOR UPDATE" in query
+                return _Result({"id": 3, "speaker_turn_id": 9})
+            return _Result({
+                "id": 12,
+                "review_status": "human_annotated_after_ai_failure",
+                "annotation_version_id": 44,
+                "resolution_method": "INDEPENDENT_HUMAN_CLASSIFICATION",
+            })
+
+    monkeypatch.setattr(ai_review.psycopg, "connect", lambda *_args, **_kwargs: _Connection())
+    reused = record_outcome_review(
+        SimpleNamespace(database=SimpleNamespace(psycopg_url="postgresql://test")),
+        SimpleNamespace(user_id=4),  # type: ignore[arg-type]
+        "outcome-id",
+        "human_annotated_after_ai_failure",
+        annotation_version_id=44,
+        resolution_method="INDEPENDENT_HUMAN_CLASSIFICATION",
+    )
+    assert reused["reused"] is True
+    with pytest.raises(ValueError, match="already has a completed human resolution"):
+        record_outcome_review(
+            SimpleNamespace(database=SimpleNamespace(psycopg_url="postgresql://test")),
+            SimpleNamespace(user_id=4),  # type: ignore[arg-type]
+            "outcome-id",
+            "human_annotated_after_ai_failure",
+            annotation_version_id=45,
+            resolution_method="INDEPENDENT_HUMAN_CLASSIFICATION",
+        )
 
 
 def test_hostility_ai_suggestion_uses_stored_structured_fields_and_evidence() -> None:
@@ -883,3 +1035,15 @@ def test_individual_review_converts_unauthorized_project_to_http_403(
     with pytest.raises(HTTPException) as raised:
         _review_workspace_or_http(None, None, "prediction-id")  # type: ignore[arg-type]
     assert raised.value.status_code == 403
+
+
+def test_manual_outcome_migration_adds_audited_resolution_method() -> None:
+    migration = (
+        ROOT / "migrations/versions/20261102_19_manual_outcome_resolution.py"
+    ).read_text(encoding="utf-8")
+    assert 'revision = "20261102_19"' in migration
+    assert 'down_revision = "20261102_18"' in migration
+    assert "resolution_method text" in migration
+    assert "CONFIRMED_FROZEN_CLASSIFICATION" in migration
+    assert "INDEPENDENT_HUMAN_CLASSIFICATION" in migration
+    assert "manual resolution methods exist; downgrade refused" in migration

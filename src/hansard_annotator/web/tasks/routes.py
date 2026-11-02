@@ -20,6 +20,7 @@ from hansard_annotator.web.annotations.ai_review import (
     ensure_prediction_assignment,
     next_unreviewed_prediction,
     prediction_review_workspace,
+    prepare_terminal_human_payload,
     record_outcome_review,
     record_prediction_review,
 )
@@ -665,12 +666,34 @@ async def edit_prediction(
     workspace = _review_workspace_or_http(settings, principal, prediction_id)
     fields = cast(list[dict[str, Any]], workspace["fields"])
     payload = await _payload_for_fields(request, fields)
+    resolution_method: str | None = None
+    if workspace.get("ai_unavailable"):
+        effective = cast(dict[str, object] | None, workspace.get("effective_review"))
+        if effective and effective.get("review_status") == "human_annotated_after_ai_failure":
+            raise HTTPException(status_code=409, detail="this terminal outcome already has a human resolution")
+        form = await request.form()
+        resolution_method = str(form.get("resolution_method") or "")
+        try:
+            payload = prepare_terminal_human_payload(
+                workspace, payload, resolution_method
+            )
+        except ValueError as error:
+            workspace["resolution_method"] = resolution_method
+            return _templates(request).TemplateResponse(
+                request,
+                "annotations/ai_workspace.html",
+                {"principal": principal, **workspace,
+                 "errors": {"_form": [str(error)]}},
+                status_code=422,
+            )
     assignment_id = ensure_prediction_assignment(settings, principal, prediction_id)
     event_type = "revised" if workspace["human_annotation"] else "submitted"
     try:
         result = save_annotation(settings, principal, assignment_id, payload, event_type=event_type)
     except AnnotationValidationError as error:
         workspace["values"] = error.outcome.values
+        if resolution_method:
+            workspace["resolution_method"] = resolution_method
         return _templates(request).TemplateResponse(
             request,
             "annotations/ai_workspace.html",
@@ -678,11 +701,15 @@ async def edit_prediction(
             status_code=422,
         )
     if workspace.get("ai_unavailable"):
-        record_outcome_review(
-            settings, principal, prediction_id, "human_annotated_after_ai_failure",
-            assignment_id=assignment_id,
-            annotation_version_id=cast(int, result["annotation_version_id"]),
-        )
+        try:
+            record_outcome_review(
+                settings, principal, prediction_id, "human_annotated_after_ai_failure",
+                assignment_id=assignment_id,
+                annotation_version_id=cast(int, result["annotation_version_id"]),
+                resolution_method=resolution_method,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
     else:
         status = _prediction_decision_status(payload, workspace["suggested_values"])
         record_prediction_review(
@@ -727,6 +754,9 @@ async def skip_prediction(
     await enforce_csrf(request, principal, settings)
     workspace = _review_workspace_or_http(settings, principal, prediction_id)
     if workspace.get("ai_unavailable"):
+        effective = cast(dict[str, object] | None, workspace.get("effective_review"))
+        if effective and effective.get("review_status") == "human_annotated_after_ai_failure":
+            raise HTTPException(status_code=409, detail="this terminal outcome already has a human resolution")
         record_outcome_review(settings, principal, prediction_id, "skipped")
     else:
         record_prediction_review(settings, principal, prediction_id, "skipped")

@@ -228,6 +228,7 @@ def campaign_unresolved_export(
     writer = csv.writer(output, lineterminator="\r\n")
     writer.writerow(
         (
+            "prediction_id",
             "record_id",
             "turn_key",
             "speech_date",
@@ -243,6 +244,7 @@ def campaign_unresolved_export(
     for record in records:
         writer.writerow(
             (
+                record.get("prediction_id"),
                 record.get("record_id"),
                 record.get("turn_key"),
                 record.get("speech_date"),
