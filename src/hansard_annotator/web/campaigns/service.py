@@ -1349,10 +1349,17 @@ def get_campaign(
             "planned": int(result.get("planned_count") or 0),
             "collected": 0,
             "valid": int(result.get("valid_count") or 0),
+            "ai_valid": int(result.get("valid_count") or 0),
             "imported": 0,
+            "imported_ai": 0,
             "unresolved": int(result.get("invalid_count") or 0)
             + int(result.get("terminal_invalid_count") or 0),
+            "unresolved_ai_failures": int(result.get("invalid_count") or 0)
+            + int(result.get("terminal_invalid_count") or 0),
             "manually_completed": 0,
+            "manually_resolved": 0,
+            "accepted_annotation_count": 0,
+            "remaining_review": int(result.get("planned_count") or 0),
             "excluded": 0,
             "coverage_percent": 0.0,
         }
@@ -1367,7 +1374,16 @@ def get_campaign(
                        AS excluded,
                      count(*) FILTER (WHERE outcome.resolution_type='INVALID_OUTPUT'
                        AND latest.review_status='human_annotated_after_ai_failure')
-                       AS manually_completed
+                       AS manually_completed,
+                     (SELECT count(*) FROM model_predictions prediction
+                      JOIN LATERAL (
+                        SELECT review_status FROM model_prediction_reviews review
+                        WHERE review.model_prediction_id=prediction.id
+                        ORDER BY review.reviewed_at DESC,review.id DESC LIMIT 1
+                      ) accepted_review ON true
+                      WHERE prediction.run_id=%s
+                        AND accepted_review.review_status IN ('accepted','edited'))
+                       AS accepted_predictions
                    FROM model_prediction_abstentions outcome
                    LEFT JOIN LATERAL (
                      SELECT review_status FROM model_prediction_outcome_reviews review
@@ -1375,22 +1391,41 @@ def get_campaign(
                      ORDER BY review.reviewed_at DESC,review.id DESC LIMIT 1
                    ) latest ON true
                    WHERE outcome.run_id=%s""",
-                (result["model_prediction_run_id"], result["model_prediction_run_id"]),
+                (result["model_prediction_run_id"], result["model_prediction_run_id"],
+                 result["model_prediction_run_id"]),
             ).fetchone()
             counts = dict(imported_counts or {})
             imported_count = int(counts.get("imported") or 0)
             invalid_outcomes = int(counts.get("invalid_outcomes") or 0)
             excluded_count = int(counts.get("excluded") or 0)
             manually_completed = int(counts.get("manually_completed") or 0)
+            accepted_predictions = int(counts.get("accepted_predictions") or 0)
             unresolved = max(0, invalid_outcomes - manually_completed)
             collected_count = imported_count + invalid_outcomes + excluded_count
+            reconciliation = campaign_review_reconciliation(
+                planned=int(result.get("planned_count") or 0),
+                ai_valid=int(result.get("valid_count") or 0),
+                imported_ai=imported_count,
+                unresolved_ai_failures=unresolved,
+                manually_resolved=manually_completed,
+                human_accepted_ai=accepted_predictions,
+                excluded=excluded_count,
+            )
             result["campaign_coverage"] = {
                 "planned": int(result.get("planned_count") or 0),
                 "collected": collected_count,
                 "valid": imported_count,
+                "ai_valid": int(result.get("valid_count") or 0),
                 "imported": imported_count,
+                "imported_ai": imported_count,
                 "unresolved": unresolved,
+                "unresolved_ai_failures": unresolved,
                 "manually_completed": manually_completed,
+                "manually_resolved": manually_completed,
+                "accepted_annotation_count": reconciliation[
+                    "accepted_annotation_count"
+                ],
+                "remaining_review": reconciliation["remaining_review"],
                 "excluded": excluded_count,
                 "coverage_percent": round(
                     collected_count * 100 / int(result["planned_count"]), 1
@@ -1402,7 +1437,8 @@ def get_campaign(
                 result["unresolved_records_preview"] = [
                     dict(value)
                     for value in connection.execute(
-                        """SELECT outcome.record_id,turn.turn_key,turn.speech_date,
+                        """SELECT outcome.public_id::text AS prediction_id,
+                                  outcome.record_id,turn.turn_key,turn.speech_date,
                                   turn.speaker_name_raw,
                                   outcome.resolution_reason AS failure_category,
                                   outcome.outcome_provenance->>'validation_error' AS validation_error,
@@ -1677,7 +1713,8 @@ def campaign_unresolved_records(
         campaign = dict(row)
         if campaign.get("model_prediction_run_id") is not None:
             values = connection.execute(
-                """SELECT outcome.record_id,turn.turn_key,turn.speech_date,
+                """SELECT outcome.public_id::text AS prediction_id,
+                          outcome.record_id,turn.turn_key,turn.speech_date,
                           turn.speaker_name_raw,
                           COALESCE(NULLIF(turn.text_clean,''),turn.text_raw) AS canonical_text,
                           outcome.resolution_reason AS failure_category,
@@ -3061,6 +3098,30 @@ def _recovery_eligibility_summary(
         "evidence_repair_record_ids": evidence_repair_ids,
         "terminal_record_ids": terminal_ids,
         "unresolved_rows": unresolved,
+    }
+
+
+def campaign_review_reconciliation(
+    *,
+    planned: int,
+    ai_valid: int,
+    imported_ai: int,
+    unresolved_ai_failures: int,
+    manually_resolved: int,
+    human_accepted_ai: int,
+    excluded: int,
+) -> dict[str, int]:
+    """Separate imported model output from accepted human annotations."""
+    accepted = manually_resolved + human_accepted_ai
+    return {
+        "planned": planned,
+        "ai_valid": ai_valid,
+        "imported_ai": imported_ai,
+        "unresolved_ai_failures": unresolved_ai_failures,
+        "manually_resolved": manually_resolved,
+        "accepted_annotation_count": accepted,
+        "remaining_review": max(0, planned - accepted - excluded),
+        "excluded": excluded,
     }
 
 

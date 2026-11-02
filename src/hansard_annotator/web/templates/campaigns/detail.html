@@ -9,7 +9,7 @@
 </div>
 {% if notice_message %}<div class="alert alert-success mt-5" role="status">{{ notice_message }}</div>{% endif %}
 
-<section class="surface mt-7 p-6">
+<section id="campaign-results" class="surface mt-7 p-6">
   <div class="flex flex-wrap items-start justify-between gap-4"><div><p class="eyebrow">Configuration</p><h2 class="mt-1 text-2xl font-semibold">{{ campaign.configuration_display_label }}</h2></div><span class="badge badge-active">{{ campaign.configuration_class|replace('_',' ') }}</span></div>
   <dl class="metadata mt-5">
     <div><dt>Task</dt><dd>{{ campaign.prediction_task }}</dd></div>
@@ -144,9 +144,11 @@
   <div class="stats-grid mt-4">
     <article class="stat"><span>Planned</span><strong>{{ coverage.get('planned', campaign.planned_count) }}</strong></article>
     <article class="stat"><span>Collected</span><strong>{{ coverage.get('collected', 0) }}</strong></article>
-    <article class="stat"><span>Valid / imported</span><strong>{{ coverage.get('valid', campaign.valid_count) }} / {{ coverage.get('imported', 0) }}</strong></article>
-    <article class="stat"><span>Unresolved</span><strong>{{ coverage.get('unresolved', campaign.invalid_count) }}</strong></article>
-    <article class="stat"><span>Manually completed</span><strong>{{ coverage.get('manually_completed', 0) }}</strong></article>
+    <article class="stat"><span>Valid AI / imported AI</span><strong>{{ coverage.get('ai_valid', campaign.valid_count) }} / {{ coverage.get('imported_ai', 0) }}</strong></article>
+    <article class="stat"><span>Unresolved AI failures</span><strong>{{ coverage.get('unresolved_ai_failures', coverage.get('unresolved', campaign.invalid_count)) }}</strong></article>
+    <article class="stat"><span>Manually resolved</span><strong>{{ coverage.get('manually_resolved', coverage.get('manually_completed', 0)) }}</strong></article>
+    <article class="stat"><span>Accepted annotations</span><strong>{{ coverage.get('accepted_annotation_count', 0) }}</strong></article>
+    <article class="stat"><span>Remaining human review</span><strong>{{ coverage.get('remaining_review', coverage.get('planned', campaign.planned_count)) }}</strong></article>
     <article class="stat"><span>Excluded</span><strong>{{ coverage.get('excluded', 0) }}</strong></article>
     <article class="stat"><span>Collected coverage</span><strong>{{ coverage.get('coverage_percent', 0) }}%</strong></article>
   </div>
@@ -168,13 +170,13 @@
     <p class="mt-4 text-sm text-muted">Campaign import is complete. Provider-refused records are counted as excluded outcomes.</p>
   {% endif %}
 
-  <details class="provenance mt-5">
+  <details id="unresolved-records" class="provenance mt-5">
     <summary>Unresolved records</summary>
     <p class="mt-3 text-sm text-muted">Current unresolved records only. Historical failures remain in the campaign audit trail.</p>
     {% if campaign.unresolved_records_preview %}
       <p class="mt-2"><a class="btn btn-secondary" href="/ai-annotation/{{ campaign.public_id }}/unresolved.csv">Export unresolved records for manual review</a></p>
-      <div class="mt-3 overflow-x-auto"><table><thead><tr><th>Record ID</th><th>Failure category</th><th>Reason</th><th>Attempts</th><th>Terminal</th></tr></thead><tbody>
-      {% for record in campaign.unresolved_records_preview %}<tr><td><code>{{ record.record_id }}</code></td><td>{{ record.failure_category or 'unresolved' }}</td><td>{{ record.reason or record.validation_error or record.provider_error or 'No diagnostic message' }}</td><td>{{ record.attempt_count or 1 }}</td><td>{{ 'Yes' if record.terminal else 'No' }}</td></tr>{% endfor %}
+      <div class="mt-3 overflow-x-auto"><table><thead><tr><th>Record ID</th><th>Failure category</th><th>Reason</th><th>Attempts</th><th>Terminal</th><th>Action</th></tr></thead><tbody>
+      {% for record in campaign.unresolved_records_preview %}<tr><td><code>{{ record.record_id }}</code></td><td>{{ record.failure_category or 'unresolved' }}</td><td>{{ record.reason or record.validation_error or record.provider_error or 'No diagnostic message' }}</td><td>{{ record.attempt_count or 1 }}</td><td>{{ 'Yes' if record.terminal else 'No' }}</td><td>{% if campaign.run_public_id and record.prediction_id %}<a class="btn btn-secondary" href="/ai-review/{{ campaign.run_public_id }}/{{ record.prediction_id }}">Open manual review</a>{% else %}Available after valid results are imported{% endif %}</td></tr>{% endfor %}
       </tbody></table></div>
     {% else %}<p class="mt-3 text-sm text-muted">No current unresolved records.</p>{% endif %}
   </details>
@@ -183,9 +185,11 @@
     <summary>Recovery options</summary>
     {% if campaign.status == 'COLLECTED' and campaign.configuration_id == 'hostility-gemini-25-flash-production' %}
       <p class="mt-3 text-sm text-muted">Current unresolved: {{ campaign.recovery_eligibility.current_unresolved_count if campaign.recovery_eligibility else 0 }} ? full retry eligible: {{ campaign.retryable_failure_count }} ? evidence repair eligible: {{ campaign.evidence_repair_preview.eligible_count }} ? remaining per-record attempt capacity: {{ campaign.recovery_eligibility.remaining_attempt_capacity if campaign.recovery_eligibility else 0 }}.</p>
+      {% if campaign.retryable_failure_count == 0 and campaign.evidence_repair_preview.eligible_count == 0 and campaign.recovery_eligibility.current_unresolved_count > 0 %}<p class="alert alert-warning mt-3">No unresolved records are eligible for automatic recovery. They have reached their per-record attempt limit or do not meet the recovery rules. Recovery limits are unchanged. Review terminal failures manually after importing valid results.</p><a class="btn btn-secondary mt-2" href="#unresolved-records">Go to unresolved records</a>{% endif %}
       {% if campaign.retryable_failure_count > 0 and not campaign.active_recovery %}<form method="post" action="/ai-annotation/{{ campaign.public_id }}/retry-invalid" class="mt-3 grid gap-2" data-progress-form>{{ csrf(principal) }}<p class="text-sm text-muted">This submits a paid Gemini Batch for currently eligible records only.</p><label for="recovery-confirmation">Type <strong>RETRY INVALID RECORDS</strong></label><input id="recovery-confirmation" name="confirmation" autocomplete="off" required><button class="btn btn-secondary" data-progress-text="Submitting recovery...">Retry {{ campaign.retryable_failure_count }} eligible records</button></form>{% endif %}
       {% set evidence = campaign.evidence_repair_preview %}
       {% if evidence.eligible_count > 0 and not campaign.active_recovery %}<form method="post" action="/ai-annotation/{{ campaign.public_id }}/repair-evidence" class="mt-3 grid gap-2" data-progress-form>{{ csrf(principal) }}<p class="text-sm text-muted">Only evidence spans will be requested; frozen hostility classifications remain unchanged. This is a paid Gemini Batch action.</p><label for="evidence-repair-confirmation">Type <strong>REPAIR HOSTILITY EVIDENCE ONLY</strong></label><input id="evidence-repair-confirmation" name="confirmation" autocomplete="off" required><button class="btn btn-secondary" data-progress-text="Submitting evidence repair...">Repair {{ evidence.eligible_count }} evidence spans</button></form>{% endif %}
+    {% elif campaign.status == 'PARTIALLY_IMPORTED' %}<p class="alert alert-warning mt-3">No automated retries or evidence repairs are available after partial import. Remaining terminal failures require human review; recovery limits are unchanged.</p><a class="btn btn-secondary mt-2" href="#unresolved-records">Open unresolved records</a>
     {% elif campaign.status == 'COLLECTED' and campaign.configuration_id == 'hostility-luna-production-v1' %}<p class="mt-3 text-sm text-muted">Historical Luna campaign: paid recovery is disabled.</p>{% endif %}
     {% if campaign.status == 'COLLECTED' and campaign.structural_repair_available_count > 0 %}<form method="post" action="/ai-annotation/{{ campaign.public_id }}/repair-structural" class="mt-3" data-progress-form>{{ csrf(principal) }}<button class="btn btn-secondary" data-progress-text="Applying repair...">Apply deterministic structural repair (no provider call)</button></form>{% endif %}
     {% if campaign.status == 'COLLECTED' and campaign.provider_refusal_available_count > 0 %}<form method="post" action="/ai-annotation/{{ campaign.public_id }}/resolve-provider-refusals" class="mt-3" data-progress-form>{{ csrf(principal) }}<button class="btn btn-secondary" data-progress-text="Recording exclusions...">Record provider-refused exclusions (no provider call)</button></form>{% endif %}

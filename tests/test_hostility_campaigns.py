@@ -81,6 +81,7 @@ from hansard_annotator.web.campaigns.service import (
     _recovery_retry_eligible,
     _selection_query,
     approved_campaign_configurations,
+    campaign_review_reconciliation,
     collect_campaign,
     collect_recovery,
     create_campaign,
@@ -204,6 +205,26 @@ def test_recovery_eligibility_uses_latest_effective_rows_for_preview_and_executi
     )
 
 
+def test_campaign_reconciliation_separates_ai_failures_from_accepted_annotations() -> None:
+    summary = campaign_review_reconciliation(
+        planned=1000,
+        ai_valid=997,
+        imported_ai=997,
+        unresolved_ai_failures=2,
+        manually_resolved=1,
+        human_accepted_ai=40,
+        excluded=1,
+    )
+    assert summary == {
+        "planned": 1000,
+        "ai_valid": 997,
+        "imported_ai": 997,
+        "unresolved_ai_failures": 2,
+        "manually_resolved": 1,
+        "accepted_annotation_count": 41,
+        "remaining_review": 958,
+        "excluded": 1,
+    }
 def test_evidence_repair_plan_is_evidence_only_and_frozen_provenance() -> None:
     configuration = approved_configuration(GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID)
     campaign = {
@@ -2083,6 +2104,28 @@ def test_hostility_gemini_recovery_ui_keeps_evidence_failures_terminal() -> None
     assert "REPAIR HOSTILITY EVIDENCE ONLY" in html
     assert "Only evidence spans will be requested" in html
 
+    no_retry_html = template.render(
+        campaign={
+            **campaign,
+            "retryable_failure_count": 0,
+            "recovery_eligibility": {
+                "current_unresolved_count": 3,
+                "remaining_attempt_capacity": 2,
+            },
+            "evidence_repair_preview": {
+                **campaign["evidence_repair_preview"],
+                "eligible_count": 0,
+            },
+        },
+        principal=_principal(),
+        credentials={"gemini": {"configured": False, "environment_variables": ("GEMINI_API_KEY",)}},
+        phase4e_defaults={},
+        notice_message=None,
+    )
+    assert "No unresolved records are eligible for automatic recovery" in no_retry_html
+    assert "reached their per-record attempt limit" in no_retry_html
+    assert 'href="#unresolved-records"' in no_retry_html
+
     partial_html = template.render(
         campaign={
             **campaign,
@@ -2093,13 +2136,20 @@ def test_hostility_gemini_recovery_ui_keeps_evidence_failures_terminal() -> None
                 "collected": 1000,
                 "valid": 997,
                 "imported": 997,
+                "ai_valid": 997,
+                "imported_ai": 997,
                 "unresolved": 3,
+                "unresolved_ai_failures": 3,
                 "manually_completed": 0,
+                "manually_resolved": 0,
+                "accepted_annotation_count": 0,
+                "remaining_review": 1000,
                 "excluded": 0,
                 "coverage_percent": 100.0,
             },
             "unresolved_records_preview": [
                 {
+                    "prediction_id": "outcome-public-id",
                     "record_id": "turn:unresolved-1",
                     "failure_category": "EVIDENCE_RESOLUTION_FAILED",
                     "reason": "ambiguous evidence",
@@ -2117,3 +2167,5 @@ def test_hostility_gemini_recovery_ui_keeps_evidence_failures_terminal() -> None
     assert "997 / 997" in partial_html
     assert "3 records remain unresolved" in partial_html
     assert "/ai-review/partial-run?hostility_failure=invalid" in partial_html
+    assert "/ai-review/partial-run/outcome-public-id" in partial_html
+    assert "Open manual review" in partial_html

@@ -16,6 +16,7 @@
       <h2 id="speech-heading" class="mt-2 text-3xl font-semibold">{{ prediction.speaker_name_raw or 'Unknown speaker' }}</h2>
       <p class="mt-2 text-lg">{{ prediction.major_heading_original }}{% if prediction.minor_heading_original %} · {{ prediction.minor_heading_original }}{% endif %}</p>
       {% if prediction.business_type %}<p class="mt-2 text-sm text-muted">{{ prediction.business_type }}</p>{% endif %}
+      {% if ai_unavailable %}<p class="mt-2 text-sm text-muted">Source turn: <code>{{ prediction.turn_key }}</code> · {{ prediction.configured_model }} · {{ prediction.prompt_version }}</p>{% endif %}
     </div>
     <div class="speech-text" data-speech-text>{{ prediction.text_clean }}</div>
   </article>
@@ -26,7 +27,22 @@
       <p class="eyebrow">Terminal model outcome</p>
       <h2 id="ai-heading" class="mt-1 text-2xl font-semibold">AI prediction unavailable</h2>
       <p class="mt-3">{{ prediction.failure_message }}</p>
-      <p class="mt-2 text-sm text-muted">Evidence could not be resolved uniquely to the source speech. Review the speech and annotate from scratch.</p>
+      <dl class="metadata mt-3">
+        <div><dt>Failure category</dt><dd>{{ prediction.failure_category|replace('_',' ')|title }}</dd></div>
+        {% if prediction.validation_message %}<div><dt>Validation message</dt><dd>{{ prediction.validation_message }}</dd></div>{% endif %}
+        <div><dt>Manual review status</dt><dd>{{ effective_review.review_status|replace('_',' ')|title if effective_review else 'Needs human review' }}</dd></div>
+        {% if effective_review and effective_review.reviewed_at %}<div><dt>Last manual review</dt><dd>{{ effective_review.reviewer_name or 'Reviewer' }} · {{ effective_review.reviewed_at }}</dd></div>{% endif %}
+      </dl>
+      {% if prediction.frozen_classification %}
+      <section class="mt-4 rounded-xl border p-4" aria-labelledby="frozen-classification-heading">
+        <h3 id="frozen-classification-heading" class="font-semibold">Original AI classification (unaccepted)</h3>
+        <p class="mt-2">Hostility: <strong>{{ prediction.frozen_classification.hostility_present }}</strong></p>
+        <p>Hostility target: <strong>{{ prediction.frozen_classification.target }}</strong></p>
+        {% if prediction.model_supplied_evidence %}<p class="mt-3 text-sm">Original model evidence (not canonicalized):</p><ul class="mt-1 space-y-2">{% for span in prediction.model_supplied_evidence %}<li class="rounded-xl border p-3"><q>{{ span.text if span is mapping else span }}</q></li>{% endfor %}</ul>{% else %}<p class="mt-2 text-sm text-muted">No recoverable model evidence was stored.</p>{% endif %}
+      </section>
+      {% endif %}
+      {% if prediction.recovery_attempt_history %}<details class="provenance mt-3"><summary>Recovery attempt history</summary><ol class="mt-2 space-y-2">{% for attempt in prediction.recovery_attempt_history %}<li>Attempt {{ attempt.attempt_number }} · {{ attempt.replacement_validation_result or attempt.status or 'unknown' }}{% if attempt.replacement_validation_error %}: {{ attempt.replacement_validation_error }}{% endif %}</li>{% endfor %}</ol></details>{% endif %}
+      <p class="mt-2 text-sm text-muted">The original AI output remains an invalid outcome. Any accepted result below is a separate human annotation.</p>
       {% else %}
       {% if prediction.prediction_task == 'hostility' %}
       <p class="eyebrow">AI SUGGESTION — NOT YET HUMAN APPROVED</p>
@@ -91,8 +107,12 @@
     </section>
     {% endif %}
 
+    {% set manual_complete = ai_unavailable and effective_review and effective_review.review_status == 'human_annotated_after_ai_failure' %}
     <section class="human-review-panel" aria-labelledby="human-form-heading">
       <div class="annotation-title"><p class="eyebrow">Human review</p><h2 id="human-form-heading" class="mt-1 text-2xl font-semibold">{% if ai_unavailable %}Annotate from scratch{% else %}Confirm or correct{% endif %}</h2><p class="mt-2 text-sm text-muted">{% if ai_unavailable %}No AI values are prefilled. Your submission becomes a normal human annotation revision linked to the terminal AI failure.{% else %}Controls begin with the AI suggestion. Submitted values become a normal human annotation revision.{% endif %}</p></div>
+      {% if manual_complete %}
+      <div class="alert alert-success mt-4"><p><strong>Human resolution recorded</strong></p><p class="mt-1">Method: {{ effective_review.resolution_method|replace('_',' ')|title if effective_review.resolution_method else 'Legacy manual annotation' }} · Reviewer: {{ effective_review.reviewer_name or 'Unknown' }} · {{ effective_review.reviewed_at }}</p><p class="mt-1">This outcome already has an accepted human annotation. Duplicate resolution is disabled.</p></div>
+      {% else %}
       <div class="secondary-actions">
         {% if not ai_unavailable %}<form method="post" action="/ai-reviews/{{ prediction.public_id }}/flag">{{ csrf(principal) }}<label for="flag-note">Codebook issue note</label><textarea id="flag-note" name="note" rows="2" maxlength="2000" placeholder="{% if prediction.prediction_task == 'hostility' %}Optional: note a hostility or target boundary issue{% else %}AU07/AU08 boundary unclear{% endif %}" required></textarea><button class="btn btn-danger mt-2" type="submit">Flag codebook issue</button></form>{% endif %}
         <div class="flex flex-wrap gap-2">
@@ -110,6 +130,14 @@
       </div>
       <form id="annotation-form" method="post" action="/ai-reviews/{{ prediction.public_id }}/edit" data-dirty-form data-correction-form>
         {{ csrf(principal) }}
+        {% if ai_unavailable %}
+        <fieldset class="field-wrap mt-4">
+          <legend>Explicit resolution decision <span aria-hidden="true">*</span></legend>
+          <p class="help">Your selection records whether you confirm the recoverable model decision or make an independent human classification.</p>
+          {% if prediction.frozen_classification %}<label class="choice-card mt-2"><input type="radio" name="resolution_method" value="CONFIRMED_FROZEN_CLASSIFICATION" required {% if resolution_method == 'CONFIRMED_FROZEN_CLASSIFICATION' %}checked{% endif %}><span><strong>Confirm the frozen AI hostility label and target</strong><small>Supply corrected, exact evidence selected from the canonical speech.</small></span></label>{% endif %}
+          <label class="choice-card mt-2"><input type="radio" name="resolution_method" value="INDEPENDENT_HUMAN_CLASSIFICATION" required {% if resolution_method == 'INDEPENDENT_HUMAN_CLASSIFICATION' %}checked{% endif %}><span><strong>Make an independent human classification</strong><small>Choose the hostility label and target yourself{% if prediction.frozen_classification %}; this may differ from the frozen AI decision{% endif %}.</small></span></label>
+        </fieldset>
+        {% endif %}
         <div class="annotation-fields">
         {% for field in fields %}
           {% set current = values.get(field.field_key) %}
@@ -137,9 +165,10 @@
         {% endfor %}
         </div>
         <div class="annotation-actions">
-          <button class="btn btn-secondary w-full" type="submit" data-submit-next data-ai-edit-submit>Save edited annotation &amp; next</button>
+          <button class="btn btn-secondary w-full" type="submit" data-submit-next data-ai-edit-submit>{% if ai_unavailable %}Save human resolution &amp; next{% else %}Save edited annotation &amp; next{% endif %}</button>
         </div>
       </form>
+      {% endif %}
     </section>
   </aside>
 </div>

@@ -24,6 +24,10 @@ REVIEW_FILTERS = {
     "skipped",
 }
 RUN_FILTERS = {"needs_review", "completed", "all"}
+MANUAL_RESOLUTION_METHODS = {
+    "CONFIRMED_FROZEN_CLASSIFICATION",
+    "INDEPENDENT_HUMAN_CLASSIFICATION",
+}
 
 
 def ai_review_runs(
@@ -277,30 +281,90 @@ def record_outcome_review(
     assignment_id: int | None = None,
     annotation_version_id: int | None = None,
     note: str | None = None,
+    resolution_method: str | None = None,
 ) -> dict[str, object]:
     if status not in {"human_annotated_after_ai_failure", "skipped"}:
         raise ValueError("invalid terminal outcome review status")
     if status == "human_annotated_after_ai_failure" and annotation_version_id is None:
         raise ValueError("human annotation after AI failure requires an annotation version")
+    if status == "human_annotated_after_ai_failure" and resolution_method not in MANUAL_RESOLUTION_METHODS:
+        raise ValueError("human annotation after AI failure requires an explicit resolution method")
     with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
         outcome = connection.execute(
             "SELECT id,speaker_turn_id FROM model_prediction_abstentions "
-            "WHERE public_id=%s::uuid AND resolution_type='INVALID_OUTPUT'",
+            "WHERE public_id=%s::uuid AND resolution_type='INVALID_OUTPUT' FOR UPDATE",
             (outcome_public_id,),
         ).fetchone()
         if outcome is None:
             raise LookupError("terminal invalid outcome not found")
+        previous = connection.execute(
+            """SELECT id,review_status,annotation_version_id,resolution_method,note
+               FROM model_prediction_outcome_reviews WHERE abstention_id=%s
+               ORDER BY reviewed_at DESC,id DESC LIMIT 1""",
+            (outcome["id"],),
+        ).fetchone()
+        if previous and previous["review_status"] == "human_annotated_after_ai_failure":
+            if (
+                previous["annotation_version_id"] == annotation_version_id
+                and previous["resolution_method"] == resolution_method
+                and status == "human_annotated_after_ai_failure"
+            ):
+                return {**dict(previous), "reused": True}
+            raise ValueError("terminal outcome already has a completed human resolution")
+        if (
+            previous
+            and previous["review_status"] == status
+            and previous["annotation_version_id"] == annotation_version_id
+            and previous["resolution_method"] == resolution_method
+            and (previous.get("note") or None) == (note.strip() if note else None)
+        ):
+            return {**dict(previous), "reused": True}
         row = connection.execute(
             """INSERT INTO model_prediction_outcome_reviews
                (abstention_id,speaker_turn_id,reviewer_user_id,assignment_id,
-                annotation_version_id,review_status,note)
-               VALUES (%s,%s,%s,%s,%s,%s,%s)
+                annotation_version_id,review_status,note,resolution_method)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
                RETURNING id,public_id,review_status,reviewed_at""",
             (outcome["id"], outcome["speaker_turn_id"], principal.user_id,
-             assignment_id, annotation_version_id, status, note.strip() if note else None),
+             assignment_id, annotation_version_id, status, note.strip() if note else None,
+             resolution_method),
         ).fetchone()
         assert row is not None
         return {**dict(row), "reused": False}
+
+
+def prepare_terminal_human_payload(
+    workspace: dict[str, object],
+    payload: dict[str, object],
+    resolution_method: str,
+) -> dict[str, object]:
+    """Apply the explicitly selected method to a terminal-outcome annotation."""
+    prediction = workspace.get("prediction")
+    if not isinstance(prediction, dict) or not prediction.get("ai_unavailable"):
+        raise ValueError("manual resolution method applies only to terminal AI outcomes")
+    reason = prediction.get("resolution_reason")
+    frozen = prediction.get("frozen_classification")
+    if resolution_method == "INDEPENDENT_HUMAN_CLASSIFICATION":
+        return payload
+    if (
+        resolution_method != "CONFIRMED_FROZEN_CLASSIFICATION"
+        or reason != "EVIDENCE_RESOLUTION_FAILED"
+        or not isinstance(frozen, dict)
+        or frozen.get("hostility_present") not in {"YES", "UNSURE"}
+        or frozen.get("target") not in {
+            "OPPOSING_PARTISAN_TARGET",
+            "OTHER_POLITICAL_TARGET",
+            "NON_POLITICAL_TARGET",
+            "UNSURE",
+        }
+    ):
+        raise ValueError(
+            "this terminal outcome can only be resolved by an independent human annotation"
+        )
+    prepared = dict(payload)
+    prepared["hostility_present"] = frozen["hostility_present"]
+    prepared["target"] = frozen["target"]
+    return prepared
 
 
 def _compatible_review_project(
@@ -349,7 +413,7 @@ def _terminal_failure_workspace(
     expected_run_public_id: str | None = None,
 ) -> dict[str, object]:
     outcome = connection.execute(
-        """SELECT outcome.id,outcome.public_id,outcome.speaker_turn_id,
+        """SELECT outcome.id,outcome.public_id,outcome.speaker_turn_id,outcome.record_id,
                   outcome.resolution_reason,outcome.outcome_provenance,
                   run.public_id AS run_public_id,run.configured_model,run.prompt_version,
                   run.execution_mode,run.annotation_schema_slug,run.annotation_schema_version,
@@ -389,9 +453,13 @@ def _terminal_failure_workspace(
         raise ValueError("multiple active compatible review projects; pause all but the intended one")
     fields, labels = load_schema(connection, int(projects[0]["annotation_schema_version_id"]))
     effective = connection.execute(
-        """SELECT review_status,note,reviewed_at,reviewer_user_id,annotation_version_id
-           FROM model_prediction_outcome_reviews WHERE abstention_id=%s
-           ORDER BY reviewed_at DESC,id DESC LIMIT 1""",
+        """SELECT review.review_status,review.note,review.reviewed_at,
+                  review.reviewer_user_id,review.annotation_version_id,
+                  review.resolution_method,reviewer.display_name AS reviewer_name
+           FROM model_prediction_outcome_reviews review
+           JOIN users reviewer ON reviewer.id=review.reviewer_user_id
+           WHERE review.abstention_id=%s
+           ORDER BY review.reviewed_at DESC,review.id DESC LIMIT 1""",
         (outcome["id"],),
     ).fetchone()
     human = connection.execute(
@@ -406,6 +474,23 @@ def _terminal_failure_workspace(
     human_data = dict(human) if human else None
     if human_data:
         human_data["changed_fields"] = []
+    provenance = outcome.get("outcome_provenance")
+    provenance = provenance if isinstance(provenance, dict) else {}
+    frozen_value = provenance.get("frozen_classification")
+    frozen_classification = (
+        dict(frozen_value)
+        if isinstance(frozen_value, dict)
+        and frozen_value.get("hostility_present") in {"YES", "UNSURE"}
+        and frozen_value.get("target") in {
+            "OPPOSING_PARTISAN_TARGET",
+            "OTHER_POLITICAL_TARGET",
+            "NON_POLITICAL_TARGET",
+            "UNSURE",
+        }
+        else None
+    )
+    model_evidence_value = provenance.get("model_supplied_evidence")
+    model_evidence = model_evidence_value if isinstance(model_evidence_value, list) else []
     failure_message = {
         "API_FAILURE": "The model provider did not return a usable response.",
         "INVALID_STRUCTURED_OUTPUT": "The model output did not pass hostility schema validation.",
@@ -421,6 +506,13 @@ def _terminal_failure_workspace(
             "reasoning": None,
             "ai_unavailable": True,
             "failure_message": failure_message,
+            "failure_category": outcome["resolution_reason"],
+            "validation_message": provenance.get("validation_error")
+            or provenance.get("provider_error"),
+            "source_record_id": outcome.get("record_id"),
+            "frozen_classification": frozen_classification,
+            "model_supplied_evidence": model_evidence,
+            "recovery_attempt_history": provenance.get("recovery_attempt_history", []),
         },
         "effective_review": dict(effective) if effective else None,
         "human_annotation": human_data,
