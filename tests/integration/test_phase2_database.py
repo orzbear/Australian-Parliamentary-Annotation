@@ -1251,6 +1251,182 @@ def test_phase4d_migration_constraints_immutability_linkage_and_downgrade_guard(
         command.downgrade(config, "20261009_06")
 
 
+def test_phase4e_partial_import_check_accepts_chunked_campaigns_and_rolls_back_invalid_state(
+    database_url: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _web_settings(database_url)
+    import_validated_run(
+        settings.database,
+        _fixture_run(tmp_path, run_id="phase4e-partial-import-check-fixture"),
+    )
+    password = "phase4e partial import test password"
+    create_user(
+        settings,
+        "phase4e-partial-import-admin",
+        "Phase 4E Partial Import Admin",
+        password,
+        admin=True,
+        must_change_password=False,
+    )
+    admin, _ = authenticate(settings, "phase4e-partial-import-admin", password)
+    url = database_url.replace("postgresql+psycopg://", "postgresql://")
+    with psycopg.connect(url) as connection:
+        corpus_id = int(connection.execute("SELECT id FROM corpora LIMIT 1").fetchone()[0])
+
+    partial = create_campaign(
+        settings, admin, name="Chunked partial import", corpus_id=corpus_id
+    )
+    full = create_campaign(settings, admin, name="Full import", corpus_id=corpus_id)
+
+    def insert_run(
+        connection: psycopg.Connection[Any],
+        campaign_row: dict[str, Any],
+        artifact_digest: str,
+        requested_count: int,
+        valid_count: int,
+        invalid_count: int,
+    ) -> int:
+        return int(
+            connection.execute(
+                """
+                INSERT INTO model_prediction_runs
+                  (artifact_sha256,prediction_task,annotation_schema_slug,
+                   annotation_schema_version,provider,configured_model,prompt_version,
+                   prompt_sha256,canonical_schema_sha256,prediction_contract_sha256,
+                   provider_schema_sha256,generation_config,execution_mode,record_set_sha256,
+                   requested_count,provider_success_count,provider_failure_count,valid_count,
+                   invalid_count,status)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0,%s,%s,'IMPORTED')
+                RETURNING id
+                """,
+                (
+                    artifact_digest,
+                    campaign_row["prediction_task"],
+                    campaign_row["annotation_schema_slug"],
+                    campaign_row["annotation_schema_version"],
+                    campaign_row["provider"],
+                    campaign_row["configured_model"],
+                    campaign_row["prompt_version"],
+                    campaign_row["prompt_sha256"],
+                    campaign_row["canonical_schema_sha256"],
+                    campaign_row["prediction_contract_sha256"],
+                    campaign_row["provider_schema_sha256"],
+                    Jsonb(campaign_row["generation_config"]),
+                    campaign_row["execution_mode"],
+                    "a" * 64,
+                    requested_count,
+                    requested_count,
+                    valid_count,
+                    invalid_count,
+                ),
+            ).fetchone()[0]
+        )
+
+    with psycopg.connect(url) as connection:
+        run_id = insert_run(connection, partial, "b" * 64, 1000, 997, 3)
+        connection.execute(
+            """
+            UPDATE ai_annotation_campaigns SET status='VALIDATED',
+              orchestration_mode='CHUNKED',orchestration_status='RECOVERY_REQUIRED',
+              record_set_sha256=%s,planned_count=1000,valid_count=997,
+              terminal_invalid_count=3,validated_at=now()
+            WHERE id=%s
+            """,
+            ("a" * 64, partial["id"]),
+        )
+        updated = connection.execute(
+            """
+            UPDATE ai_annotation_campaigns SET status='PARTIALLY_IMPORTED',
+              imported_at=now(),model_prediction_run_id=%s
+            WHERE id=%s RETURNING status,orchestration_status,provider_job_id,
+                                  planned_count,valid_count,terminal_invalid_count,
+                                  imported_at,model_prediction_run_id
+            """,
+            (run_id, partial["id"]),
+        ).fetchone()
+        assert updated is not None
+        assert updated[0:6] == (
+            "PARTIALLY_IMPORTED",
+            "RECOVERY_REQUIRED",
+            None,
+            1000,
+            997,
+            3,
+        )
+        assert updated[6] is not None and updated[7] == run_id
+
+        full_run_id = insert_run(connection, full, "c" * 64, 1, 1, 0)
+        connection.execute(
+            """
+            UPDATE ai_annotation_campaigns SET status='VALIDATED',provider_job_id=%s,
+              record_set_sha256=%s,planned_count=1,terminal_invalid_count=0,validated_at=now()
+            WHERE id=%s
+            """,
+            ("legacy-full-import-job", "d" * 64, full["id"]),
+        )
+        full_update = connection.execute(
+            """
+            UPDATE ai_annotation_campaigns SET status='IMPORTED',imported_at=now(),
+              model_prediction_run_id=%s WHERE id=%s
+            RETURNING status,imported_at,model_prediction_run_id
+            """,
+            (full_run_id, full["id"]),
+        ).fetchone()
+        assert full_update is not None
+        assert full_update[0] == "IMPORTED"
+        assert full_update[1] is not None and full_update[2] == full_run_id
+        connection.commit()
+
+        invalid = create_campaign(
+            settings, admin, name="Invalid partial state", corpus_id=corpus_id
+        )
+        invalid_run_id = insert_run(connection, invalid, "e" * 64, 1, 1, 0)
+        connection.execute(
+            """
+            UPDATE ai_annotation_campaigns SET status='VALIDATED',
+              orchestration_mode='CHUNKED',record_set_sha256=%s,planned_count=1,
+              terminal_invalid_count=0,validated_at=now() WHERE id=%s
+            """,
+            ("f" * 64, invalid["id"]),
+        )
+        connection.commit()
+        with pytest.raises(psycopg.errors.CheckViolation) as error:
+            connection.execute(
+                """
+                UPDATE ai_annotation_campaigns SET status='PARTIALLY_IMPORTED',
+                  imported_at=now(),model_prediction_run_id=%s WHERE id=%s
+                """,
+                (invalid_run_id, invalid["id"]),
+            )
+        assert error.value.diag.constraint_name == "ai_annotation_campaigns_partial_import_check"
+        connection.rollback()
+
+    with psycopg.connect(url) as connection:
+        state = connection.execute(
+            "SELECT status,model_prediction_run_id FROM ai_annotation_campaigns WHERE id=%s",
+            (invalid["id"],),
+        ).fetchone()
+        assert state == ("VALIDATED", None)
+        assert connection.execute(
+            "SELECT status,imported_at,model_prediction_run_id FROM ai_annotation_campaigns WHERE id=%s",
+            (partial["id"],),
+        ).fetchone()[0] == "PARTIALLY_IMPORTED"
+        assert connection.execute(
+            "SELECT status,imported_at,model_prediction_run_id FROM ai_annotation_campaigns WHERE id=%s",
+            (full["id"],),
+        ).fetchone()[0] == "IMPORTED"
+        assert connection.execute(
+            "SELECT count(*) FROM model_prediction_runs WHERE artifact_sha256=%s",
+            ("e" * 64,),
+        ).fetchone()[0] == 1
+
+    repeated = import_campaign(
+        settings, admin, str(partial["public_id"]), "IMPORT VALID RECORDS"
+    )
+    assert repeated["status"] == "PARTIALLY_IMPORTED"
+    assert repeated["model_prediction_run_id"] == run_id
+
+
 def test_phase4e_chunk_persistence_authorization_and_downgrade_guard(
     database_url: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
