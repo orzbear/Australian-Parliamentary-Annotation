@@ -1771,6 +1771,10 @@ def test_hostility_collection_validation_and_import_use_hostility_adapter(
     validated = validate_campaign(_settings(), _principal(), str(campaign["public_id"]))
     assert validated["status"] == "VALIDATED"
     assert validated["valid_count"] == 100
+    validated_again = validate_campaign(
+        _settings(), _principal(), str(campaign["public_id"])
+    )
+    assert validated_again == validated
 
     imported_calls: list[dict[str, Any]] = []
 

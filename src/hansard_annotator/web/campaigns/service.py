@@ -2844,6 +2844,8 @@ def _terminal_recovery_history(
         """
         SELECT campaign_record.record_id,recovery.attempt_number,
                recovery.public_id::text AS recovery_id,recovery.provider_job_id,
+               COALESCE(recovery.operational_metadata->>'recovery_mode',
+                        'classification_retry') AS recovery_mode,
                recovery.artifact_reference,recovery_record.original_validation_error
         FROM ai_annotation_campaign_recoveries recovery
         JOIN ai_annotation_campaign_recovery_records recovery_record
@@ -2875,15 +2877,21 @@ def _terminal_recovery_history(
             and recovered.get("recovery_provider_job_id") == row["provider_job_id"]
             and recovered.get("original_validation_error")
             == row["original_validation_error"]
+            and (
+                recovered.get("recovery_mode") is None
+                or recovered.get("recovery_mode") == row["recovery_mode"]
+            )
         )
         history.setdefault(record_id, []).append(
             {
                 "attempt_number": int(row["attempt_number"]),
                 "recovery_id": str(row["recovery_id"]),
                 "provider_job_id": str(row["provider_job_id"] or ""),
+                "recovery_mode": str(row["recovery_mode"]),
                 "original_validation_error": str(row["original_validation_error"]),
                 "replacement_validation_result": str(recovered.get("status") or "missing"),
-                "replacement_validation_error": recovered.get("validation_error"),
+                "replacement_validation_error": recovered.get("validation_error")
+                or recovered.get("provider_error"),
                 "lineage_consistent": lineage_consistent,
             }
         )
