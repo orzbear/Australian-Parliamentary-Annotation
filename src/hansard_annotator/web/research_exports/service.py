@@ -14,6 +14,11 @@ from typing import Any, Literal
 import psycopg
 from psycopg.rows import dict_row
 
+from hansard_annotator.llm_eval.hostility import (
+    MODEL_TARGET_CODES,
+    PRESENCE_CODES,
+    partisan_hostility,
+)
 from hansard_annotator.llm_eval.review_audit import create_review_audit
 from hansard_annotator.web.auth.models import Principal
 from hansard_annotator.web.codebook.service import DownloadKind, canonical_download
@@ -114,7 +119,7 @@ def prediction_export(
         connection.execute("SET TRANSACTION READ ONLY")
         run = connection.execute(
             """
-            SELECT id,public_id,provider,configured_model,returned_model,prompt_version,
+            SELECT id,public_id,prediction_task,provider,configured_model,returned_model,prompt_version,
                    prompt_sha256,canonical_schema_sha256,prediction_contract_sha256,
                    provider_schema_sha256,generation_config,execution_mode,record_set_sha256,
                    artifact_sha256,provider_job_id,imported_at
@@ -127,7 +132,8 @@ def prediction_export(
         rows = connection.execute(
             """
             SELECT prediction.public_id AS prediction_id,prediction.record_id,
-                   prediction.speaker_turn_id,turn.turn_key,turn.speech_date,turn.chamber,
+                   prediction.speaker_turn_id,prediction.prediction_task,
+                   prediction.prediction_values,turn.turn_key,turn.speech_date,turn.chamber,
                    turn.speaker_name_raw,prediction.is_non_policy,
                    prediction.primary_australian_domain,
                    prediction.secondary_australian_domains,prediction.reasoning,
@@ -138,8 +144,12 @@ def prediction_export(
             """,
             (run["id"],),
         ).fetchall()
+    task = run["prediction_task"]
+    if task not in {"policy", "hostility"}:
+        raise ValueError(f"unsupported prediction task for CSV export: {task!r}")
+
     output = io.StringIO(newline="")
-    fields = [
+    metadata_fields = [
         "run_id",
         "provider",
         "configured_model",
@@ -161,17 +171,116 @@ def prediction_export(
         "speech_date",
         "chamber",
         "speaker_name_raw",
+    ]
+    policy_fields = [
         "is_non_policy",
         "primary_australian_domain",
         "secondary_australian_domains",
+    ]
+    hostility_fields = [
+        "prediction_task",
+        "hostility_present",
+        "target",
+        "evidence_spans",
+        "partisan_hostility",
+    ]
+    trailing_fields = [
         "reasoning",
         "returned_model",
         "created_at",
     ]
+    fields = metadata_fields + (policy_fields if task == "policy" else hostility_fields) + trailing_fields
     writer = csv.DictWriter(output, fieldnames=fields, lineterminator="\n")
     writer.writeheader()
     for raw in rows:
         row = dict(raw)
+        if row["prediction_task"] != task:
+            raise ValueError(
+                f"prediction {row['prediction_id']} task does not match its run task"
+            )
+        values = row["prediction_values"]
+        if not isinstance(values, dict):
+            raise ValueError(f"prediction {row['prediction_id']} values are not a JSON object")
+        if task == "hostility":
+            if any(
+                row[field] is not None
+                for field in (
+                    "is_non_policy",
+                    "primary_australian_domain",
+                    "secondary_australian_domains",
+                )
+            ):
+                raise ValueError(
+                    f"prediction {row['prediction_id']} has policy fields for a hostility task"
+                )
+            if set(values) != {"hostility_present", "target", "evidence_spans"}:
+                raise ValueError(
+                    f"prediction {row['prediction_id']} has invalid hostility values"
+                )
+            presence = values["hostility_present"]
+            target = values["target"]
+            spans = values["evidence_spans"]
+            if presence not in PRESENCE_CODES or target not in MODEL_TARGET_CODES:
+                raise ValueError(
+                    f"prediction {row['prediction_id']} has invalid hostility label or target"
+                )
+            if not isinstance(spans, list) or any(
+                not isinstance(span, dict)
+                or set(span) != {"start_offset", "end_offset", "text"}
+                or not isinstance(span.get("start_offset"), int)
+                or isinstance(span.get("start_offset"), bool)
+                or not isinstance(span.get("end_offset"), int)
+                or isinstance(span.get("end_offset"), bool)
+                or span["start_offset"] < 0
+                or span["end_offset"] <= span["start_offset"]
+                or not isinstance(span.get("text"), str)
+                or not span["text"]
+                for span in spans
+            ):
+                raise ValueError(
+                    f"prediction {row['prediction_id']} has invalid hostility evidence spans"
+                )
+            if (presence == "NO" and (target != "N/A" or spans)) or (
+                presence != "NO" and (target == "N/A" or not spans)
+            ):
+                raise ValueError(
+                    f"prediction {row['prediction_id']} has inconsistent hostility values"
+                )
+            row.update(
+                prediction_task=task,
+                hostility_present=presence,
+                target=target,
+                evidence_spans=spans,
+                partisan_hostility=partisan_hostility(values),
+            )
+        else:
+            if (
+                not isinstance(row["is_non_policy"], bool)
+                or not isinstance(row["secondary_australian_domains"], list)
+                or (
+                    row["primary_australian_domain"] is not None
+                    and not isinstance(row["primary_australian_domain"], str)
+                )
+            ):
+                raise ValueError(
+                    f"prediction {row['prediction_id']} has invalid policy fields"
+                )
+            if values and (
+                set(values)
+                != {
+                    "is_non_policy",
+                    "primary_australian_domain",
+                    "secondary_australian_domains",
+                }
+                or values["is_non_policy"] != row["is_non_policy"]
+                or values["primary_australian_domain"]
+                != row["primary_australian_domain"]
+                or values["secondary_australian_domains"]
+                != row["secondary_australian_domains"]
+            ):
+                raise ValueError(
+                    f"prediction {row['prediction_id']} has inconsistent policy values"
+                )
         row.update(
             run_id=str(run["public_id"]),
             provider=run["provider"],
