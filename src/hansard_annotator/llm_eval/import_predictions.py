@@ -88,26 +88,23 @@ def _prediction_artifact_summary(
     _generation_identity(provenance)
     coverage = summary.get("coverage", {})
     invalid = int(coverage.get("invalid_structured_predictions") or 0)
+    failed = int(coverage.get("failed_provider_responses") or 0)
+    missing = int(coverage.get("missing_responses") or 0)
     planned = int(coverage.get("planned_requests") or 0)
     valid = int(coverage.get("valid_structured_predictions") or 0)
     refused = int(coverage.get("provider_refused") or 0)
     terminal_invalid_supported = (
         prediction_task == "hostility"
-        and invalid > 0
-        and valid + refused + invalid == planned
-        and not any(
-            int(coverage.get(key) or 0)
-            for key in (
-                "failed_provider_responses", "missing_responses", "duplicate_mappings"
-            )
-        )
+        and invalid + failed + missing > 0
+        and valid + refused + invalid + failed + missing == planned
+        and int(coverage.get("duplicate_mappings") or 0) == 0
     )
     if not coverage.get("accounting_invariant_ok") and not terminal_invalid_supported:
         raise ValueError("artifact coverage or structured validation is not importable")
     if invalid != 0 and not terminal_invalid_supported:
         raise ValueError("artifact coverage or structured validation is not importable")
-    if (refused and valid + refused + invalid != planned) or (
-        planned and valid + refused + invalid != planned
+    if (refused and valid + refused + invalid + failed + missing != planned) or (
+        planned and valid + refused + invalid + failed + missing != planned
     ):
         raise ValueError("artifact outcomes do not match planned coverage")
     if refused:
@@ -178,9 +175,9 @@ def iter_prediction_artifact(
                     raise ValueError(f"prediction line {number} has invalid refusal lineage")
                 _validate_refusal_response(value.get("provider_response"))
                 continue
-            if value.get("status") == "invalid":
-                # Kept out of the prediction stream. The dedicated terminal-outcome
-                # importer below accepts only the frozen hostility evidence failure.
+            if value.get("status") in {"invalid", "provider_failure", "missing"}:
+                # Operational and structured failures are imported only as explicit
+                # terminal outcomes, never as fabricated prediction values.
                 continue
             if value.get("status") != "success":
                 raise ValueError(f"prediction line {number} is not successful")
@@ -209,23 +206,33 @@ def iter_terminal_invalid_artifact(
     with (directory / "predictions.jsonl").open(encoding="utf-8") as source:
         for number, line in enumerate(source, 1):
             value = json.loads(line)
-            if not isinstance(value, dict) or value.get("status") != "invalid":
+            if not isinstance(value, dict) or value.get("status") not in {
+                "invalid", "provider_failure", "missing"
+            }:
                 continue
-            if value.get("validation_error") != (
-                "hostility evidence must resolve uniquely to canonical text"
-            ):
-                raise ValueError(
-                    f"prediction line {number} has an unsupported terminal invalid outcome"
-                )
             record_id = value.get("record_id")
             response = value.get("provider_response")
             if (
                 not isinstance(record_id, str)
                 or not record_id.startswith("turn:")
-                or not isinstance(response, dict)
                 or value.get("prediction") is not None
             ):
                 raise ValueError(f"prediction line {number} has incomplete invalid provenance")
+            if value.get("status") == "invalid":
+                if not isinstance(response, dict) or not isinstance(value.get("validation_error"), str):
+                    raise ValueError(f"prediction line {number} has incomplete invalid provenance")
+                reason = (
+                    "EVIDENCE_RESOLUTION_FAILED"
+                    if value["validation_error"] == "hostility evidence must resolve uniquely to canonical text"
+                    else "INVALID_STRUCTURED_OUTPUT"
+                )
+            elif value.get("status") == "provider_failure":
+                if not isinstance(response, dict):
+                    raise ValueError(f"prediction line {number} has incomplete provider failure provenance")
+                reason = "API_FAILURE"
+            else:
+                reason = "API_FAILURE"
+            value["terminal_resolution_reason"] = reason
             history = (terminal_recovery_history or {}).get(record_id, [])
             if require_recovery_lineage and not history:
                 raise ValueError(
@@ -545,9 +552,15 @@ def import_predictions(
             raise ValueError("artifact row count does not match operational summary")
         if refusal_records != expected_refusals:
             raise ValueError("artifact refusal count does not match operational summary")
-        if terminal_invalid_records != int(
-            summary["coverage"].get("invalid_structured_predictions") or 0
-        ):
+        expected_terminal_invalid = sum(
+            int(summary["coverage"].get(key) or 0)
+            for key in (
+                "invalid_structured_predictions",
+                "failed_provider_responses",
+                "missing_responses",
+            )
+        )
+        if terminal_invalid_records != expected_terminal_invalid:
             raise ValueError("artifact terminal invalid count does not match operational summary")
         result = {
             "artifact_records": artifact_records,
@@ -697,11 +710,11 @@ def import_predictions(
                     int(run["id"]),
                     turns[str(row["record_id"]).removeprefix("turn:")]["id"],
                     row["record_id"],
-                    "EVIDENCE_RESOLUTION_FAILED",
+                    str(row["terminal_resolution_reason"]),
                     Jsonb({
                         **row,
                         "outcome": "INVALID_OUTPUT",
-                        "category": "EVIDENCE_RESOLUTION_FAILED",
+                        "category": str(row["terminal_resolution_reason"]),
                         "recovery_attempt_history": row.get(
                             "recovery_attempt_history", []
                         ),

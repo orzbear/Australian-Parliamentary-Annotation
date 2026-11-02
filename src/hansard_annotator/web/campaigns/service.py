@@ -7,6 +7,7 @@ import json
 import math
 import os
 from collections import Counter
+from collections.abc import Iterable
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -100,6 +101,7 @@ PAID_CONFIRMATION = "START AI CAMPAIGN"
 RECOVERY_CONFIRMATION = "RETRY INVALID RECORDS"
 MAX_CAMPAIGN_RECOVERY_ATTEMPTS = 3
 EVIDENCE_RECOVERY_CONFIRMATION = "REPAIR HOSTILITY EVIDENCE ONLY"
+PARTIAL_IMPORT_CONFIRMATION = "IMPORT VALID RECORDS"
 PRODUCTION_GENERATION_CONFIG = APPROVED_PRODUCTION_GENERATION
 PRODUCTION_EXECUTION_MODE = "batch"
 DEFAULT_EXCLUDE_HUMAN_ANNOTATED = True
@@ -163,6 +165,7 @@ STATES = {
     "PROVIDER_COMPLETED",
     "COLLECTED",
     "VALIDATED",
+    "PARTIALLY_IMPORTED",
     "IMPORTED",
     "FAILED",
     "CANCELLED",
@@ -175,10 +178,11 @@ TRANSITIONS = {
     "RUNNING": {"RUNNING", "PROVIDER_COMPLETED", "FAILED"},
     "PROVIDER_COMPLETED": {"COLLECTED", "FAILED"},
     "COLLECTED": {"VALIDATED", "FAILED"},
-    "VALIDATED": {"IMPORTED", "FAILED"},
+    "VALIDATED": {"PARTIALLY_IMPORTED", "IMPORTED", "FAILED"},
     "FAILED": {"RUNNING", "PROVIDER_COMPLETED", "COLLECTED", "VALIDATED"},
     "CANCELLED": set(),
     "IMPORTED": set(),
+    "PARTIALLY_IMPORTED": set(),
 }
 
 
@@ -1341,6 +1345,117 @@ def get_campaign(
             ),
             None,
         )
+        result["campaign_coverage"] = {
+            "planned": int(result.get("planned_count") or 0),
+            "collected": 0,
+            "valid": int(result.get("valid_count") or 0),
+            "imported": 0,
+            "unresolved": int(result.get("invalid_count") or 0)
+            + int(result.get("terminal_invalid_count") or 0),
+            "manually_completed": 0,
+            "excluded": 0,
+            "coverage_percent": 0.0,
+        }
+        if result.get("model_prediction_run_id") is not None:
+            imported_counts = connection.execute(
+                """SELECT
+                     (SELECT count(*) FROM model_predictions prediction
+                      WHERE prediction.run_id=%s) AS imported,
+                     count(*) FILTER (WHERE outcome.resolution_type='INVALID_OUTPUT')
+                       AS invalid_outcomes,
+                     count(*) FILTER (WHERE outcome.resolution_type='PROVIDER_REFUSAL')
+                       AS excluded,
+                     count(*) FILTER (WHERE outcome.resolution_type='INVALID_OUTPUT'
+                       AND latest.review_status='human_annotated_after_ai_failure')
+                       AS manually_completed
+                   FROM model_prediction_abstentions outcome
+                   LEFT JOIN LATERAL (
+                     SELECT review_status FROM model_prediction_outcome_reviews review
+                     WHERE review.abstention_id=outcome.id
+                     ORDER BY review.reviewed_at DESC,review.id DESC LIMIT 1
+                   ) latest ON true
+                   WHERE outcome.run_id=%s""",
+                (result["model_prediction_run_id"], result["model_prediction_run_id"]),
+            ).fetchone()
+            counts = dict(imported_counts or {})
+            imported_count = int(counts.get("imported") or 0)
+            invalid_outcomes = int(counts.get("invalid_outcomes") or 0)
+            excluded_count = int(counts.get("excluded") or 0)
+            manually_completed = int(counts.get("manually_completed") or 0)
+            unresolved = max(0, invalid_outcomes - manually_completed)
+            collected_count = imported_count + invalid_outcomes + excluded_count
+            result["campaign_coverage"] = {
+                "planned": int(result.get("planned_count") or 0),
+                "collected": collected_count,
+                "valid": imported_count,
+                "imported": imported_count,
+                "unresolved": unresolved,
+                "manually_completed": manually_completed,
+                "excluded": excluded_count,
+                "coverage_percent": round(
+                    collected_count * 100 / int(result["planned_count"]), 1
+                )
+                if int(result.get("planned_count") or 0)
+                else 0.0,
+            }
+            if unresolved:
+                result["unresolved_records_preview"] = [
+                    dict(value)
+                    for value in connection.execute(
+                        """SELECT outcome.record_id,turn.turn_key,turn.speech_date,
+                                  turn.speaker_name_raw,
+                                  outcome.resolution_reason AS failure_category,
+                                  outcome.outcome_provenance->>'validation_error' AS validation_error,
+                                  COALESCE((outcome.outcome_provenance->>'attempt_count')::integer,1)
+                                    AS attempt_count,
+                                  true AS terminal
+                           FROM model_prediction_abstentions outcome
+                           JOIN speaker_turns turn ON turn.id=outcome.speaker_turn_id
+                           LEFT JOIN LATERAL (
+                             SELECT review_status FROM model_prediction_outcome_reviews review
+                             WHERE review.abstention_id=outcome.id
+                             ORDER BY review.reviewed_at DESC,review.id DESC LIMIT 1
+                           ) latest ON true
+                           WHERE outcome.run_id=%s AND outcome.resolution_type='INVALID_OUTPUT'
+                             AND latest.review_status IS DISTINCT FROM
+                               'human_annotated_after_ai_failure'
+                           ORDER BY outcome.record_id LIMIT 50""",
+                        (result["model_prediction_run_id"],),
+                    ).fetchall()
+                ]
+        elif result.get("artifact_reference"):
+            effective_directory = _current_effective_artifact_directory(result, recoveries)
+            operational_summary_path = effective_directory / "operational_summary.json"
+            if operational_summary_path.is_file():
+                artifact_summary = json.loads(
+                    operational_summary_path.read_text(encoding="utf-8")
+                )
+                coverage_data = artifact_summary.get("coverage", {})
+                if isinstance(coverage_data, dict):
+                    current_valid = int(
+                        coverage_data.get("valid_structured_predictions") or 0
+                    )
+                    unresolved = sum(
+                        int(coverage_data.get(key) or 0)
+                        for key in (
+                            "invalid_structured_predictions",
+                            "failed_provider_responses",
+                            "missing_responses",
+                        )
+                    )
+                    excluded = int(coverage_data.get("provider_refused") or 0)
+                    collected_count = current_valid + unresolved + excluded
+                    result["campaign_coverage"].update(
+                        collected=collected_count,
+                        valid=current_valid,
+                        unresolved=unresolved,
+                        excluded=excluded,
+                        coverage_percent=round(
+                            collected_count * 100 / int(result["planned_count"]), 1
+                        )
+                        if int(result.get("planned_count") or 0)
+                        else 0.0,
+                    )
         batch_progress = connection.execute(
             """
             SELECT count(*) AS chunks_total,
@@ -1371,12 +1486,12 @@ def get_campaign(
         result["batch_progress"] = dict(batch_progress) if batch_progress else {}
         if is_hostility_production_campaign(result):
             progress = result["batch_progress"]
-            result["retryable_failure_count"] = (
+            result["historical_failure_attempt_count"] = (
                 int(progress.get("chunk_invalid") or 0)
-                - int(progress.get("chunk_evidence_failures") or 0)
                 + int(progress.get("chunk_provider_failures") or 0)
                 + int(progress.get("chunk_missing") or 0)
             )
+            result["retryable_failure_count"] = 0
             result["evidence_repair_preview"] = {
                 "eligible_count": 0,
                 "ineligible_count": 0,
@@ -1457,6 +1572,7 @@ def get_campaign(
             if (
                 is_hostility_production_campaign(result)
                 and result["status"] == "COLLECTED"
+                and result.get("model_prediction_run_id") is None
             ):
                 attempts = {
                     str(value["record_id"]): int(value["attempt_count"])
@@ -1470,51 +1586,64 @@ def get_campaign(
                         (row["id"],),
                     ).fetchall()
                 }
-                evidence_preview = cast(dict[str, Any], result["evidence_repair_preview"])
-                eligible_ids = cast(list[str], evidence_preview["eligible_record_ids_preview"])
-                ineligible_ids = cast(
-                    list[dict[str, str]], evidence_preview["ineligible_records_preview"]
+                recovery_state = _recovery_eligibility_summary(
+                    iter_jsonl(current_directory / "predictions.jsonl"),
+                    attempts,
+                    is_luna=False,
+                    preserve_evidence_failures=True,
+                    full_retry_attempt_available=len(recoveries)
+                    < MAX_CAMPAIGN_RECOVERY_ATTEMPTS,
                 )
-                ineligible_reasons = cast(dict[str, int], evidence_preview["ineligible_reasons"])
-                for prediction_row in iter_jsonl(current_directory / "predictions.jsonl"):
-                    if (
-                        prediction_row.get("status") == "success"
-                        and prediction_row.get("recovery_mode") == "evidence_only"
-                    ):
-                        evidence_preview["already_repaired_count"] += 1
-                    if not _evidence_failure_for_repair(prediction_row):
-                        continue
-                    record_id = prediction_row.get("record_id")
-                    has_frozen_classification = _stored_frozen_classification(prediction_row) is not None
-                    original_evidence = _stored_model_evidence(prediction_row)
-                    has_original_evidence = isinstance(original_evidence, list) and bool(original_evidence)
-                    attempts_remaining = max(
-                        0,
-                        MAX_CAMPAIGN_RECOVERY_ATTEMPTS - attempts.get(str(record_id), 0),
+                result["recovery_eligibility"] = recovery_state
+                result["retryable_failure_count"] = recovery_state[
+                    "eligible_full_retry_count"
+                ]
+                evidence_preview = cast(dict[str, Any], result["evidence_repair_preview"])
+                evidence_ids = cast(list[str], recovery_state["evidence_repair_record_ids"])
+                unresolved_rows = cast(list[dict[str, Any]], recovery_state["unresolved_rows"])
+                evidence_preview.update(
+                    eligible_count=len(evidence_ids),
+                    already_repaired_count=recovery_state["already_repaired_count"],
+                    remaining_attempt_budget=recovery_state["remaining_attempt_capacity"],
+                    estimated_provider_calls=len(evidence_ids),
+                    eligible_record_ids_preview=evidence_ids[:20],
+                )
+                terminal_ids = set(recovery_state["terminal_record_ids"])
+                ineligible = [
+                    {
+                        "record_id": str(row["record_id"]),
+                        "reason": "attempt_limit_reached"
+                        if attempts.get(str(row["record_id"]), 0)
+                        >= MAX_CAMPAIGN_RECOVERY_ATTEMPTS
+                        else "not_recoverable_by_current_contract",
+                    }
+                    for row in unresolved_rows
+                    if row.get("record_id") in terminal_ids
+                ]
+                evidence_preview["ineligible_count"] = len(ineligible)
+                evidence_preview["ineligible_records_preview"] = ineligible[:20]
+                result["unresolved_records_preview"] = unresolved_rows[:50]
+                category_counts: dict[str, int] = {}
+                preview_rows: list[dict[str, Any]] = []
+                for unresolved_row in unresolved_rows:
+                    category = str(
+                        unresolved_row.get("failure_category")
+                        or unresolved_row.get("status")
                     )
-                    remaining = max(
-                        0,
-                        MAX_CAMPAIGN_RECOVERY_ATTEMPTS
-                        - attempts.get(str(record_id), 0),
+                    category_counts[category] = category_counts.get(category, 0) + 1
+                    record_id = str(unresolved_row["record_id"])
+                    preview_rows.append(
+                        {
+                            "record_id": record_id,
+                            "failure_category": category,
+                            "reason": unresolved_row.get("validation_error")
+                            or unresolved_row.get("provider_error"),
+                            "attempt_count": attempts.get(record_id, 0) + 1,
+                            "terminal": record_id in terminal_ids,
+                        }
                     )
-                    evidence_preview["remaining_attempt_budget"] += remaining
-                    if has_frozen_classification and has_original_evidence and attempts_remaining:
-                        evidence_preview["eligible_count"] += 1
-                        if len(eligible_ids) < 20 and isinstance(record_id, str):
-                            eligible_ids.append(record_id)
-                    else:
-                        evidence_preview["ineligible_count"] += 1
-                        reason = (
-                            "frozen_classification_invalid"
-                            if not has_frozen_classification
-                            else "original_evidence_missing"
-                            if not has_original_evidence
-                            else "attempt_limit_reached"
-                        )
-                        ineligible_reasons[reason] = ineligible_reasons.get(reason, 0) + 1
-                        if len(ineligible_ids) < 20 and isinstance(record_id, str):
-                            ineligible_ids.append({"record_id": record_id, "reason": reason})
-                evidence_preview["estimated_provider_calls"] = evidence_preview["eligible_count"]
+                result["unresolved_records_preview"] = preview_rows[:50]
+                result["failure_category_counts"] = category_counts
         original_metadata = cast(
             dict[str, Any], result.get("operational_metadata") or {}
         )
@@ -1531,6 +1660,105 @@ def get_campaign(
             float(original_cost.get("total_pilot_cost_usd") or 0) + recovery_cost
         )
         return result
+
+
+def campaign_unresolved_records(
+    settings: WebSettings, principal: Principal, public_id: str
+) -> list[dict[str, Any]]:
+    """Export current unresolved results with canonical turn references and lineage."""
+    _require_admin(principal)
+    with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
+        row = connection.execute(
+            "SELECT * FROM ai_annotation_campaigns WHERE public_id::text=%s",
+            (public_id,),
+        ).fetchone()
+        if row is None:
+            raise LookupError("AI annotation campaign not found")
+        campaign = dict(row)
+        if campaign.get("model_prediction_run_id") is not None:
+            values = connection.execute(
+                """SELECT outcome.record_id,turn.turn_key,turn.speech_date,
+                          turn.speaker_name_raw,
+                          COALESCE(NULLIF(turn.text_clean,''),turn.text_raw) AS canonical_text,
+                          outcome.resolution_reason AS failure_category,
+                          outcome.outcome_provenance,latest.review_status
+                   FROM model_prediction_abstentions outcome
+                   JOIN speaker_turns turn ON turn.id=outcome.speaker_turn_id
+                   LEFT JOIN LATERAL (
+                     SELECT review_status FROM model_prediction_outcome_reviews review
+                     WHERE review.abstention_id=outcome.id
+                     ORDER BY review.reviewed_at DESC,review.id DESC LIMIT 1
+                   ) latest ON true
+                   WHERE outcome.run_id=%s AND outcome.resolution_type='INVALID_OUTPUT'
+                     AND latest.review_status IS DISTINCT FROM
+                       'human_annotated_after_ai_failure'
+                   ORDER BY outcome.record_id""",
+                (campaign["model_prediction_run_id"],),
+            ).fetchall()
+            recovery_history = _campaign_recovery_attempt_export_history(
+                connection, int(campaign["id"])
+            )
+            output: list[dict[str, Any]] = []
+            for value in values:
+                item = dict(value)
+                provenance = item.get("outcome_provenance")
+                provenance = provenance if isinstance(provenance, dict) else {}
+                item.update(
+                    reason=provenance.get("validation_error")
+                    or provenance.get("provider_error"),
+                    attempt_count=int(provenance.get("attempt_count") or 1),
+                    attempt_history=recovery_history.get(
+                        str(item["record_id"]),
+                        provenance.get("recovery_attempt_history", []),
+                    ),
+                    terminal=True,
+                )
+                item.pop("outcome_provenance", None)
+                item.pop("review_status", None)
+                output.append(item)
+            return output
+
+        if not campaign.get("artifact_reference"):
+            return []
+        recoveries = _collected_recoveries(connection, int(campaign["id"]))
+        directory = _current_effective_artifact_directory(campaign, recoveries)
+        turns = {
+            str(value["record_id"]): dict(value)
+            for value in connection.execute(
+                """SELECT record.record_id,turn.turn_key,turn.speech_date,
+                          turn.speaker_name_raw,
+                          COALESCE(NULLIF(turn.text_clean,''),turn.text_raw) AS canonical_text
+                   FROM ai_annotation_campaign_records record
+                   JOIN speaker_turns turn ON turn.id=record.speaker_turn_id
+                   WHERE record.campaign_id=%s""",
+                (campaign["id"],),
+            ).fetchall()
+        }
+        history = _campaign_recovery_attempt_export_history(
+            connection, int(campaign["id"])
+        )
+        output = []
+        for prediction in iter_jsonl(directory / "predictions.jsonl"):
+            if prediction.get("status") not in {"invalid", "provider_failure", "missing"}:
+                continue
+            record_id = prediction.get("record_id")
+            turn = turns.get(str(record_id))
+            if not turn:
+                continue
+            attempt_count = len(history.get(str(record_id), [])) + 1
+            output.append(
+                {
+                    **turn,
+                    "failure_category": prediction.get("failure_category")
+                    or prediction.get("status"),
+                    "reason": prediction.get("validation_error")
+                    or prediction.get("provider_error"),
+                    "attempt_count": attempt_count,
+                    "attempt_history": history.get(str(record_id), []),
+                    "terminal": attempt_count >= MAX_CAMPAIGN_RECOVERY_ATTEMPTS,
+                }
+            )
+        return output
 
 
 def plan_campaign(
@@ -2625,6 +2853,32 @@ def _terminal_recovery_history(
     return history
 
 
+def _campaign_recovery_attempt_export_history(
+    connection: psycopg.Connection[dict[str, Any]], campaign_id: int
+) -> dict[str, list[dict[str, Any]]]:
+    rows = connection.execute(
+        """SELECT campaign_record.record_id,recovery.attempt_number,
+                  recovery.public_id::text AS recovery_id,recovery.provider_job_id,
+                  recovery.status,recovery.artifact_reference,
+                  recovery.operational_metadata->>'recovery_mode' AS recovery_mode,
+                  recovery_record.original_validation_error
+           FROM ai_annotation_campaign_recoveries recovery
+           JOIN ai_annotation_campaign_recovery_records recovery_record
+             ON recovery_record.recovery_id=recovery.id
+           JOIN ai_annotation_campaign_records campaign_record
+             ON campaign_record.id=recovery_record.campaign_record_id
+           WHERE recovery.campaign_id=%s
+           ORDER BY campaign_record.record_id,recovery.attempt_number""",
+        (campaign_id,),
+    ).fetchall()
+    history: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        item = dict(row)
+        record_id = str(item.pop("record_id"))
+        history.setdefault(record_id, []).append(item)
+    return history
+
+
 def _original_coverage_complete(campaign: dict[str, Any]) -> None:
     metadata = campaign.get("operational_metadata")
     coverage = metadata.get("coverage") if isinstance(metadata, dict) else None
@@ -2720,6 +2974,94 @@ def _recovery_retry_eligible(
         == "hostility evidence must resolve uniquely to canonical text"
     )
     return not ((is_luna or preserve_evidence_failures) and evidence_failure)
+
+
+def _recovery_record_eligible(
+    result: dict[str, Any],
+    *,
+    recovery_mode: str,
+    record_attempts: int,
+    is_luna: bool,
+    preserve_evidence_failures: bool,
+    full_retry_attempt_available: bool,
+) -> bool:
+    if record_attempts >= MAX_CAMPAIGN_RECOVERY_ATTEMPTS:
+        return False
+    if recovery_mode == "evidence_only":
+        return (
+            _evidence_failure_for_repair(result)
+            and _stored_frozen_classification(result) is not None
+            and isinstance(_stored_model_evidence(result), list)
+            and bool(_stored_model_evidence(result))
+        )
+    if recovery_mode != "classification_retry" or not full_retry_attempt_available:
+        return False
+    return _recovery_retry_eligible(
+        result,
+        is_luna=is_luna,
+        preserve_evidence_failures=preserve_evidence_failures,
+    )
+
+
+def _recovery_eligibility_summary(
+    rows: Iterable[dict[str, Any]],
+    attempts: dict[str, int],
+    *,
+    is_luna: bool,
+    preserve_evidence_failures: bool,
+    full_retry_attempt_available: bool,
+) -> dict[str, Any]:
+    unresolved: list[dict[str, Any]] = []
+    full_retry_ids: list[str] = []
+    evidence_repair_ids: list[str] = []
+    terminal_ids: list[str] = []
+    remaining_capacity = 0
+    already_repaired = 0
+    failure_statuses = {"invalid", "provider_failure", "missing"}
+    for row in rows:
+        record_id = row.get("record_id")
+        status = row.get("status")
+        if status == "success" and row.get("recovery_mode") == "evidence_only":
+            already_repaired += 1
+        if status not in failure_statuses:
+            continue
+        if not isinstance(record_id, str):
+            continue
+        unresolved.append(row)
+        count = attempts.get(record_id, 0)
+        remaining_capacity += max(0, MAX_CAMPAIGN_RECOVERY_ATTEMPTS - count)
+        if _recovery_record_eligible(
+            row,
+            recovery_mode="classification_retry",
+            record_attempts=count,
+            is_luna=is_luna,
+            preserve_evidence_failures=preserve_evidence_failures,
+            full_retry_attempt_available=full_retry_attempt_available,
+        ):
+            full_retry_ids.append(record_id)
+        elif _recovery_record_eligible(
+            row,
+            recovery_mode="evidence_only",
+            record_attempts=count,
+            is_luna=is_luna,
+            preserve_evidence_failures=preserve_evidence_failures,
+            full_retry_attempt_available=full_retry_attempt_available,
+        ):
+            evidence_repair_ids.append(record_id)
+        else:
+            terminal_ids.append(record_id)
+    return {
+        "current_unresolved_count": len(unresolved),
+        "eligible_full_retry_count": len(full_retry_ids),
+        "eligible_evidence_repair_count": len(evidence_repair_ids),
+        "terminal_failure_count": len(terminal_ids),
+        "remaining_attempt_capacity": remaining_capacity,
+        "already_repaired_count": already_repaired,
+        "full_retry_record_ids": full_retry_ids,
+        "evidence_repair_record_ids": evidence_repair_ids,
+        "terminal_record_ids": terminal_ids,
+        "unresolved_rows": unresolved,
+    }
 
 
 def _stored_frozen_classification(result: dict[str, Any]) -> dict[str, Any] | None:
@@ -2852,23 +3194,32 @@ def submit_recovery(
                 (campaign["id"],),
             ).fetchall()
         }
+        attempt_row = connection.execute(
+            """SELECT COALESCE(max(attempt_number),0)+1 AS attempt_number
+               FROM ai_annotation_campaign_recoveries WHERE campaign_id=%s""",
+            (campaign["id"],),
+        ).fetchone()
+        assert attempt_row is not None
+        attempt_number = int(attempt_row["attempt_number"])
+        if (
+            recovery_mode == "classification_retry"
+            and attempt_number > MAX_CAMPAIGN_RECOVERY_ATTEMPTS
+        ):
+            raise CampaignError(
+                f"campaign recovery allows at most {MAX_CAMPAIGN_RECOVERY_ATTEMPTS} append-only attempts"
+            )
         selected_source_rows: dict[str, dict[str, Any]] = {}
 
         def eligible_result(result: dict[str, Any]) -> bool:
-            if recovery_mode == "evidence_only":
-                record_id = result.get("record_id")
-                return (
-                    _evidence_failure_for_repair(result)
-                    and _stored_frozen_classification(result) is not None
-                    and isinstance(_stored_model_evidence(result), list)
-                    and bool(_stored_model_evidence(result))
-                    and isinstance(record_id, str)
-                    and previous_record_attempts.get(record_id, 0) < MAX_CAMPAIGN_RECOVERY_ATTEMPTS
-                )
-            return _recovery_retry_eligible(
+            record_id = result.get("record_id")
+            return isinstance(record_id, str) and _recovery_record_eligible(
                 result,
+                recovery_mode=recovery_mode,
+                record_attempts=previous_record_attempts.get(record_id, 0),
                 is_luna=is_luna,
                 preserve_evidence_failures=preserve_evidence_failures,
+                full_retry_attempt_available=attempt_number
+                <= MAX_CAMPAIGN_RECOVERY_ATTEMPTS,
             )
 
         unresolved_digest = hashlib.sha256(b"[")
@@ -2892,22 +3243,6 @@ def submit_recovery(
         if not unresolved_count:
             raise CampaignError("campaign has no unresolved retry-eligible records")
         unresolved_hash = unresolved_digest.hexdigest()
-        attempt_row = connection.execute(
-            """
-            SELECT COALESCE(max(attempt_number),0)+1 AS attempt_number
-            FROM ai_annotation_campaign_recoveries WHERE campaign_id=%s
-            """,
-            (campaign["id"],),
-        ).fetchone()
-        assert attempt_row is not None
-        attempt_number = int(attempt_row["attempt_number"])
-        if (
-            recovery_mode != "evidence_only"
-            and attempt_number > MAX_CAMPAIGN_RECOVERY_ATTEMPTS
-        ):
-            raise CampaignError(
-                f"campaign recovery allows at most {MAX_CAMPAIGN_RECOVERY_ATTEMPTS} append-only attempts"
-            )
         if is_luna:
             if campaign.get("authorized_at") is None or campaign.get("authorized_spend_ceiling_usd") is None:
                 raise CampaignError("Luna recovery requires the original spend authorization")
@@ -3929,9 +4264,16 @@ def validate_campaign(
 
 
 def import_campaign(
-    settings: WebSettings, principal: Principal, public_id: str
+    settings: WebSettings,
+    principal: Principal,
+    public_id: str,
+    confirmation: str,
 ) -> dict[str, Any]:
     _require_admin(principal)
+    if confirmation != PARTIAL_IMPORT_CONFIRMATION:
+        raise CampaignError(
+            f"prediction import requires typing {PARTIAL_IMPORT_CONFIRMATION}"
+        )
     with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
         campaign = connection.execute(
             "SELECT * FROM ai_annotation_campaigns WHERE public_id::text=%s FOR UPDATE",
@@ -3939,10 +4281,18 @@ def import_campaign(
         ).fetchone()
         if campaign is None:
             raise LookupError("AI annotation campaign not found")
-        if campaign["status"] == "IMPORTED":
+        if campaign["status"] in {"IMPORTED", "PARTIALLY_IMPORTED"}:
             return dict(campaign)
         if campaign["status"] != "VALIDATED" or campaign["model_prediction_run_id"] is not None:
             raise CampaignError("campaign is not ready for a first prediction import")
+        active_recovery = connection.execute(
+            """SELECT 1 FROM ai_annotation_campaign_recoveries
+               WHERE campaign_id=%s AND status IN
+                 ('PREPARING','SUBMITTED','RUNNING','PROVIDER_COMPLETED') LIMIT 1""",
+            (campaign["id"],),
+        ).fetchone()
+        if active_recovery is not None:
+            raise CampaignError("campaign cannot be imported while recovery is active")
         artifact = _current_effective_artifact_directory(
             dict(campaign), _collected_recoveries(connection, int(campaign["id"]))
         )
@@ -3982,13 +4332,15 @@ def import_campaign(
         ).fetchone()
         if run is None:
             raise CampaignError("prediction importer did not produce a linked run")
+        partial = int(campaign.get("terminal_invalid_count") or 0) > 0
+        target_status = "PARTIALLY_IMPORTED" if partial else "IMPORTED"
         updated = connection.execute(
             """
-            UPDATE ai_annotation_campaigns SET status='IMPORTED',imported_at=now(),
+            UPDATE ai_annotation_campaigns SET status=%s,imported_at=now(),
                    model_prediction_run_id=%s
-            WHERE id=%s AND model_prediction_run_id IS NULL RETURNING *
+            WHERE id=%s AND status='VALIDATED' AND model_prediction_run_id IS NULL RETURNING *
             """,
-            (run["id"], campaign["id"]),
+            (target_status, run["id"], campaign["id"]),
         ).fetchone()
         if updated is None:
             raise CampaignError("campaign was already linked during import")

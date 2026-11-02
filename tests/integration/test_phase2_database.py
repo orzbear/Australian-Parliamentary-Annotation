@@ -1837,7 +1837,9 @@ def test_provider_refusals_import_separately_and_exclude_same_configuration(
     assert validate_campaign(
         settings, admin, str(lifecycle["public_id"])
     )["status"] == "VALIDATED"
-    imported = import_campaign(settings, admin, str(lifecycle["public_id"]))
+    imported = import_campaign(
+        settings, admin, str(lifecycle["public_id"]), "IMPORT VALID RECORDS"
+    )
     assert imported["status"] == "IMPORTED"
 
     with psycopg.connect(url) as connection:
