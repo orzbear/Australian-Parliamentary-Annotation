@@ -140,7 +140,7 @@ def build_report(
         if total_turns is None:
             raise PreflightError("could not count current corpus turns")
         eligible_rows = connection.execute(
-            """SELECT turn.id::text AS id,turn.turn_key,
+            '''SELECT turn.id::text AS id,turn.turn_key,
                       turn.text_clean,turn.text_raw,
                       sha256(convert_to(turn.turn_key || ':' || %s,'UTF8')) AS selection_hash
                FROM speaker_turns turn
@@ -158,7 +158,7 @@ def build_report(
                        THEN btrim(turn.text_clean)<>''
                        WHEN turn.text_raw IS NOT NULL AND turn.text_raw<>''
                        THEN btrim(turn.text_raw)<>'' ELSE false END
-               ORDER BY selection_hash,turn.turn_key COLLATE "C""",
+               ORDER BY selection_hash,turn.turn_key COLLATE "C"''',
             (seed, corpus["id"]),
         ).fetchall()
         eligible_ids = [str(row["id"]) for row in eligible_rows]
