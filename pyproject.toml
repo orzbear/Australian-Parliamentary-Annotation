@@ -43,6 +43,9 @@ hansard-web = "hansard_annotator.web.cli:main"
 hansard-llm-eval = "hansard_annotator.llm_eval.cli:main"
 hansard-llm-ops = "hansard_annotator.llm_eval.ops_cli:main"
 hansard-campaign-worker = "hansard_annotator.web.campaigns.worker:main"
+hansard-hostility-preflight = "hansard_annotator.llm_eval.hostility_preflight:main"
+hansard-campaign-artifacts = "hansard_annotator.llm_eval.campaign_artifact_backup:main"
+hansard-hostility-export = "hansard_annotator.web.research_exports.canonical_hostility:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
