@@ -121,6 +121,14 @@ def test_preflight_uses_read_only_queries_and_is_deterministic(tmp_path) -> None
     assert "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY" in connection.statements
     assert all(statement.startswith(("SELECT", "WITH", "SET TRANSACTION"))
                for statement in connection.statements)
+    selection_queries = [
+        statement for statement in connection.statements if "selection_hash" in statement
+    ]
+    assert len(selection_queries) == 2
+    assert all(
+        'ORDER BY selection_hash,turn.turn_key COLLATE "C"' in statement
+        for statement in selection_queries
+    )
     hash_payload = {key: value for key, value in first.items() if key != "sha256"}
     expected_hash = hashlib.sha256(
         json.dumps(hash_payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
