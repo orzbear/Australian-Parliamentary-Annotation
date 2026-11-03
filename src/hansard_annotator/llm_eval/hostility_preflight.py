@@ -5,8 +5,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
+import tempfile
 from collections import Counter
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -21,13 +24,71 @@ from hansard_annotator.web.campaigns.configurations import (
     approved_configuration,
 )
 from hansard_annotator.web.campaigns.phase4e import (
+    CHARACTERS_PER_TOKEN,
+    INVARIANT_INPUT_TOKENS,
     deterministic_chunks,
-    estimate_record_input_tokens,
 )
 
 
 class PreflightError(ValueError):
     """The requested production plan cannot be safely reconciled."""
+
+
+FETCH_BATCH_SIZE = 2_000
+
+
+def _server_rows(
+    connection: psycopg.Connection[dict[str, Any]],
+    *,
+    name: str,
+    query: str,
+    params: tuple[Any, ...] = (),
+) -> Iterator[dict[str, Any]]:
+    """Stream a potentially large query using a PostgreSQL server-side cursor."""
+    cursor = connection.cursor(name=name)
+    try:
+        cursor.itersize = FETCH_BATCH_SIZE
+        cursor.execute(query, params)
+        while rows := cursor.fetchmany(FETCH_BATCH_SIZE):
+            yield from rows
+    finally:
+        cursor.close()
+
+
+def _input_tokens_from_utf8_bytes(byte_length: int) -> int:
+    """Match the Phase 4E estimate without materialising canonical speech text."""
+    return INVARIANT_INPUT_TOKENS + max(
+        1, math.ceil(byte_length / CHARACTERS_PER_TOKEN)
+    )
+
+
+def _report_sha256(report: dict[str, Any]) -> str:
+    encoder = json.JSONEncoder(
+        sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    )
+    digest = hashlib.sha256()
+    for segment in encoder.iterencode(report):
+        digest.update(segment.encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _write_report_atomically(path: Path, report: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="\n", dir=path.parent,
+            prefix=f".{path.name}.", suffix=".tmp", delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            json.dump(report, temporary, sort_keys=True, ensure_ascii=False, indent=2)
+            temporary.write("\n")
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def fits_enqueued_token_budget(
@@ -139,9 +200,12 @@ def build_report(
         ).fetchone()
         if total_turns is None:
             raise PreflightError("could not count current corpus turns")
-        eligible_rows = connection.execute(
+        eligible_query = (
             '''SELECT turn.id::text AS id,turn.turn_key,
-                      turn.text_clean,turn.text_raw,
+                      CASE WHEN turn.text_clean IS NOT NULL AND turn.text_clean<>''
+                        THEN octet_length(convert_to(turn.text_clean,'UTF8'))
+                        ELSE octet_length(convert_to(COALESCE(turn.text_raw,''),'UTF8'))
+                      END AS canonical_text_utf8_bytes,
                       sha256(convert_to(turn.turn_key || ':' || %s,'UTF8')) AS selection_hash
                FROM speaker_turns turn
                JOIN reconstruction_runs reconstruction ON reconstruction.id=turn.reconstruction_run_id
@@ -158,18 +222,28 @@ def build_report(
                        THEN btrim(turn.text_clean)<>''
                        WHEN turn.text_raw IS NOT NULL AND turn.text_raw<>''
                        THEN btrim(turn.text_raw)<>'' ELSE false END
-               ORDER BY selection_hash,turn.turn_key COLLATE "C"''',
-            (seed, corpus["id"]),
-        ).fetchall()
-        eligible_ids = [str(row["id"]) for row in eligible_rows]
+               ORDER BY selection_hash,turn.turn_key COLLATE "C"'''
+        )
+        eligible_rows: list[tuple[str, str, int]] = []
+        for row in _server_rows(
+            connection,
+            name="hostility_preflight_eligible",
+            query=eligible_query,
+            params=(seed, corpus["id"]),
+        ):
+            eligible_rows.append((
+                str(row["id"]), str(row["turn_key"]),
+                int(row["canonical_text_utf8_bytes"]),
+            ))
+        eligible_ids = [row[0] for row in eligible_rows]
         exact_run = """provider=%s AND configured_model=%s AND prompt_version=%s
             AND prompt_sha256=%s AND canonical_schema_sha256=%s
             AND prediction_contract_sha256=%s AND provider_schema_sha256=%s
             AND generation_config=%s::jsonb AND execution_mode=%s
             AND prediction_task='hostility' AND status='imported'"""
         exact_values = (*config_params[:7], config_params[7], config_params[8])
-        matched = connection.execute(
-            f"""SELECT turn.id::text AS id,
+        matched_query = f"""WITH matched AS (
+                SELECT turn.id::text AS id,
                     count(DISTINCT prediction.id) AS predictions,
                     count(DISTINCT abstention.id) AS terminal_outcomes,
                         count(DISTINCT abstention.id) FILTER
@@ -190,25 +264,34 @@ def build_report(
                 LEFT JOIN model_prediction_outcome_reviews review ON review.abstention_id=abstention.id
                   AND review.resolution_method IS NOT NULL
                 WHERE corpus.id=%s AND (prediction.id IS NOT NULL OR abstention.id IS NOT NULL)
-                GROUP BY turn.id""",
+                GROUP BY turn.id
+            )
+            SELECT COALESCE(array_agg(id ORDER BY id) FILTER (WHERE predictions=1),ARRAY[]::text[]) AS completed_ids,
+                   COALESCE(array_agg(id ORDER BY id) FILTER (WHERE terminal_outcomes=1),ARRAY[]::text[]) AS terminal_ids,
+                   count(*) FILTER (WHERE predictions>1 OR terminal_outcomes>1
+                     OR (predictions>0 AND terminal_outcomes>0)) AS conflict_count,
+                   (COALESCE(array_agg(id ORDER BY id) FILTER (WHERE predictions>1 OR terminal_outcomes>1
+                     OR (predictions>0 AND terminal_outcomes>0)),ARRAY[]::text[]))[1:20] AS conflict_ids,
+                   COALESCE(sum(terminal_invalid),0)::bigint AS terminal_invalid,
+                   COALESCE(sum(provider_refusals),0)::bigint AS provider_refusals,
+                   COALESCE(sum((manual_reviews>0)::integer),0)::bigint AS manual_reviews
+            FROM matched"""
+        outcomes = connection.execute(
+            matched_query,
             (*exact_values, *exact_values, corpus["id"]),
-        ).fetchall()
-        duplicate_rows = [
-            row
-            for row in matched
-            if int(row["predictions"]) > 1 or int(row["terminal_outcomes"]) > 1
-            or (int(row["predictions"]) and int(row["terminal_outcomes"]))
-        ]
-        if duplicate_rows:
+        ).fetchone()
+        if outcomes is None:
+            raise PreflightError("could not reconcile imported hostility outcomes")
+        if int(outcomes["conflict_count"]):
             raise PreflightError(
                 "conflicting or duplicate exact-configuration outcomes: "
-                + ", ".join(str(row["id"]) for row in duplicate_rows[:20])
+                + ", ".join(str(item) for item in outcomes["conflict_ids"])
             )
-        completed = [str(row["id"]) for row in matched if int(row["predictions"]) == 1]
-        terminal = [str(row["id"]) for row in matched if int(row["terminal_outcomes"]) == 1]
-        terminal_invalid_count = sum(int(row["terminal_invalid"]) for row in matched)
-        provider_refusal_count = sum(int(row["provider_refusals"]) for row in matched)
-        manual = sum(int(row["manual_reviews"]) > 0 for row in matched)
+        completed = [str(item) for item in outcomes["completed_ids"]]
+        terminal = [str(item) for item in outcomes["terminal_ids"]]
+        terminal_invalid_count = int(outcomes["terminal_invalid"])
+        provider_refusal_count = int(outcomes["provider_refusals"])
+        manual = int(outcomes["manual_reviews"])
         active_tokens = connection.execute(
             """WITH active_batches AS (
                  SELECT COALESCE(sum(batch.estimated_input_tokens),0)::bigint AS tokens
@@ -231,7 +314,7 @@ def build_report(
         ).fetchone()
         if active_tokens is None:
             raise PreflightError("could not account for active Gemini Batch jobs")
-        active_campaign_rows = connection.execute(
+        active_campaign_query = (
             """SELECT campaign.public_id::text AS public_id,campaign.name,campaign.status,
                       campaign.provider,campaign.configured_model,campaign.prompt_sha256,
                       campaign.canonical_schema_sha256,campaign.prediction_contract_sha256,
@@ -243,32 +326,19 @@ def build_report(
                  WHERE campaign.prediction_task='hostility'
                  AND campaign.status NOT IN ('DRAFT','IMPORTED')
                  AND campaign.corpus_id=%s
-               ORDER BY campaign.created_at,campaign.id,record.selection_order""",
-            (corpus["id"],),
-        ).fetchall()
-        accepted_outcome_ids = set(completed) | set(terminal)
-        exact_active_members = [
-            str(row["turn_id"])
-            for row in active_campaign_rows
-            if row["turn_id"] is not None
-            and row["provider"] == "gemini"
-            and row["configured_model"] == "gemini-2.5-flash"
-            and row["prompt_sha256"].strip() == approved_configuration(GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID).prompt_sha256
-            and row["canonical_schema_sha256"].strip() == approved_configuration(GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID).canonical_schema_sha256
-            and row["prediction_contract_sha256"].strip() == approved_configuration(GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID).prediction_contract_sha256
-            and row["provider_schema_sha256"].strip() == approved_configuration(GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID).provider_schema_sha256
-            and row["generation_config"] == approved_configuration(GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID).generation_config
-            and row["execution_mode"] == approved_configuration(GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID).execution_mode
-            and str(row["turn_id"]) not in accepted_outcome_ids
-        ]
-        eligible_set = set(eligible_ids)
-        stale_active_ids = sorted(set(exact_active_members) - eligible_set)
-        current_active_members = [item for item in exact_active_members if item in eligible_set]
-        reconciliation = reconcile_sets(
-            eligible_ids, completed, terminal, active_ids=current_active_members
+               ORDER BY campaign.created_at,campaign.id,record.selection_order"""
         )
+        accepted_outcome_ids = set(completed) | set(terminal)
+        frozen_config = approved_configuration(GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID)
+        exact_active_members: list[str] = []
+        other_configuration_active_members: list[str] = []
         active_campaign_summaries: dict[str, dict[str, Any]] = {}
-        for row in active_campaign_rows:
+        for row in _server_rows(
+            connection,
+            name="hostility_preflight_active_campaigns",
+            query=active_campaign_query,
+            params=(corpus["id"],),
+        ):
             key = str(row["public_id"])
             active_campaign_summaries.setdefault(
                 key,
@@ -277,46 +347,65 @@ def build_report(
                     "planned_count", "record_set_sha256",
                 )},
             )
-        active_exact_duplicates = reconciliation["duplicate_active_ids"]
-        other_configuration_active_members = [
-            str(row["turn_id"])
-            for row in active_campaign_rows
-            if row["turn_id"] is not None
-            and not (
-                row["provider"] == "gemini"
-                and row["configured_model"] == "gemini-2.5-flash"
-                and row["prompt_sha256"].strip() == approved_configuration(GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID).prompt_sha256
-                and row["canonical_schema_sha256"].strip() == approved_configuration(GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID).canonical_schema_sha256
-                and row["prediction_contract_sha256"].strip() == approved_configuration(GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID).prediction_contract_sha256
-                and row["provider_schema_sha256"].strip() == approved_configuration(GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID).provider_schema_sha256
-                and row["generation_config"] == approved_configuration(GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID).generation_config
-                and row["execution_mode"] == approved_configuration(GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID).execution_mode
+            if row["turn_id"] is None:
+                continue
+            turn_id = str(row["turn_id"])
+            exact_configuration = (
+                row["provider"] == frozen_config.provider
+                and row["configured_model"] == frozen_config.configured_model
+                and row["prompt_sha256"].strip() == frozen_config.prompt_sha256
+                and row["canonical_schema_sha256"].strip() == frozen_config.canonical_schema_sha256
+                and row["prediction_contract_sha256"].strip() == frozen_config.prediction_contract_sha256
+                and row["provider_schema_sha256"].strip() == frozen_config.provider_schema_sha256
+                and row["generation_config"] == frozen_config.generation_config
+                and row["execution_mode"] == frozen_config.execution_mode
             )
-        ]
+            if exact_configuration:
+                if turn_id not in accepted_outcome_ids:
+                    exact_active_members.append(turn_id)
+            else:
+                other_configuration_active_members.append(turn_id)
+        eligible_set = set(eligible_ids)
+        stale_active_ids = sorted(set(exact_active_members) - eligible_set)
+        current_active_members = [item for item in exact_active_members if item in eligible_set]
+        reconciliation = reconcile_sets(
+            eligible_ids, completed, terminal, active_ids=current_active_members
+        )
+        active_exact_duplicates = reconciliation["duplicate_active_ids"]
         other_configuration_active_overlap = sorted(
             set(other_configuration_active_members) & set(reconciliation["remaining_ids"])
         )
-        records = []
-        lookup = {str(row["id"]): row for row in eligible_rows}
-        for order, record_id in enumerate(reconciliation["remaining_ids"]):
-            row = lookup[record_id]
-            text_value = row["text_clean"] or row["text_raw"] or ""
-            records.append(
-                {
-                    "selection_order": order,
-                    "turn_id": record_id,
-                    "turn_key": str(row["turn_key"]),
-                    "record_id": f"turn:{row['turn_key']}",
-                    "estimated_input_tokens": estimate_record_input_tokens(text_value),
+        remaining_ids_set = set(reconciliation["remaining_ids"])
+        remaining_turn_ids: list[str] = []
+        remaining_turn_keys: list[str] = []
+        remaining_record_ids: list[str] = []
+
+        def planned_records(
+            source_rows: list[tuple[str, str, int]], remaining_ids: set[str]
+        ) -> Iterator[dict[str, Any]]:
+            selection_order = 0
+            for turn_id, turn_key, text_bytes in source_rows:
+                if turn_id not in remaining_ids:
+                    continue
+                record_id = f"turn:{turn_key}"
+                remaining_turn_ids.append(turn_id)
+                remaining_turn_keys.append(turn_key)
+                remaining_record_ids.append(record_id)
+                yield {
+                    "selection_order": selection_order,
+                    "record_id": record_id,
+                    "estimated_input_tokens": _input_tokens_from_utf8_bytes(text_bytes),
                 }
-            )
-        chunks = list(
-            deterministic_chunks(
-                records,
-                max_records=max_records_per_chunk,
-                max_input_tokens=safe_ceiling,
-            )
-        )
+                selection_order += 1
+
+        eligible_count = len(eligible_rows)
+        chunks = list(deterministic_chunks(
+            planned_records(eligible_rows, remaining_ids_set),
+            max_records=max_records_per_chunk,
+            max_input_tokens=safe_ceiling,
+        ))
+        del eligible_rows
+        del remaining_ids_set
         pilot = connection.execute(
             """SELECT COALESCE(sum(run.output_tokens),0)::bigint AS output_tokens,
                       COALESCE(sum(run.requested_count),0)::bigint AS requested_count,
@@ -352,12 +441,12 @@ def build_report(
         unknown_legacy_jobs = int(active_tokens["unknown_legacy_jobs"])
     pricing = load_pricing(Path("config/llm_eval/pricing.yaml"))
     model_pricing = pricing["models"]["gemini:gemini-2.5-flash"]["modes"]["batch"]
-    input_tokens = sum(int(item["estimated_input_tokens"]) for item in records)
+    input_tokens = sum(chunk.estimated_input_tokens for chunk in chunks)
     # Output estimation deliberately uses the 1,000-record pilot's measured per-record output.
     output_per_record = (
         pilot_output_tokens / pilot_requested_count if pilot_requested_count else None
     )
-    output_tokens = int(len(records) * output_per_record) if output_per_record is not None else None
+    output_tokens = int(len(remaining_record_ids) * output_per_record) if output_per_record is not None else None
     estimated_cost = None
     if output_tokens is not None:
         estimated_cost = (
@@ -378,8 +467,8 @@ def build_report(
             + output_tokens * float(model_pricing["output_per_million_usd"])
         ) / 1_000_000
         if pilot_requested_count:
-            projected_cache_storage_cost = pilot_cache_storage_cost / pilot_requested_count * len(records)
-            projected_recovery_cost = actual_pilot_recovery_cost / pilot_requested_count * len(records)
+            projected_cache_storage_cost = pilot_cache_storage_cost / pilot_requested_count * len(remaining_record_ids)
+            projected_recovery_cost = actual_pilot_recovery_cost / pilot_requested_count * len(remaining_record_ids)
     max_chunk_tokens = max((chunk.estimated_input_tokens for chunk in chunks), default=0)
     quota_fits = fits_enqueued_token_budget(
         active_job_tokens, max_chunk_tokens, google_enqueued_token_limit, unknown_legacy_jobs
@@ -404,23 +493,23 @@ def build_report(
         },
         "corpus": {"public_id": str(corpus["public_id"]), "slug": corpus["slug"],
                    "preprocessing_run_id": corpus["current_preprocessing_run_id"]},
-        "counts": {"canonical_turns": int(total_turns["total"]), "hostility_eligible_turns": len(eligible_rows),
-                   "not_hostility_eligible": int(total_turns["total"]) - len(eligible_rows),
+        "counts": {"canonical_turns": int(total_turns["total"]), "hostility_eligible_turns": eligible_count,
+                   "not_hostility_eligible": int(total_turns["total"]) - eligible_count,
                    "excluded_accepted_or_active": len(set(completed) | set(terminal) | set(current_active_members)),
                    **{k: v for k, v in reconciliation.items() if k.endswith("_count")},
-                   "manual_resolutions": manual, "remaining": len(records)},
+                   "manual_resolutions": manual, "remaining": len(remaining_record_ids)},
         "existing_terminal_invalid_outcomes": terminal_invalid_count,
         "existing_provider_refusals": provider_refusal_count,
-        "remaining_turn_ids": [item["turn_id"] for item in records],
-        "remaining_turn_keys": [item["turn_key"] for item in records],
+        "remaining_turn_ids": remaining_turn_ids,
+        "remaining_turn_keys": remaining_turn_keys,
         "active_campaigns": list(active_campaign_summaries.values()),
         "pending_exact_campaign_turn_ids": sorted(set(exact_active_members)),
         "overlapping_active_turn_ids": active_exact_duplicates,
         "stale_active_turn_ids": stale_active_ids,
         "other_configuration_active_overlap_turn_ids": other_configuration_active_overlap,
         "selection": {"seed": seed, "ordering": "sha256(turn_key + ':' + seed), turn_key COLLATE C"},
-        "remaining_record_ids": [item["record_id"] for item in records],
-        "remaining_record_set_sha256": canonical_hash([x["record_id"] for x in records]),
+        "remaining_record_ids": remaining_record_ids,
+        "remaining_record_set_sha256": canonical_hash(remaining_record_ids),
         "expected_provider_job_count": len(chunks),
         "max_estimated_enqueued_tokens": max_chunk_tokens,
         "chunks": [{"number": item.chunk_number, "records": item.record_count,
@@ -454,14 +543,13 @@ def build_report(
                   "active_jobs_with_unknown_token_usage": unknown_legacy_jobs,
                   "operator_confirmation_required": True},
         "readiness": {"provider_calls_made": False, "database_writes": False,
-                      "ready": bool(records) and output_tokens is not None and not exact_active_members and not active_exact_duplicates and not stale_active_ids and quota_fits,
+                      "ready": bool(remaining_record_ids) and output_tokens is not None and not exact_active_members and not active_exact_duplicates and not stale_active_ids and quota_fits,
                       "blocking_issues": (["records remain assigned to another non-imported exact-configuration campaign"] if exact_active_members else []) + (["exact-configuration campaigns overlap on unresolved turn IDs"] if active_exact_duplicates else []) + (["exact-configuration campaigns include unresolved turns outside the current corpus"] if stale_active_ids else []) + (["measured pilot output-token usage unavailable"] if output_tokens is None else []) + (["active Gemini jobs have unknown token usage"] if unknown_legacy_jobs else []) + (["active jobs plus the next planned chunk exceed the operator-confirmed Batch token limit"] if quota_exceeded else []),
                       "checks": ["exact frozen configuration", "current canonical corpus", "set-based coverage", "deterministic chunk plan", "quota value supplied by operator"]},
     }
-    canonical_json = json.dumps(report, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
-    report["sha256"] = hashlib.sha256(canonical_json).hexdigest()
+    report["sha256"] = _report_sha256(report)
     if output_path is not None:
-        output_path.write_text(json.dumps(report, sort_keys=True, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        _write_report_atomically(output_path, report)
     return report
 
 
