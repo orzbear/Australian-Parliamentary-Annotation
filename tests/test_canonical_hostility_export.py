@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -111,6 +112,95 @@ def test_export_query_pins_all_frozen_fields_and_reports_overlap_counts() -> Non
     assert parameters[-1] == "batch"
     assert "count(*) OVER() AS prediction_count" in query
     assert "count(*) OVER() AS outcome_count" in query
+
+
+def _projection_names(select_list: str) -> set[str]:
+    expressions: list[str] = []
+    depth = 0
+    start = 0
+    for index, character in enumerate(select_list):
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+        elif character == "," and depth == 0:
+            expressions.append(select_list[start:index])
+            start = index + 1
+    expressions.append(select_list[start:])
+
+    names: set[str] = set()
+    for expression in expressions:
+        alias = re.search(r"\bAS\s+([a-z_][a-z0-9_]*)\s*$", expression, re.IGNORECASE)
+        if alias:
+            names.add(alias.group(1).lower())
+        else:
+            direct_column = re.search(r"\.([a-z_][a-z0-9_]*)\s*$", expression.strip())
+            if direct_column:
+                names.add(direct_column.group(1).lower())
+    return names
+
+
+def test_export_cte_projections_match_outer_references_and_migration_schema() -> None:
+    query = _query()
+    outer_select = query[
+        query.index("SELECT corpus.public_id") : query.index("FROM corpora corpus")
+    ]
+    projections = {
+        "prediction": (
+            query[
+                query.index("SELECT count(*) OVER() AS prediction_count") : query.index(
+                    "FROM model_predictions mp",
+                    query.index("SELECT count(*) OVER() AS prediction_count"),
+                )
+            ],
+            "prediction_count",
+        ),
+        "terminal": (
+            query[
+                query.index("SELECT count(*) OVER() AS outcome_count") : query.index(
+                    "FROM model_prediction_abstentions outcome"
+                )
+            ],
+            "outcome_count",
+        ),
+    }
+    for alias, (projection, _) in projections.items():
+        select_index = projection.upper().index("SELECT")
+        select_list = projection[select_index + len("SELECT") :]
+        projected = _projection_names(select_list)
+        referenced = {
+            name.lower()
+            for name in re.findall(rf"\b{alias}\.([a-z_][a-z0-9_]*)", outer_select, re.I)
+        }
+        assert referenced <= projected, f"{alias} references missing projection(s): {referenced - projected}"
+
+    abstention_migration = Path(
+        "migrations/versions/20261020_10_provider_abstentions.py"
+    ).read_text(encoding="utf-8")
+    outcome_migration = Path(
+        "migrations/versions/20261027_13_terminal_prediction_outcomes.py"
+    ).read_text(encoding="utf-8")
+    table_definition = re.search(
+        r"CREATE TABLE model_prediction_abstentions \((.*?)\n\s*\);",
+        abstention_migration,
+        re.DOTALL,
+    )
+    assert table_definition is not None
+    schema_columns = set(
+        re.findall(
+            r"^\s+([a-z_][a-z0-9_]*)\s+(?:bigint|uuid|text|jsonb|timestamptz)\b",
+            table_definition.group(1),
+            re.MULTILINE | re.IGNORECASE,
+        )
+    )
+    assert "resolution_type" in schema_columns
+    assert "RENAME COLUMN refusal_provenance TO outcome_provenance" in outcome_migration
+    schema_columns.discard("refusal_provenance")
+    schema_columns.add("outcome_provenance")
+    selected_outcome_columns = set(re.findall(r"\boutcome\.([a-z_][a-z0-9_]*)", query, re.I))
+    assert selected_outcome_columns <= schema_columns
+    terminal_projection, _ = projections["terminal"]
+    assert "outcome.resolution_type" in terminal_projection
 
 
 def test_terminal_provider_refusal_stays_distinct_and_not_a_hostility_no() -> None:
