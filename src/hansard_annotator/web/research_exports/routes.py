@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import FileResponse, Response
 from fastapi.templating import Jinja2Templates
 from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
 
 from hansard_annotator.web.auth.models import Principal
 from hansard_annotator.web.config import WebSettings
@@ -100,8 +101,12 @@ async def download_canonical_ai(
     except (CanonicalAIExportError, OSError, ValueError) as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
     try:
-        export = create_canonical_full_corpus_export(
-            settings, principal, corpus_id, directory
+        export = await run_in_threadpool(
+            create_canonical_full_corpus_export,
+            settings,
+            principal,
+            corpus_id,
+            directory,
         )
     except PermissionError as error:
         cleanup_canonical_export_work_dir(directory, settings.export_work_root)
