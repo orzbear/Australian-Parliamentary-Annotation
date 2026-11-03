@@ -19,7 +19,7 @@ def _active_campaign_ids(settings: WebSettings) -> list[str]:
             """
             SELECT public_id::text FROM ai_annotation_campaigns
             WHERE orchestration_mode='CHUNKED' AND authorized_at IS NOT NULL
-              AND orchestration_status IN ('RUNNING','MAIN_COMPLETE')
+              AND orchestration_status IN ('RUNNING','MAIN_COMPLETE','PAUSED')
             ORDER BY id
             """
         ).fetchall()

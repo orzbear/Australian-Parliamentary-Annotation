@@ -1180,6 +1180,17 @@ def test_campaign_long_actions_disable_and_running_status_auto_polls() -> None:
     assert "PROVIDER_COMPLETED" not in status.split("hx-post", 1)[0]
 
 
+def test_chunk_failure_ui_explains_reconciliation_and_paused_collection() -> None:
+    detail = (ROOT / "src/hansard_annotator/web/templates/campaigns/detail.html").read_text(
+        encoding="utf-8"
+    )
+    assert "Terminal child-job failures are collected and reconciled" in detail
+    assert "Reconcile / collect completed jobs" in detail
+    assert "provider_terminal_state" in detail
+    assert "submission_outcome_uncertain" in detail
+    assert "not automatically resubmitted" in detail
+
+
 def test_campaign_feedback_and_export_completion_copy_are_explicit() -> None:
     routes = (ROOT / "src/hansard_annotator/web/campaigns/routes.py").read_text(
         encoding="utf-8"

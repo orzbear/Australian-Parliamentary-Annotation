@@ -31,7 +31,9 @@ from hansard_annotator.web.campaigns.phase4e import (
     CHUNK_PLANNER_VERSION,
     PHASE4E_ADVISORY_LOCK_NAMESPACE,
     _cache_receipt_for_chunk,
+    _gemini_collection_target,
     _orchestration_tick_locked,
+    _verify_gemini_chunk_identity,
     active_estimated_tokens,
     build_campaign_effective_artifact,
     committed_spend,
@@ -47,6 +49,8 @@ from hansard_annotator.web.campaigns.recovery import (
 from hansard_annotator.web.campaigns.service import (
     GEMINI_BATCH_SCHEMA_SHA256,
     PREDICTION_CONTRACT_SHA256,
+    CampaignError,
+    _original_coverage_complete,
 )
 
 
@@ -173,6 +177,72 @@ def test_worker_holds_cross_transaction_lock_and_uses_lost_receipt_lookup() -> N
     assert "summary_coverage[\"missing_responses\"]" in locked_source
 
 
+def test_terminal_chunk_states_are_collected_and_job_identity_is_verified() -> None:
+    assert _gemini_collection_target({"state": "BATCH_STATE_SUCCEEDED"}) == "PROVIDER_COMPLETED"
+    assert _gemini_collection_target({"state": "BATCH_STATE_FAILED"}) == "PROVIDER_COMPLETED"
+    assert _gemini_collection_target({"state": "BATCH_STATE_EXPIRED"}) == "PROVIDER_COMPLETED"
+    assert _gemini_collection_target({"state": "BATCH_STATE_RUNNING"}) == "RUNNING"
+    chunk = {
+        "provider_job_id": "batches/original-job",
+        "submission_display_name": "frozen-child-name",
+        "configured_model": "gemini-2.5-flash",
+    }
+    _verify_gemini_chunk_identity(
+        {"batch_name": "batches/original-job", "display_name": "frozen-child-name", "model": "models/gemini-2.5-flash"},
+        chunk,
+    )
+    with pytest.raises(CampaignError, match="batch_name"):
+        _verify_gemini_chunk_identity({"batch_name": "batches/different-job"}, chunk)
+
+
+def test_pause_allows_collection_reconciliation_but_blocks_new_submission() -> None:
+    worker_source = Path("src/hansard_annotator/web/campaigns/worker.py").read_text(encoding="utf-8")
+    tick_source = inspect.getsource(_orchestration_tick_locked)
+    assert "'RUNNING','MAIN_COMPLETE','PAUSED'" in worker_source
+    assert "if paused and chunk[\"status\"] == \"SUBMITTING\":" in tick_source
+    assert 'return TickResult("awaiting-submission-reconciliation"' in tick_source
+    assert tick_source.index("connection.commit()") < tick_source.index("provider.submit(plan")
+    assert '"submission_reconciliation_required": True' in tick_source
+    pause_guard = tick_source.split("if paused and chunk[\"status\"] == \"SUBMITTING\":", 1)[1].split(
+        "if chunk[\"status\"] in {\"SUBMITTED\", \"RUNNING\", \"FAILED\"}", 1
+    )[0]
+    assert ".find_batch(" in pause_guard
+    assert ".submit(" not in pause_guard
+
+
+def test_recovery_requires_verified_effective_outcomes_for_failed_chunk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    public_id = "test-campaign"
+    monkeypatch.setenv("HANSARD_CAMPAIGN_ARTIFACT_ROOT", str(tmp_path))
+    campaign_root = tmp_path / f"campaign-{public_id}"
+    child = tmp_path / "child"
+    _chunk(child, [_success("turn:0", 0)], 2)
+    expected = ["turn:0", "turn:1"]
+    frozen_hash = canonical_hash(expected)
+    effective = campaign_root / "effective"
+    summary = build_campaign_effective_artifact(
+        chunk_directories=[child],
+        expected_record_ids=expected,
+        output_directory=effective,
+        provenance=_provenance(),
+    )
+    campaign = {
+        "public_id": public_id,
+        "planned_count": 2,
+        "record_set_sha256": frozen_hash,
+        "artifact_reference": str(effective),
+        "artifact_sha256": summary["artifact_sha256"],
+        "operational_metadata": {"coverage": summary["coverage"]},
+    }
+    _original_coverage_complete(campaign)
+    assert summary["coverage"]["missing"] == 1
+
+    campaign["artifact_sha256"] = "0" * 64
+    with pytest.raises(CampaignError, match="verified effective artifact"):
+        _original_coverage_complete(campaign)
+
+
 def test_watch_worker_isolates_tick_errors_but_one_shot_remains_fail_fast(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -272,7 +342,13 @@ def _repairable(record_id: str, index: int) -> dict[str, Any]:
     }
 
 
-def _chunk(path: Path, rows: list[dict[str, Any]], planned: int) -> None:
+def _chunk(
+    path: Path,
+    rows: list[dict[str, Any]],
+    planned: int,
+    *,
+    batch_state: str | None = None,
+) -> None:
     path.mkdir()
     for name, value in (
         ("plan.json", {}),
@@ -289,6 +365,7 @@ def _chunk(path: Path, rows: list[dict[str, Any]], planned: int) -> None:
         json.dumps(
             {
                 "coverage": {"planned_requests": planned},
+                "batch_status": {"state": batch_state, "error": "provider job failed"} if batch_state else {},
                 "tokens": {},
                 "cost": {},
             }
@@ -357,6 +434,28 @@ def test_aggregate_detects_missing_and_duplicate_identities(tmp_path: Path) -> N
     rows = [json.loads(line) for line in (tmp_path / "effective" / "predictions.jsonl").read_text(encoding="utf-8").splitlines()]
     assert rows[1]["record_id"] == "turn:1"
     assert rows[1]["status"] == "missing"
+
+
+def test_failed_child_job_reconciles_absent_results_as_provider_failures(
+    tmp_path: Path,
+) -> None:
+    child = tmp_path / "failed-child"
+    _chunk(child, [], 2, batch_state="BATCH_STATE_EXPIRED")
+    summary = build_campaign_effective_artifact(
+        chunk_directories=[child],
+        expected_record_ids=["turn:0", "turn:1"],
+        output_directory=tmp_path / "failed-effective",
+        provenance=_provenance(),
+    )
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "failed-effective" / "predictions.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [row["status"] for row in rows] == ["provider_failure", "provider_failure"]
+    assert all("EXPIRED" in row["provider_error"] for row in rows)
+    assert summary["coverage"]["provider_failed"] == 2
+    assert summary["coverage"]["missing"] == 0
+    assert summary["coverage"]["accounting_invariant_ok"] is False
 
 
 def test_streaming_recovery_replaces_missing_without_materializing_campaign(
