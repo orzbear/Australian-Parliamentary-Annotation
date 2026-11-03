@@ -41,6 +41,7 @@ from hansard_annotator.web.campaigns.phase4e import (
     estimate_record_input_tokens,
     orchestration_tick,
     projected_spend_with_candidate,
+    quota_submission_fits,
     submission_fits,
 )
 from hansard_annotator.web.campaigns.recovery import (
@@ -51,6 +52,7 @@ from hansard_annotator.web.campaigns.service import (
     PREDICTION_CONTRACT_SHA256,
     CampaignError,
     _original_coverage_complete,
+    submit_recovery,
 )
 
 
@@ -127,6 +129,18 @@ def test_active_token_quota_and_safety_margin_allow_multiple_chunks() -> None:
         ceiling=10_000_000,
         safety_factor=0.9,
     )
+    assert not quota_submission_fits(
+        active_tokens=2_699_990, unknown_jobs=1, candidate_tokens=1,
+        ceiling=3_000_000, safety_factor=0.9,
+    )
+    assert not quota_submission_fits(
+        active_tokens=2_000_000, unknown_jobs=0, candidate_tokens=700_001,
+        ceiling=3_000_000, safety_factor=0.9,
+    )
+    assert quota_submission_fits(
+        active_tokens=0, unknown_jobs=0, candidate_tokens=2_699_990,
+        ceiling=3_000_000, safety_factor=0.9,
+    )
 
 
 def test_spend_ceiling_reserves_active_work_and_uses_higher_actual_cost() -> None:
@@ -157,6 +171,7 @@ def test_worker_holds_cross_transaction_lock_and_uses_lost_receipt_lookup() -> N
     module_source = Path(
         "src/hansard_annotator/web/campaigns/phase4e.py"
     ).read_text(encoding="utf-8")
+    recovery_source = inspect.getsource(submit_recovery)
     assert "pg_try_advisory_lock" in source
     assert "pg_advisory_unlock" in source
     assert "PHASE4E_ADVISORY_LOCK_NAMESPACE" in source
@@ -175,6 +190,20 @@ def test_worker_holds_cross_transaction_lock_and_uses_lost_receipt_lookup() -> N
         "ensure_campaign_cache("
     )
     assert "summary_coverage[\"missing_responses\"]" in locked_source
+    assert "PHASE4E_GLOBAL_SUBMISSION_LOCK_ID" in source
+    assert "active_batches.tokens+active_legacy.tokens" in locked_source
+    assert "active_batches.unknown_jobs+active_legacy.unknown_jobs+" in locked_source
+    assert "active_recoveries.unknown_jobs" in locked_source
+    assert "recovery.status IN ('PREPARING','SUBMITTED','RUNNING','PROVIDER_COMPLETED')" in locked_source
+    assert "GREATEST(" in locked_source and "batch.input_tokens" in locked_source
+    assert "batch.input_tokens>batch.estimated_input_tokens" in locked_source
+    assert '"quota-usage-review"' in locked_source
+    assert "owner.provider='gemini'" in locked_source
+    assert "authorized_configuration.get(\"first_chunk_only\") is True" in locked_source
+    assert "SET orchestration_status='PAUSED',paused_at=now()" in locked_source
+    assert "GEMINI_HOSTILITY_APPROVED_BATCH_TOKEN_LIMIT = 3_000_000" in module_source
+    assert "pg_advisory_lock" in recovery_source
+    assert "pg_advisory_unlock" in recovery_source
 
 
 def test_terminal_chunk_states_are_collected_and_job_identity_is_verified() -> None:

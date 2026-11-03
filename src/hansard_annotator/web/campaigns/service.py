@@ -71,6 +71,7 @@ from hansard_annotator.llm_eval.providers import _http_json
 from hansard_annotator.web.audit.service import record_event
 from hansard_annotator.web.auth.models import Principal
 from hansard_annotator.web.campaigns.configurations import (
+    GEMINI_HOSTILITY_FULL_PRODUCTION_SEED,
     GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID,
     LUNA_PRODUCTION_CONFIGURATION_ID,
     POLICY_CONFIGURATION_ID,
@@ -116,6 +117,19 @@ LUNA_PRODUCTION_PILOT_SIZE = HOSTILITY_PRODUCTION_PILOT_SIZE
 HOSTILITY_PRODUCTION_CONFIGURATION_IDS = frozenset(
     {GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID, LUNA_PRODUCTION_CONFIGURATION_ID}
 )
+CAMPAIGN_PROVIDER_QUOTA_LOCK_NAMESPACE = 0x50483445
+CAMPAIGN_PROVIDER_QUOTA_LOCK_ID = 0
+
+
+def _assert_full_hostility_preflight_match(
+    seed: str, expected_sha256: str | None, actual_sha256: str
+) -> None:
+    if seed == GEMINI_HOSTILITY_FULL_PRODUCTION_SEED and (
+        expected_sha256 is None or expected_sha256 != actual_sha256
+    ):
+        raise CampaignError(
+            "planned hostility record set differs from the read-only preflight SHA-256"
+        )
 OTHER_EXCLUSION_LABELS = {
     "missing_prompt_text": "No cleaned or raw speech text",
     "hostility_policy_eligibility": (
@@ -1811,6 +1825,7 @@ def plan_campaign(
     seed: str,
     exclude_human_annotated: bool,
     retry_provider_refusals: bool = False,
+    preflight_record_set_sha256: str | None = None,
     _connection: psycopg.Connection[dict[str, Any]] | None = None,
 ) -> PlanResult:
     _require_admin(principal)
@@ -1857,12 +1872,13 @@ def plan_campaign(
                     "hostility production must include human-annotated turns and cannot retry prior failures during selection"
                 )
             full_seed = (
-                "hostility-gemini-25-flash-production-v1"
+                GEMINI_HOSTILITY_FULL_PRODUCTION_SEED
                 if configuration.configuration_id
                 == GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID
                 else "hostility-luna-production-v1"
             )
-            if seed not in {full_seed, HOSTILITY_PRODUCTION_PILOT_SEED}:
+            allowed_seeds = {full_seed, HOSTILITY_PRODUCTION_PILOT_SEED}
+            if seed not in allowed_seeds:
                 raise CampaignError("hostility production selection seed is frozen")
         breakdown = _planning_breakdown(
             connection,
@@ -1938,6 +1954,14 @@ def plan_campaign(
         if configuration.prediction_task == "hostility":
             _assert_hostility_policy_eligible(connection, int(campaign["id"]))
         record_set_sha256 = record_set_hasher.hexdigest()
+        is_verified_gemini_full_selection = (
+            configuration.configuration_id == GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID
+            and seed == GEMINI_HOSTILITY_FULL_PRODUCTION_SEED
+        )
+        if is_verified_gemini_full_selection:
+            _assert_full_hostility_preflight_match(
+                seed, preflight_record_set_sha256, record_set_sha256
+            )
         estimate = estimate_plan(
             selected_count,
             model=configuration.configured_model,
@@ -1961,6 +1985,8 @@ def plan_campaign(
             ],
             "other_exclusion_reasons": breakdown["other_exclusion_reasons"],
             "seed": seed,
+            **({"preflight_record_set_sha256": preflight_record_set_sha256}
+               if is_verified_gemini_full_selection else {}),
             "limit": limit,
             "ordering": "sha256(turn_key + ':' + seed), turn_key",
         }
@@ -3258,7 +3284,7 @@ def _stored_model_evidence(result: dict[str, Any]) -> object:
     return evidence if isinstance(evidence, list) else None
 
 
-def submit_recovery(
+def _submit_recovery_under_quota_lock(
     settings: WebSettings,
     principal: Principal,
     public_id: str,
@@ -3689,6 +3715,37 @@ def submit_recovery(
             raise
         provider_label = "OpenAI" if is_luna else "Gemini"
         raise CampaignError(f"{provider_label} recovery submission failed: {error}") from error
+
+
+def submit_recovery(
+    settings: WebSettings,
+    principal: Principal,
+    public_id: str,
+    confirmation: str,
+    *,
+    gateway: Any | None = None,
+    recovery_mode: str = "classification_retry",
+) -> dict[str, Any]:
+    """Serialize a Gemini recovery submission with quota-controlled chunk jobs."""
+    with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as lock_connection:
+        lock_connection.execute(
+            "SELECT pg_advisory_lock(%s::integer,%s::integer)",
+            (CAMPAIGN_PROVIDER_QUOTA_LOCK_NAMESPACE, CAMPAIGN_PROVIDER_QUOTA_LOCK_ID),
+        )
+        try:
+            return _submit_recovery_under_quota_lock(
+                settings,
+                principal,
+                public_id,
+                confirmation,
+                gateway=gateway,
+                recovery_mode=recovery_mode,
+            )
+        finally:
+            lock_connection.execute(
+                "SELECT pg_advisory_unlock(%s::integer,%s::integer)",
+                (CAMPAIGN_PROVIDER_QUOTA_LOCK_NAMESPACE, CAMPAIGN_PROVIDER_QUOTA_LOCK_ID),
+            )
 
 
 def refresh_recovery(

@@ -328,6 +328,7 @@ async def campaign_plan(
     principal: Annotated[Principal, Depends(require_admin)],
     planned_count: Annotated[int, Form()],
     seed: Annotated[str, Form()],
+    preflight_record_set_sha256: Annotated[str | None, Form()] = None,
     exclude_human_annotated: Annotated[bool, Form()] = DEFAULT_EXCLUDE_HUMAN_ANNOTATED,
     retry_provider_refusals: Annotated[bool, Form()] = False,
 ) -> RedirectResponse:
@@ -339,6 +340,7 @@ async def campaign_plan(
             campaign_id,
             limit=planned_count,
             seed=seed,
+            preflight_record_set_sha256=preflight_record_set_sha256,
             exclude_human_annotated=exclude_human_annotated,
             retry_provider_refusals=retry_provider_refusals,
         )
@@ -557,6 +559,7 @@ async def campaign_authorize_full(
     principal: Annotated[Principal, Depends(require_admin)],
     confirmation: Annotated[str, Form()],
     spend_ceiling_usd: Annotated[Decimal, Form()],
+    first_chunk_only: Annotated[bool, Form()] = False,
 ) -> RedirectResponse:
     await enforce_csrf(request, principal, settings)
     try:
@@ -566,6 +569,7 @@ async def campaign_authorize_full(
             campaign_id,
             confirmation=confirmation,
             spend_ceiling_usd=spend_ceiling_usd,
+            first_chunk_only=first_chunk_only,
         )
     except (CampaignError, LookupError, PermissionError, ValueError) as error:
         raise _http_error(error) from error
