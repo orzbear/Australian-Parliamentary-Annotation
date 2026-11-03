@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import hashlib
 import json
 import os
+import threading
 import zipfile
+from collections.abc import Iterator
 from datetime import UTC, date, datetime
 from pathlib import Path
 
+import pyarrow.parquet as pq
 import pytest
 from fastapi import HTTPException
 from psycopg.types.json import Jsonb
@@ -20,6 +25,7 @@ from hansard_annotator.web.config import (
     MINIMUM_EXPORT_MIN_FREE_BYTES,
     WebSettings,
 )
+from hansard_annotator.web.research_exports import canonical_ai as canonical_ai_module
 from hansard_annotator.web.research_exports import routes as export_routes
 from hansard_annotator.web.research_exports.canonical_ai import (
     CANONICAL_EXPORT_DIR_PREFIX,
@@ -64,6 +70,7 @@ def _raw(**overrides: object) -> dict[str, object]:
         "text_raw": "Useful speech",
         "usable_text": True,
         "prediction_public_id": None,
+        "prediction_task": "policy",
         "prediction_match_count": None,
         "abstention_public_id": None,
         "abstention_match_count": None,
@@ -93,6 +100,10 @@ def test_canonical_query_is_corpus_first_and_exactly_configuration_pinned() -> N
     assert "LEFT JOIN matching_abstentions" in query
     assert "generation_config=%s" in query
     assert "execution_mode=%s AND status='imported'" in query
+    assert "prediction_task='policy'" in query
+    assert "SELECT prediction.*" not in query
+    assert "SELECT abstention.*" not in query
+    assert "raw_provider_response" not in query
     assert 'ORDER BY turn.speech_date,source.relative_path COLLATE "C"' in query
     assert parameters == (
         "gemini",
@@ -206,6 +217,134 @@ def test_outcomes_never_synthesize_abstention_or_no_text_classification() -> Non
     assert no_text["refusal_provenance_json"] is None
 
 
+def test_output_rows_can_reuse_the_export_pinned_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configuration = production_configuration()
+    raw = _raw(prediction_public_id="prediction", prediction_match_count=1)
+    expected = _output_row(raw, 1)
+    expected_parameters = _configuration_parameters(configuration)
+
+    def unexpected_configuration_lookup() -> dict[str, object]:
+        raise AssertionError("configuration should be reused for each export row")
+
+    monkeypatch.setattr(
+        canonical_ai_module, "production_configuration", unexpected_configuration_lookup
+    )
+    actual = _output_row(raw, 1, configuration)
+    assert actual == expected
+    actual_parameters = _configuration_parameters(configuration)
+    assert actual_parameters[:7] == expected_parameters[:7]
+    assert actual_parameters[7].obj == expected_parameters[7].obj  # type: ignore[union-attr]
+    assert actual_parameters[8:] == expected_parameters[8:]
+
+
+def test_canonical_export_streams_one_read_only_query_into_bounded_outputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    row_count = 73
+    statements: list[str] = []
+    row_template = _raw(
+        prediction_public_id="prediction-0",
+        prediction_task="policy",
+        prediction_match_count=1,
+        is_non_policy=False,
+        primary_australian_domain="AU01",
+        secondary_australian_domains=["AU02"],
+        reasoning="Immutable synthetic prediction.",
+        prediction_returned_model=production_configuration()["configured_model"],
+        run_public_id="00000000-0000-0000-0000-000000000002",
+        run_artifact_sha256="a" * 64,
+        run_record_set_sha256="b" * 64,
+        provider_job_id="synthetic-batch",
+        run_imported_at=datetime(2026, 1, 3, tzinfo=UTC),
+    )
+
+    class _Result:
+        def fetchone(self) -> dict[str, object]:
+            return {
+                "public_id": "00000000-0000-0000-0000-000000000001",
+                "slug": "synthetic-house",
+                "name": "Synthetic House",
+                "turn_count": row_count,
+            }
+
+    class _Cursor:
+        itersize = 0
+
+        def __enter__(self) -> _Cursor:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def execute(self, statement: str, _parameters: object) -> None:
+            statements.append(statement)
+            assert statement.lstrip().startswith("WITH matching_runs")
+            assert self.itersize == 16
+
+        def __iter__(self) -> Iterator[dict[str, object]]:
+            for order in range(1, row_count + 1):
+                row = dict(row_template)
+                row.update(
+                    turn_id=order,
+                    turn_key=f"turn-{order:04d}",
+                    turn_sequence=order,
+                    prediction_public_id=f"prediction-{order}",
+                )
+                yield row
+
+    class _Connection:
+        def __enter__(self) -> _Connection:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def execute(self, statement: str, _parameters: object = None) -> _Result:
+            statements.append(statement)
+            normalized = statement.lstrip().upper()
+            assert normalized.startswith(
+                ("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY", "SELECT")
+            )
+            return _Result()
+
+        def cursor(self, *, name: str) -> _Cursor:
+            assert name == "canonical_full_corpus_ai_export"
+            return _Cursor()
+
+    monkeypatch.setattr(
+        canonical_ai_module.psycopg, "connect", lambda *_args, **_kwargs: _Connection()
+    )
+    monkeypatch.setattr(canonical_ai_module, "ROW_BATCH_SIZE", 16)
+    monkeypatch.setattr(canonical_ai_module, "check_export_disk_space", lambda *_args: 1)
+    output = canonical_ai_module.create_canonical_full_corpus_export(
+        _test_settings(tmp_path / "exports"),
+        _admin_principal(),
+        "00000000-0000-0000-0000-000000000001",
+        tmp_path / "streamed-export",
+        generated_at=datetime(2026, 1, 4, tzinfo=UTC),
+    )
+
+    with output.csv_path.open(encoding="utf-8", newline="") as source:
+        csv_rows = list(csv.DictReader(source))
+    parquet_rows = pq.read_table(output.parquet_path).to_pylist()  # type: ignore[no-untyped-call]
+    assert len(csv_rows) == len(parquet_rows) == row_count
+    assert [row["turn_key"] for row in csv_rows] == [
+        row["turn_key"] for row in parquet_rows
+    ]
+    assert [row["corpus_order"] for row in parquet_rows] == list(
+        range(1, row_count + 1)
+    )
+    assert output.manifest["row_count"] == row_count
+    assert output.manifest["outcome_counts"][OUTCOME_PREDICTION] == row_count
+    assert len(statements) == 3  # read-only setup, metadata SELECT, one cursor SELECT
+    assert statements[0].lstrip().upper().startswith("SET TRANSACTION ISOLATION LEVEL")
+    assert output.manifest["files"][output.csv_path.name]["sha256"] == hashlib.sha256(
+        output.csv_path.read_bytes()
+    ).hexdigest()
+
+
 @pytest.mark.parametrize(
     "row,message",
     [
@@ -268,6 +407,14 @@ def test_outcomes_never_synthesize_abstention_or_no_text_classification() -> Non
                 generation_config={"thinking_budget": 0},
             ),
             "non-canonical generation_config",
+        ),
+        (
+            _raw(
+                prediction_public_id="prediction",
+                prediction_match_count=1,
+                prediction_task="hostility",
+            ),
+            "non-policy prediction task",
         ),
     ],
 )
@@ -541,6 +688,69 @@ def test_download_canonical_ai_uses_configured_work_root_and_cleans_up_success(
     assert sibling_file.read_bytes() == b"concurrent-in-progress"
     assert persisted_artifact.exists()
     assert list(default_temp_dir.iterdir()) == []
+
+
+def test_concurrent_canonical_downloads_use_isolated_work_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    work_root = tmp_path / "concurrent-export-work"
+    work_root.mkdir()
+    settings = _test_settings(work_root)
+    barrier = threading.Barrier(2)
+    directories: list[Path] = []
+
+    async def _noop_csrf(
+        _request: Request, _principal: Principal, _settings: WebSettings
+    ) -> None:
+        return None
+
+    def _concurrent_export(
+        _settings: WebSettings,
+        _principal: Principal,
+        _corpus_id: str,
+        output_directory: Path,
+    ) -> CanonicalAIExport:
+        directories.append(output_directory)
+        barrier.wait(timeout=10)
+        csv_path = output_directory / "canonical_full_corpus_ai.csv"
+        parquet_path = output_directory / "canonical_full_corpus_ai.parquet"
+        manifest_path = output_directory / "manifest.json"
+        zip_path = output_directory / "canonical_full_corpus_ai.zip"
+        for path in (csv_path, parquet_path, manifest_path, zip_path):
+            path.write_bytes(output_directory.name.encode())
+        return CanonicalAIExport(
+            output_directory,
+            csv_path,
+            parquet_path,
+            manifest_path,
+            zip_path,
+            {"corpus": {"slug": output_directory.name}},
+        )
+
+    monkeypatch.setattr(export_routes, "enforce_csrf", _noop_csrf)
+    monkeypatch.setattr(export_routes, "check_export_disk_space", lambda *_args: 1)
+    monkeypatch.setattr(
+        export_routes, "create_canonical_full_corpus_export", _concurrent_export
+    )
+
+    async def _download_both() -> tuple[object, object]:
+        return await asyncio.gather(
+            export_routes.download_canonical_ai(
+                _dummy_request(), "corpus-one", settings, _admin_principal()
+            ),
+            export_routes.download_canonical_ai(
+                _dummy_request(), "corpus-two", settings, _admin_principal()
+            ),
+        )
+
+    first, second = asyncio.run(_download_both())
+    assert len(directories) == 2 and directories[0] != directories[1]
+    assert all(directory.parent == work_root for directory in directories)
+    assert Path(first.path).parent != Path(second.path).parent  # type: ignore[attr-defined]
+    for response in (first, second):
+        assert response.background is not None  # type: ignore[attr-defined]
+        asyncio.run(response.background())  # type: ignore[attr-defined]
+    assert list(work_root.iterdir()) == []
 
 
 @pytest.mark.parametrize(

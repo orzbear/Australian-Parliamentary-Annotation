@@ -187,8 +187,10 @@ PARQUET_SCHEMA = pa.schema(
 )
 
 
-def _configuration_parameters() -> tuple[object, ...]:
-    configuration = production_configuration()
+def _configuration_parameters(
+    configuration: dict[str, Any] | None = None,
+) -> tuple[object, ...]:
+    configuration = configuration or production_configuration()
     return (
         configuration["provider"],
         configuration["configured_model"],
@@ -205,14 +207,24 @@ def _configuration_parameters() -> tuple[object, ...]:
 def _canonical_query() -> str:
     return """
         WITH matching_runs AS MATERIALIZED (
-          SELECT * FROM model_prediction_runs
+          SELECT id,public_id,provider,configured_model,returned_model,prompt_version,
+                 prompt_sha256,canonical_schema_sha256,prediction_contract_sha256,
+                 provider_schema_sha256,generation_config,execution_mode,artifact_sha256,
+                 record_set_sha256,provider_job_id,imported_at
+          FROM model_prediction_runs
           WHERE provider=%s AND configured_model=%s AND prompt_version=%s
             AND prompt_sha256=%s AND canonical_schema_sha256=%s
             AND prediction_contract_sha256=%s AND provider_schema_sha256=%s
             AND generation_config=%s AND execution_mode=%s AND status='imported'
+            AND prediction_task='policy'
         ),
         matching_predictions AS (
-          SELECT prediction.*,
+          SELECT prediction.id,prediction.public_id,prediction.speaker_turn_id,
+                 prediction.prediction_task,prediction.is_non_policy,
+                 prediction.primary_australian_domain,
+                 prediction.secondary_australian_domains,prediction.reasoning,
+                 prediction.returned_model,prediction.artifact_reference,
+                 prediction.created_at,
                  run.public_id AS run_public_id,run.provider,run.configured_model,
                  run.returned_model AS run_returned_model,run.prompt_version,
                  run.prompt_sha256,run.canonical_schema_sha256,
@@ -231,11 +243,15 @@ def _canonical_query() -> str:
                  ) AS match_number
           FROM model_predictions prediction
           JOIN matching_runs run ON run.id=prediction.run_id
+            AND prediction.prediction_task='policy'
           LEFT JOIN ai_annotation_campaigns campaign
             ON campaign.model_prediction_run_id=run.id
         ),
         matching_abstentions AS (
-          SELECT abstention.*,
+          SELECT abstention.id,abstention.public_id,abstention.speaker_turn_id,
+                 abstention.resolution_type,abstention.resolution_reason,
+                 abstention.outcome_provenance,abstention.artifact_reference,
+                 abstention.created_at,
                  run.public_id AS run_public_id,run.provider,run.configured_model,
                  run.returned_model AS run_returned_model,run.prompt_version,
                  run.prompt_sha256,run.canonical_schema_sha256,
@@ -369,8 +385,12 @@ def _canonical_json(value: object) -> str | None:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def _verify_row_provenance(raw: dict[str, Any], turn_key: str) -> str | None:
-    configuration = production_configuration()
+def _verify_row_provenance(
+    raw: dict[str, Any],
+    turn_key: str,
+    configuration: dict[str, Any] | None = None,
+) -> str | None:
+    configuration = configuration or production_configuration()
     for field in (
         "provider",
         "configured_model",
@@ -399,7 +419,9 @@ def _verify_row_provenance(raw: dict[str, Any], turn_key: str) -> str | None:
     return None
 
 
-def _output_row(raw: dict[str, Any], order: int) -> dict[str, Any]:
+def _output_row(
+    raw: dict[str, Any], order: int, configuration: dict[str, Any] | None = None
+) -> dict[str, Any]:
     turn_key = str(raw["turn_key"])
     prediction = raw.get("prediction_public_id") is not None
     refusal = raw.get("abstention_public_id") is not None
@@ -416,7 +438,9 @@ def _output_row(raw: dict[str, Any], order: int) -> dict[str, Any]:
         outcome = OUTCOME_NO_USABLE_TEXT
         thinking_level = None
     elif prediction:
-        thinking_level = _verify_row_provenance(raw, turn_key)
+        if raw.get("prediction_task") != "policy":
+            raise CanonicalAIExportError(f"non-policy prediction task for {turn_key}")
+        thinking_level = _verify_row_provenance(raw, turn_key, configuration)
         outcome = OUTCOME_PREDICTION
     elif refusal:
         if (
@@ -424,7 +448,7 @@ def _output_row(raw: dict[str, Any], order: int) -> dict[str, Any]:
             or raw.get("resolution_reason") != "PROHIBITED_CONTENT"
         ):
             raise CanonicalAIExportError(f"unsupported abstention for {turn_key}")
-        thinking_level = _verify_row_provenance(raw, turn_key)
+        thinking_level = _verify_row_provenance(raw, turn_key, configuration)
         outcome = OUTCOME_PROVIDER_REFUSAL
     else:
         raise CanonicalAIExportError(f"usable turn has no production outcome: {turn_key}")
@@ -576,13 +600,15 @@ def _write_deterministic_zip(path: Path, files: list[Path]) -> None:
 
 
 def _rows(
-    connection: psycopg.Connection[dict[str, Any]], corpus_public_id: str
+    connection: psycopg.Connection[dict[str, Any]],
+    corpus_public_id: str,
+    configuration: dict[str, Any],
 ) -> Iterator[dict[str, Any]]:
     with connection.cursor(name="canonical_full_corpus_ai_export") as cursor:
         cursor.itersize = ROW_BATCH_SIZE
         cursor.execute(
             _canonical_query(),
-            (*_configuration_parameters(), corpus_public_id),
+            (*_configuration_parameters(configuration), corpus_public_id),
         )
         for raw in cursor:
             yield dict(raw)
@@ -652,6 +678,7 @@ def create_canonical_full_corpus_export(
     previous_turn_key: str | None = None
     corpus: dict[str, Any] | None = None
     parquet_batch: list[dict[str, Any]] = []
+    configuration = production_configuration()
     with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
         connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
         metadata = connection.execute(
@@ -679,9 +706,9 @@ def create_canonical_full_corpus_export(
                 version="2.6",
                 write_statistics=True,
             ) as parquet_writer:
-                for raw in _rows(connection, corpus_public_id):
+                for raw in _rows(connection, corpus_public_id, configuration):
                     row_count += 1
-                    row = _output_row(raw, row_count)
+                    row = _output_row(raw, row_count, configuration)
                     turn_id = int(row["turn_id"])
                     turn_key = str(row["turn_key"])
                     if turn_id == previous_turn_id or turn_key == previous_turn_key:
@@ -709,7 +736,6 @@ def create_canonical_full_corpus_export(
     expected_count = int(corpus["turn_count"])
     if row_count != expected_count or sum(counts.values()) != expected_count:
         raise CanonicalAIExportError("canonical outcome counts do not reconcile to corpus total")
-    configuration = production_configuration()
     files = {
         csv_path.name: {"sha256": _sha256(csv_path), "bytes": csv_path.stat().st_size},
         parquet_path.name: {
