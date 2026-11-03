@@ -370,6 +370,56 @@ def test_collection_flags_missing_duplicates_failures_and_invalid_predictions() 
     assert coverage["missing_responses"] == 1
 
 
+@pytest.mark.parametrize("state", ["BATCH_STATE_FAILED", "BATCH_STATE_EXPIRED"])
+def test_terminal_failed_gemini_job_can_be_collected_without_fabricating_results(
+    state: str,
+) -> None:
+    batch = {
+        "name": "batches/failed-child",
+        "displayName": "phase4e-child",
+        "model": "models/gemini-2.5-flash",
+        "state": state,
+        "error": {"message": "provider job terminated"},
+        "batchStats": {"requestCount": "2", "successfulRequestCount": "0", "failedRequestCount": "2"},
+    }
+    with pytest.raises(ValueError, match="did not succeed"):
+        collect_inline_batch(
+            batch_value=batch,
+            plan=_batch_plan(),
+            domain_codes=("AU01", "AU02", "AU_OTHER_REVIEW"),
+        )
+    results, coverage = collect_inline_batch(
+        batch_value=batch,
+        plan=_batch_plan(),
+        domain_codes=("AU01", "AU02", "AU_OTHER_REVIEW"),
+        allow_unsuccessful_terminal=True,
+    )
+    assert results == []
+    assert coverage["planned_requests"] == 2
+    assert coverage["collected_responses"] == 0
+    assert coverage["missing_responses"] == 2
+
+
+def test_terminal_failed_job_preserves_available_response_and_marks_only_absence_missing() -> None:
+    results, coverage = collect_inline_batch(
+        batch_value={
+            "state": "BATCH_STATE_FAILED",
+            "error": {"message": "partial provider failure"},
+            "batchStats": {"requestCount": "2", "successfulRequestCount": "1", "failedRequestCount": "1"},
+            "output": {"inlinedResponses": {"inlinedResponses": [
+                {"metadata": {"key": "record-1"}, "response": _gemini_response()}
+            ]}},
+        },
+        plan=_batch_plan(),
+        domain_codes=("AU01", "AU02", "AU_OTHER_REVIEW"),
+        allow_unsuccessful_terminal=True,
+    )
+    assert [result["record_id"] for result in results] == ["record-1"]
+    assert results[0]["status"] == "success"
+    assert coverage["collected_responses"] == 1
+    assert coverage["missing_responses"] == 1
+
+
 @pytest.mark.parametrize("state", ["BATCH_STATE_PENDING", "BATCH_STATE_RUNNING"])
 def test_collection_refuses_non_terminal_batches(state: str) -> None:
     with pytest.raises(ValueError, match="not terminal"):

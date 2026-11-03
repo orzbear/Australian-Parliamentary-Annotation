@@ -1502,6 +1502,7 @@ def get_campaign(
               count(*) FILTER (WHERE status='RUNNING') AS chunks_running,
               count(*) FILTER (WHERE status='PROVIDER_COMPLETED') AS chunks_completed,
               count(*) FILTER (WHERE status='COLLECTED') AS chunks_collected,
+              count(*) FILTER (WHERE status='FAILED') AS chunks_failed,
               COALESCE(sum(record_count),0) AS chunk_records,
               COALESCE(sum(estimated_input_tokens),0) AS chunk_estimated_input_tokens,
               COALESCE(sum(valid_count),0) AS chunk_valid,
@@ -1551,7 +1552,8 @@ def get_campaign(
                        processing_cost_usd,cache_cost_usd,
                        provider_input_file_sha256,provider_input_file_id,
                        provider_output_file_id,provider_output_file_sha256,
-                       provider_error_file_id,provider_error_file_sha256,retry_count
+                       provider_error_file_id,provider_error_file_sha256,retry_count,
+                       failure_metadata
                 FROM ai_annotation_campaign_batches WHERE campaign_id=%s
                 ORDER BY chunk_number LIMIT 20 OFFSET %s
                 """,
@@ -2932,13 +2934,74 @@ def _original_coverage_complete(campaign: dict[str, Any]) -> None:
     if not isinstance(coverage, dict):
         raise CampaignError("campaign has no collected coverage metadata")
     planned = int(campaign["planned_count"])
+    if int(coverage.get("planned_requests") or -1) != planned or int(
+        coverage.get("duplicate_mappings") or 0
+    ) != 0:
+        raise CampaignError("targeted retry requires complete, duplicate-free record planning")
     if (
-        int(coverage.get("planned_requests") or -1) != planned
-        or int(coverage.get("collected_responses") or -1) != planned
-        or int(coverage.get("missing_responses") or 0) != 0
-        or int(coverage.get("duplicate_mappings") or 0) != 0
+        int(coverage.get("collected_responses") or -1) == planned
+        and int(coverage.get("missing_responses") or 0) == 0
     ):
-        raise CampaignError("targeted retry requires complete, duplicate-free provider coverage")
+        return
+
+    # A terminal failed child may have no provider response for some records.
+    # Permit bounded recovery only after the immutable campaign-effective
+    # artifact proves that every frozen record has exactly one explicit outcome.
+    # This does not bless missing predictions: those rows remain `missing` and
+    # enter the existing typed, per-record recovery workflow.
+    artifact_reference = campaign.get("artifact_reference")
+    artifact_digest = campaign.get("artifact_sha256")
+    frozen_record_hash = campaign.get("record_set_sha256")
+    if not all(isinstance(value, str) and value for value in (artifact_reference, artifact_digest, frozen_record_hash)):
+        raise CampaignError("targeted retry requires reconciled outcomes for the frozen record set")
+    expected_directory = _artifact_directory(str(campaign["public_id"])) / "effective"
+    directory = Path(str(artifact_reference)).resolve()
+    if directory != expected_directory.resolve():
+        raise CampaignError("campaign effective artifact path does not match its frozen identity")
+    try:
+        summary_path = directory / "operational_summary.json"
+        predictions_path = directory / "predictions.jsonl"
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        if artifact_sha256(directory) != artifact_digest:
+            raise ValueError("artifact digest mismatch")
+        artifact_coverage = summary.get("coverage", {})
+        provenance = summary.get("provenance", {})
+        if (
+            not isinstance(artifact_coverage, dict)
+            or not isinstance(provenance, dict)
+            or provenance.get("record_ids_sha256") != frozen_record_hash
+            or int(artifact_coverage.get("planned_requests") or -1) != planned
+            or int(artifact_coverage.get("duplicate_mappings") or 0) != 0
+            or int(artifact_coverage.get("missing_responses") or 0)
+            != int(coverage.get("missing_responses") or 0)
+        ):
+            raise ValueError("effective artifact provenance or coverage mismatch")
+        seen: set[str] = set()
+        digest = hashlib.sha256(b"[")
+        with predictions_path.open(encoding="utf-8") as predictions:
+            for line in predictions:
+                row = json.loads(line)
+                record_id = row.get("record_id") if isinstance(row, dict) else None
+                outcome = row.get("status") if isinstance(row, dict) else None
+                if (
+                    not isinstance(record_id, str)
+                    or record_id in seen
+                    or outcome not in {"success", "invalid", "provider_failure", "provider_refusal", "missing"}
+                ):
+                    raise ValueError("effective artifact has an absent, duplicate, or unknown outcome")
+                if seen:
+                    digest.update(b",")
+                digest.update(
+                    json.dumps(record_id, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                )
+                seen.add(record_id)
+        digest.update(b"]")
+        if len(seen) != planned or digest.hexdigest() != frozen_record_hash:
+            raise ValueError("effective outcomes do not exactly cover the frozen record set")
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+        raise CampaignError(
+            "targeted retry requires a verified effective artifact with one explicit outcome per frozen record"
+        ) from error
 
 
 def _recovery_directory(public_id: str, attempt_number: int) -> Path:

@@ -87,6 +87,34 @@ CHARACTERS_PER_TOKEN = 3
 INSERT_BATCH_SIZE = 1_000
 ACTIVE_BATCH_STATUSES = {"SUBMITTING", "SUBMITTED", "RUNNING", "PROVIDER_COMPLETED"}
 PHASE4E_ADVISORY_LOCK_NAMESPACE = 0x50483445
+GEMINI_TERMINAL_STATES = {
+    "BATCH_STATE_SUCCEEDED",
+    "BATCH_STATE_FAILED",
+    "BATCH_STATE_EXPIRED",
+    "BATCH_STATE_CANCELLED",
+}
+
+
+def _verify_gemini_chunk_identity(
+    status: dict[str, object], chunk: dict[str, Any]
+) -> None:
+    """Reject a status response that does not identify this frozen child job."""
+    expected = {
+        "batch_name": chunk.get("provider_job_id"),
+        "display_name": chunk.get("submission_display_name"),
+        "model": f"models/{chunk.get('configured_model')}",
+    }
+    for field, value in expected.items():
+        actual = status.get(field)
+        if actual is not None and value is not None and actual != value:
+            raise CampaignError(f"Gemini child job {field} does not match stored submission provenance")
+
+
+def _gemini_collection_target(status: dict[str, object]) -> str:
+    """Keep all terminal Gemini results collectible, including failed/expired jobs."""
+    if status.get("state") in GEMINI_TERMINAL_STATES:
+        return "PROVIDER_COMPLETED"
+    return "RUNNING" if status.get("state") == "BATCH_STATE_RUNNING" else "SUBMITTED"
 
 
 @dataclass(frozen=True)
@@ -585,7 +613,28 @@ def build_campaign_effective_artifact(
                 record_set_hasher.add(str(expected_id))
                 candidates = indexed.get(local_index, [])
                 if not candidates:
-                    counts["missing"] += 1
+                    batch_status = summary.get("batch_status", {})
+                    provider_state = (
+                        batch_status.get("state")
+                        if isinstance(batch_status, dict)
+                        else None
+                    )
+                    terminal_failure = provider_state in {
+                        "BATCH_STATE_FAILED",
+                        "BATCH_STATE_EXPIRED",
+                        "BATCH_STATE_CANCELLED",
+                    }
+                    if terminal_failure:
+                        counts["provider_failed"] += 1
+                    else:
+                        counts["missing"] += 1
+                    provider_error = (
+                        batch_status.get("error")
+                        if terminal_failure and isinstance(batch_status, dict)
+                        else None
+                    )
+                    if terminal_failure:
+                        provider_error = f"{provider_state}: {provider_error or 'provider job failed'}"
                     predictions.write(
                         json.dumps(
                             {
@@ -593,10 +642,18 @@ def build_campaign_effective_artifact(
                                 "request_index": counts["planned"] - 1,
                                 "chunk_number": chunk_number,
                                 "chunk_request_index": local_index,
-                                "status": "missing",
-                                "failure_category": FailureCategory.MISSING_RESULT.value,
+                                "status": "provider_failure" if terminal_failure else "missing",
+                                "failure_category": (
+                                    FailureCategory.PROVIDER_FAILURE.value
+                                    if terminal_failure
+                                    else FailureCategory.MISSING_RESULT.value
+                                ),
                                 "prediction": None,
-                                "provider_error": "provider response missing",
+                                "provider_error": provider_error or (
+                                    f"terminal provider job {provider_state} produced no response"
+                                    if terminal_failure
+                                    else "provider response missing"
+                                ),
                             },
                             ensure_ascii=False,
                             sort_keys=True,
@@ -1257,15 +1314,17 @@ def _orchestration_tick_locked(
         campaign = dict(campaign_row)
         if campaign["orchestration_mode"] != "CHUNKED" or campaign["authorized_at"] is None:
             raise CampaignError("campaign is not authorized for chunk orchestration")
-        if campaign["orchestration_status"] == "PAUSED":
-            return TickResult("paused", public_id)
-        if campaign["orchestration_status"] not in {"RUNNING", "MAIN_COMPLETE"}:
+        paused = campaign["orchestration_status"] == "PAUSED"
+        if campaign["orchestration_status"] not in {"RUNNING", "MAIN_COMPLETE", "PAUSED"}:
             return TickResult("idle", public_id)
         chunk_row = connection.execute(
             """
             SELECT * FROM ai_annotation_campaign_batches
-            WHERE campaign_id=%s AND status IN
-              ('PROVIDER_COMPLETED','SUBMITTING')
+            WHERE campaign_id=%s AND (
+              status IN ('PROVIDER_COMPLETED','SUBMITTING')
+              OR (status IN ('SUBMITTED','RUNNING') AND provider_job_id IS NOT NULL)
+              OR (status='FAILED' AND provider_job_id IS NOT NULL)
+            )
             ORDER BY CASE status WHEN 'PROVIDER_COMPLETED' THEN 0 ELSE 1 END,
                      chunk_number LIMIT 1 FOR UPDATE
             """,
@@ -1350,6 +1409,15 @@ def _orchestration_tick_locked(
                     _finalize_main_pass(connection, campaign)
                     return TickResult("main-complete", public_id)
                 return TickResult("idle", public_id)
+        elif chunk_row is None and paused:
+            incomplete = connection.execute(
+                """SELECT count(*) AS count FROM ai_annotation_campaign_batches
+                   WHERE campaign_id=%s AND status<>'COLLECTED'""",
+                (campaign["id"],),
+            ).fetchone()
+            if incomplete and int(incomplete["count"]) == 0:
+                _finalize_main_pass(connection, campaign)
+                return TickResult("main-complete", public_id)
         if chunk_row is None:
             return TickResult("idle", public_id)
         chunk = dict(chunk_row)
@@ -1363,7 +1431,27 @@ def _orchestration_tick_locked(
             )
         provider: Any = gateway if gateway is not None else (OpenAIBatchGateway() if is_luna else LiveGeminiGateway())
 
-        if chunk["status"] in {"SUBMITTED", "RUNNING"}:
+        # A paused campaign may reconcile a lost submission receipt, but it must
+        # never submit. If the deterministic job cannot be found, leave the
+        # SUBMITTING reservation untouched for an explicit operator decision.
+        if paused and chunk["status"] == "SUBMITTING":
+            if is_luna:
+                return TickResult("awaiting-submission-reconciliation", public_id, int(chunk["chunk_number"]))
+            found_job_id = cast(BatchFinder, provider).find_batch(
+                str(chunk["submission_display_name"]), str(chunk["configured_model"])
+            )
+            if found_job_id is None:
+                return TickResult("awaiting-submission-reconciliation", public_id, int(chunk["chunk_number"]))
+            connection.execute(
+                """UPDATE ai_annotation_campaign_batches
+                   SET status='SUBMITTED',provider_job_id=%s,
+                       failure_metadata=failure_metadata || %s
+                   WHERE id=%s AND status='SUBMITTING' AND provider_job_id IS NULL""",
+                (found_job_id, Jsonb({"submission_reconciled": True, "submission_reconciliation_required": False}), chunk["id"]),
+            )
+            return TickResult("submission-reconciled", public_id, int(chunk["chunk_number"]), found_job_id)
+
+        if chunk["status"] in {"SUBMITTED", "RUNNING", "FAILED"} and chunk.get("provider_job_id"):
             if is_luna:
                 batch = provider.retrieve(str(chunk["provider_job_id"]))
                 state = str(batch.get("status") or "unknown")
@@ -1390,20 +1478,27 @@ def _orchestration_tick_locked(
                 )
                 return TickResult("refreshed", public_id, int(chunk["chunk_number"]), target)
             status = parse_batch_status(provider.status(str(chunk["provider_job_id"])))
-            target = "PROVIDER_COMPLETED" if status["successful_terminal"] else (
-                "FAILED" if status["terminal"] else "RUNNING"
-            )
+            _verify_gemini_chunk_identity(status, chunk)
+            target = _gemini_collection_target(status)
+            terminal_failure = bool(status["terminal"] and not status["successful_terminal"])
+            failure_details: dict[str, Any] = {}
+            if terminal_failure:
+                failure_details = {
+                    "provider_terminal_state": status["state"],
+                    "provider_error": status["error"],
+                    "terminal_job_failure": True,
+                }
             connection.execute(
                 """
                 UPDATE ai_annotation_campaign_batches SET status=%s,provider_state=%s,
                   provider_success_count=%s,provider_failure_count=%s,
                   provider_completed_at=CASE WHEN %s THEN COALESCE(provider_completed_at,now())
                     ELSE provider_completed_at END,
-                  failure_metadata=CASE WHEN %s THEN %s ELSE failure_metadata END
+                  failure_metadata=CASE WHEN %s THEN failure_metadata || %s ELSE failure_metadata END
                 WHERE id=%s
                 """,
                 (target, status["state"], status["successful_count"], status["failed_count"],
-                 bool(status["terminal"]), target == "FAILED", Jsonb({"provider_error": status["error"]}), chunk["id"]),
+                 bool(status["terminal"]), terminal_failure, Jsonb(failure_details), chunk["id"]),
             )
             return TickResult("refreshed", public_id, int(chunk["chunk_number"]), target)
 
@@ -1475,6 +1570,8 @@ def _orchestration_tick_locked(
                     })
                 else:
                     response = provider.status(str(chunk["provider_job_id"]))
+                    response_status = parse_batch_status(response)
+                    _verify_gemini_chunk_identity(response_status, chunk)
                     results, coverage = collect_inline_batch(
                         batch_value=response, plan=plan,
                         domain_codes=_production_domain_codes(),
@@ -1484,6 +1581,7 @@ def _orchestration_tick_locked(
                             if campaign.get("prediction_task") == "hostility"
                             else None
                         ),
+                        allow_unsuccessful_terminal=True,
                     )
                     directory.mkdir(parents=True, exist_ok=True)
                     pricing = load_pricing(ROOT / "config/llm_eval/pricing.yaml")
@@ -1685,6 +1783,7 @@ def _orchestration_tick_locked(
         submission_uncertain = (
             isinstance(failure_metadata, dict)
             and bool(failure_metadata.get("submission_outcome_uncertain"))
+            and not bool(failure_metadata.get("submission_reconciled"))
         )
         if provider_job_id is None and submission_uncertain:
             return TickResult(
@@ -1692,11 +1791,22 @@ def _orchestration_tick_locked(
                 public_id,
                 int(chunk["chunk_number"]),
             )
+        # Persist uncertainty before making the external request. If the worker
+        # process stops after the provider accepts the job but before we store
+        # its receipt, the next worker must reconcile the deterministic job
+        # identity instead of blindly submitting another copy.
+        connection.execute(
+            """UPDATE ai_annotation_campaign_batches
+               SET failure_metadata=failure_metadata || %s
+               WHERE id=%s AND status='SUBMITTING' AND provider_job_id IS NULL""",
+            (Jsonb({"submission_outcome_uncertain": True, "submission_reconciliation_required": True}), chunk["id"]),
+        )
+        connection.commit()
         try:
             provider_job_id = provider_job_id or provider.submit(plan, str(chunk["configured_model"]))
         except Exception as error:
             if _is_quota_error(error):
-                connection.execute("UPDATE ai_annotation_campaign_batches SET status='PENDING',failure_metadata=failure_metadata || %s WHERE id=%s AND status='SUBMITTING'", (Jsonb({"quota_event": str(error)[:1000]}), chunk["id"]))
+                connection.execute("UPDATE ai_annotation_campaign_batches SET status='PENDING',failure_metadata=failure_metadata || %s WHERE id=%s AND status='SUBMITTING'", (Jsonb({"submission_reconciled": True, "submission_reconciliation_required": False, "quota_event": str(error)[:1000]}), chunk["id"]))
                 return TickResult("quota-refused", public_id, int(chunk["chunk_number"]))
             connection.execute(
                 """
@@ -1723,12 +1833,14 @@ def _orchestration_tick_locked(
               provider_state='BATCH_STATE_PENDING',cache_identifier=%s,
               cache_content_sha256=%s,cache_model=%s,cache_display_name=%s,
               cache_created_at=%s,cache_expires_at=%s,cache_verified_at=%s,
-              cache_metadata=%s,submitted_at=now()
+              cache_metadata=%s,submitted_at=now(),
+              failure_metadata=failure_metadata || %s
             WHERE id=%s AND status='SUBMITTING' AND provider_job_id IS NULL
             """,
             (provider_job_id, cache["cache_identifier"], cache["cache_content_sha256"],
              cache["cache_model"], cache["cache_display_name"], cache["cache_created_at"],
              cache["cache_expires_at"], cache["cache_verified_at"], Jsonb(cache["cache_metadata"]),
+             Jsonb({"submission_reconciled": True, "submission_reconciliation_required": False}),
              chunk["id"]),
         )
         return TickResult("submitted", public_id, int(chunk["chunk_number"]), provider_job_id)

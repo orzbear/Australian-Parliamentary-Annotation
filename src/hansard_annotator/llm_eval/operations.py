@@ -599,11 +599,12 @@ def collect_inline_batch(
     *, batch_value: dict[str, Any], plan: dict[str, Any], domain_codes: tuple[str, ...],
     prediction_task: str = "policy", records_by_id: dict[str, dict[str, Any]] | None = None,
     frozen_classifications_by_id: dict[str, dict[str, Any]] | None = None,
+    allow_unsuccessful_terminal: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     status = parse_batch_status(batch_value)
     if not status["terminal"]:
         raise ValueError(f"batch is not terminal: {status['state']}")
-    if not status["successful_terminal"]:
+    if not status["successful_terminal"] and not allow_unsuccessful_terminal:
         raise ValueError(f"batch did not succeed: {status['state']}; error={status['error']}")
     planned = plan["request"]["batch"]["input_config"]["requests"]["requests"]
     planned_keys = [str(item["metadata"]["key"]) for item in planned]
@@ -613,7 +614,11 @@ def collect_inline_batch(
     inline = output.get("inlinedResponses") if isinstance(output, dict) else None
     responses = inline.get("inlinedResponses") if isinstance(inline, dict) else None
     if not isinstance(responses, list):
-        raise ValueError("successful inline batch contains no inline responses")
+        if status["successful_terminal"] or not allow_unsuccessful_terminal:
+            raise ValueError("successful inline batch contains no inline responses")
+        # A terminal failed/expired job may have no output at all. Preserve it as
+        # explicit missing outcomes; never synthesize predictions for that job.
+        responses = []
     seen: set[str] = set()
     duplicate_count = 0
     unmapped_count = 0
