@@ -341,7 +341,8 @@ def _query() -> str:
         ORDER BY run.id,mp.id LIMIT 1
       ) prediction ON true
       LEFT JOIN LATERAL (
-        SELECT count(*) OVER() AS outcome_count,outcome.public_id,outcome.resolution_reason,
+        SELECT count(*) OVER() AS outcome_count,outcome.public_id,
+               outcome.resolution_type,outcome.resolution_reason,
                outcome.outcome_provenance,run.public_id AS run_public_id,run.provider,
                run.configured_model,run.returned_model,run.annotation_schema_slug,
                run.annotation_schema_version,run.prompt_version,run.prompt_sha256,
@@ -352,7 +353,8 @@ def _query() -> str:
                campaign.record_set_sha256 AS campaign_record_set_sha256,
                campaign.artifact_sha256 AS campaign_artifact_sha256,
                recovery_lineage.items AS recovery_lineage,chunk_lineage.item AS chunk_lineage,
-               review.review_status,review.resolution_method AS human_resolution_method,
+               review.review_status AS human_review_status,
+               review.resolution_method AS human_resolution_method,
                review.reviewer_user_id AS human_reviewer_id,review.reviewed_at AS human_reviewed_at,
                review.annotation_version_id AS human_annotation_version_id,
                av.values AS human_values,review.note AS human_review_note
