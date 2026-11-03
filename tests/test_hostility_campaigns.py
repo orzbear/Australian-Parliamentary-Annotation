@@ -50,6 +50,7 @@ from hansard_annotator.llm_eval.prompt import build_system_prompt, prompt_hash
 from hansard_annotator.web.auth.models import Principal
 from hansard_annotator.web.campaigns.configurations import (
     APPROVED_AI_CONFIGURATIONS,
+    GEMINI_HOSTILITY_FULL_PRODUCTION_SEED,
     GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID,
     HOSTILITY_CONFIGURATION_ID,
     HOSTILITY_SCHEMA_SHA256,
@@ -73,6 +74,7 @@ from hansard_annotator.web.campaigns.service import (
     LUNA_PRODUCTION_PILOT_SIZE,
     PAID_CONFIRMATION,
     CampaignError,
+    _assert_full_hostility_preflight_match,
     _assert_hostility_policy_eligible,
     _complete_recovery_plan_pricing,
     _evidence_repair_plan,
@@ -707,6 +709,25 @@ def test_gemini_hostility_production_uses_typed_phase4e_authorization(
     assert authorized["provider"] == "gemini"
     assert authorized["generation_config"] == {"thinking_budget": 0}
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_full_hostility_campaign_binds_selection_to_preflight_hash() -> None:
+    plan_source = inspect.getsource(plan_campaign)
+    assert "GEMINI_HOSTILITY_FULL_PRODUCTION_SEED" in plan_source
+    assert "allowed_seeds.add" not in plan_source
+    assert "hostility-gemini-25-flash-production-v1" not in plan_source
+    expected = "a" * 64
+    _assert_full_hostility_preflight_match(
+        GEMINI_HOSTILITY_FULL_PRODUCTION_SEED, expected, expected
+    )
+    with pytest.raises(CampaignError, match="preflight SHA-256"):
+        _assert_full_hostility_preflight_match(
+            GEMINI_HOSTILITY_FULL_PRODUCTION_SEED, "b" * 64, expected
+        )
+    with pytest.raises(CampaignError, match="preflight SHA-256"):
+        _assert_full_hostility_preflight_match(
+            GEMINI_HOSTILITY_FULL_PRODUCTION_SEED, None, expected
+        )
 
 
 def test_hostility_eligibility_uses_latest_valid_policy_prediction_contract() -> None:
@@ -2080,6 +2101,8 @@ def test_webui_templates_render_task_aware_new_and_detail_views(
     assert "Prepare 1,000-record Gemini production pilot" in luna_html
     assert "hostility-luna-production-pilot-1000-v1" in luna_html
     assert "Prepare full remaining Gemini production set" in luna_html
+    assert "hostility-full-20261103-v1" in luna_html
+    assert "preflight_record_set_sha256" in luna_html
 
 
 def test_hostility_gemini_recovery_ui_keeps_evidence_failures_terminal() -> None:

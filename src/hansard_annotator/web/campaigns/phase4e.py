@@ -42,6 +42,7 @@ from hansard_annotator.llm_eval.prompt import (
 from hansard_annotator.llm_eval.providers import provider_prediction_schema_hash
 from hansard_annotator.web.auth.models import Principal
 from hansard_annotator.web.campaigns.configurations import (
+    GEMINI_HOSTILITY_FULL_PRODUCTION_SEED,
     GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID,
     LUNA_PRODUCTION_CONFIGURATION_ID,
 )
@@ -60,10 +61,13 @@ from hansard_annotator.web.campaigns.recovery import (
     structural_repair_count,
 )
 from hansard_annotator.web.campaigns.service import (
+    CAMPAIGN_PROVIDER_QUOTA_LOCK_ID,
+    CAMPAIGN_PROVIDER_QUOTA_LOCK_NAMESPACE,
     CampaignError,
     GeminiGateway,
     LiveGeminiGateway,
     _artifact_directory,
+    _assert_full_hostility_preflight_match,
     _assert_hostility_policy_eligible,
     _campaign_configuration,
     _configuration_context,
@@ -82,11 +86,15 @@ CHUNK_PLANNER_VERSION = "phase4e-full-input-v1"
 DEFAULT_ENQUEUED_TOKEN_CEILING = 10_000_000
 DEFAULT_SAFETY_FACTOR = 0.90
 DEFAULT_MAX_CHUNK_RECORDS = 1_000
+GEMINI_HOSTILITY_APPROVED_BATCH_TOKEN_LIMIT = 3_000_000
+GEMINI_HOSTILITY_APPROVED_ACTIVE_TOKEN_BUDGET = 2_700_000
+GEMINI_HOSTILITY_APPROVED_SAFETY_FACTOR = 0.90
 INVARIANT_INPUT_TOKENS = 4_131
 CHARACTERS_PER_TOKEN = 3
 INSERT_BATCH_SIZE = 1_000
 ACTIVE_BATCH_STATUSES = {"SUBMITTING", "SUBMITTED", "RUNNING", "PROVIDER_COMPLETED"}
-PHASE4E_ADVISORY_LOCK_NAMESPACE = 0x50483445
+PHASE4E_ADVISORY_LOCK_NAMESPACE = CAMPAIGN_PROVIDER_QUOTA_LOCK_NAMESPACE
+PHASE4E_GLOBAL_SUBMISSION_LOCK_ID = CAMPAIGN_PROVIDER_QUOTA_LOCK_ID
 GEMINI_TERMINAL_STATES = {
     "BATCH_STATE_SUCCEEDED",
     "BATCH_STATE_FAILED",
@@ -448,6 +456,19 @@ def submission_fits(
 ) -> bool:
     safe_ceiling = math.floor(ceiling * safety_factor)
     return active_tokens + candidate_tokens <= safe_ceiling
+
+
+def quota_submission_fits(
+    *, active_tokens: int, unknown_jobs: int, candidate_tokens: int,
+    ceiling: int, safety_factor: float,
+) -> bool:
+    """Never submit when any tracked Gemini job has unknown queued-token use."""
+    return unknown_jobs == 0 and submission_fits(
+        active_tokens=active_tokens,
+        candidate_tokens=candidate_tokens,
+        ceiling=ceiling,
+        safety_factor=safety_factor,
+    )
 
 
 def committed_spend(
@@ -819,6 +840,26 @@ def plan_campaign_chunks(
             _assert_hostility_policy_eligible(connection, int(campaign["id"]))
         if configuration.prediction_task != "policy" and not is_hostility_production:
             raise CampaignError("full production orchestration is only supported for policy campaigns")
+        if (
+            configuration.configuration_id == GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID
+            and selection.get("selection_kind") == "full_eligible_population"
+        ):
+            if selection.get("seed") != GEMINI_HOSTILITY_FULL_PRODUCTION_SEED:
+                raise CampaignError(
+                    "Gemini hostility chunk plan must use the approved preflight seed"
+                )
+            _assert_full_hostility_preflight_match(
+                str(selection["seed"]), selection.get("preflight_record_set_sha256"),
+                str(campaign["record_set_sha256"]),
+            )
+            if (
+                enqueued_token_ceiling != GEMINI_HOSTILITY_APPROVED_BATCH_TOKEN_LIMIT
+                or safety_factor != GEMINI_HOSTILITY_APPROVED_SAFETY_FACTOR
+                or max_chunk_records != DEFAULT_MAX_CHUNK_RECORDS
+            ):
+                raise CampaignError(
+                    "Gemini hostility launch planning requires the approved 3,000,000-token limit, 0.90 safety factor, and 1,000-record chunk cap"
+                )
         if is_luna and campaign["cache_status"] != "NOT_REQUIRED":
             raise CampaignError("Luna production must not use a Gemini cache")
 
@@ -977,6 +1018,7 @@ def authorize_full_production(
     *,
     confirmation: str,
     spend_ceiling_usd: Decimal,
+    first_chunk_only: bool = False,
 ) -> dict[str, Any]:
     _require_admin(principal)
     with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
@@ -1010,6 +1052,20 @@ def authorize_full_production(
             )
         if configuration.prediction_task == "hostility":
             _assert_hostility_policy_eligible(connection, int(campaign["id"]))
+        selection = campaign.get("selection_definition")
+        if (
+            configuration.configuration_id == GEMINI_HOSTILITY_PRODUCTION_CONFIGURATION_ID
+            and isinstance(selection, dict)
+            and selection.get("seed") == GEMINI_HOSTILITY_FULL_PRODUCTION_SEED
+        ):
+            _assert_full_hostility_preflight_match(
+                str(selection.get("seed")), selection.get("preflight_record_set_sha256"),
+                str(campaign["record_set_sha256"]),
+            )
+            if not first_chunk_only:
+                raise CampaignError(
+                    "initial Gemini hostility authorization must hold after the first child Batch"
+                )
         estimate = Decimal(str(campaign["estimated_total_cost_usd"] or 0))
         if spend_ceiling_usd < estimate:
             raise CampaignError("authorization ceiling is below the current campaign estimate")
@@ -1032,6 +1088,8 @@ def authorize_full_production(
             "total_cost_usd": str(estimate),
         }
         identity["record_set_sha256"] = campaign["record_set_sha256"]
+        if first_chunk_only:
+            identity["first_chunk_only"] = True
         identity["corpus_run_name"] = (
             "phase1-full-20260723-v4"
             if configuration.configuration_id
@@ -1332,12 +1390,47 @@ def _orchestration_tick_locked(
         ).fetchone()
         if chunk_row is None and campaign["orchestration_status"] == "RUNNING":
             active = connection.execute(
-                """
-                SELECT COALESCE(sum(estimated_input_tokens),0) AS tokens
-                FROM ai_annotation_campaign_batches
-                WHERE campaign_id=%s AND status IN
-                  ('SUBMITTING','SUBMITTED','RUNNING','PROVIDER_COMPLETED')
-                """,
+                """WITH active_batches AS (
+                     SELECT COALESCE(sum(GREATEST(
+                              COALESCE(batch.estimated_input_tokens,0),
+                              COALESCE(batch.input_tokens,0))),0)::bigint AS tokens,
+                            count(*) FILTER (WHERE COALESCE(batch.estimated_input_tokens,
+                              batch.input_tokens,0)<=0)::bigint AS unknown_jobs
+                     FROM ai_annotation_campaign_batches batch
+                     JOIN ai_annotation_campaigns owner ON owner.id=batch.campaign_id
+                     WHERE owner.provider='gemini' AND batch.provider='gemini'
+                       AND batch.status IN ('SUBMITTING','SUBMITTED','RUNNING','PROVIDER_COMPLETED')
+                   ), active_legacy AS (
+                     SELECT COALESCE(sum(owner.estimated_input_tokens),0)::bigint AS tokens,
+                            count(*) FILTER (WHERE owner.estimated_input_tokens IS NULL
+                              OR owner.estimated_input_tokens<=0)::bigint AS unknown_jobs
+                     FROM ai_annotation_campaigns owner
+                     WHERE owner.provider='gemini' AND owner.orchestration_mode='LEGACY'
+                       AND owner.provider_job_id IS NOT NULL
+                       AND owner.status IN ('SUBMITTED','RUNNING','PROVIDER_COMPLETED')
+                   ), active_recoveries AS (
+                     SELECT count(*)::bigint AS unknown_jobs
+                     FROM ai_annotation_campaign_recoveries recovery
+                     JOIN ai_annotation_campaigns owner ON owner.id=recovery.campaign_id
+                     WHERE owner.provider='gemini'
+                       AND recovery.status IN ('PREPARING','SUBMITTED','RUNNING','PROVIDER_COMPLETED')
+                   ), usage_discrepancies AS (
+                     SELECT count(*)::bigint AS count
+                     FROM ai_annotation_campaign_batches batch
+                     JOIN ai_annotation_campaigns owner ON owner.id=batch.campaign_id
+                     WHERE batch.campaign_id=%s
+                       AND owner.provider='gemini' AND batch.provider='gemini'
+                       AND batch.status='COLLECTED'
+                       AND batch.input_tokens IS NOT NULL
+                       AND batch.estimated_input_tokens IS NOT NULL
+                       AND batch.input_tokens>batch.estimated_input_tokens
+                   )
+                   SELECT active_batches.tokens+active_legacy.tokens AS tokens,
+                          active_batches.unknown_jobs+active_legacy.unknown_jobs+
+                            active_recoveries.unknown_jobs AS unknown_jobs,
+                          usage_discrepancies.count AS usage_discrepancies
+                   FROM active_batches CROSS JOIN active_legacy CROSS JOIN active_recoveries
+                     CROSS JOIN usage_discrepancies""",
                 (campaign["id"],),
             ).fetchone()
             pending = connection.execute(
@@ -1358,8 +1451,14 @@ def _orchestration_tick_locked(
                         "new Luna submissions are disabled",
                     )
                 active_tokens = int(active["tokens"] if active else 0)
-                if not submission_fits(
+                unknown_jobs = int(active["unknown_jobs"] if active else 1)
+                if int(active["usage_discrepancies"] if active else 0):
+                    wait_action = "quota-usage-review"
+                elif unknown_jobs:
+                    wait_action = "quota-unknown"
+                elif not quota_submission_fits(
                     active_tokens=active_tokens,
+                    unknown_jobs=unknown_jobs,
                     candidate_tokens=int(pending["estimated_input_tokens"]),
                     ceiling=int(campaign["enqueued_token_ceiling"]),
                     safety_factor=float(campaign["enqueued_token_safety_factor"]),
@@ -1396,7 +1495,16 @@ def _orchestration_tick_locked(
             if active_row is not None:
                 chunk_row = active_row
             elif pending is not None and wait_action is not None:
-                return TickResult(wait_action, public_id, int(pending["chunk_number"]))
+                detail = (
+                    "a collected Gemini child reported more input tokens than estimated; operator review is required"
+                    if wait_action == "quota-usage-review"
+                    else "an active Gemini provider job has unknown estimated token use"
+                    if wait_action == "quota-unknown"
+                    else None
+                )
+                return TickResult(
+                    wait_action, public_id, int(pending["chunk_number"]), detail
+                )
             else:
                 incomplete = connection.execute(
                     """
@@ -1843,6 +1951,18 @@ def _orchestration_tick_locked(
              Jsonb({"submission_reconciled": True, "submission_reconciliation_required": False}),
              chunk["id"]),
         )
+        authorized_configuration = campaign.get("authorized_configuration")
+        if (
+            int(chunk["chunk_number"]) == 1
+            and isinstance(authorized_configuration, dict)
+            and authorized_configuration.get("first_chunk_only") is True
+        ):
+            connection.execute(
+                """UPDATE ai_annotation_campaigns
+                   SET orchestration_status='PAUSED',paused_at=now()
+                   WHERE id=%s AND orchestration_status='RUNNING'""",
+                (campaign["id"],),
+            )
         return TickResult("submitted", public_id, int(chunk["chunk_number"]), provider_job_id)
 
 
@@ -1861,16 +1981,28 @@ def orchestration_tick(
         if campaign is None:
             raise LookupError("AI annotation campaign not found")
         campaign_id = int(campaign["id"])
-        locked = lock_connection.execute(
+        global_locked = lock_connection.execute(
             "SELECT pg_try_advisory_lock(%s::integer,%s::integer) AS locked",
-            (PHASE4E_ADVISORY_LOCK_NAMESPACE, campaign_id),
+            (PHASE4E_ADVISORY_LOCK_NAMESPACE, PHASE4E_GLOBAL_SUBMISSION_LOCK_ID),
         ).fetchone()
-        if not locked or not locked["locked"]:
-            return TickResult("locked", public_id)
+        if not global_locked or not global_locked["locked"]:
+            return TickResult("quota-locked", public_id)
         try:
-            return _orchestration_tick_locked(settings, public_id, gateway=gateway)
+            campaign_locked = lock_connection.execute(
+                "SELECT pg_try_advisory_lock(%s::integer,%s::integer) AS locked",
+                (PHASE4E_ADVISORY_LOCK_NAMESPACE, campaign_id),
+            ).fetchone()
+            if not campaign_locked or not campaign_locked["locked"]:
+                return TickResult("locked", public_id)
+            try:
+                return _orchestration_tick_locked(settings, public_id, gateway=gateway)
+            finally:
+                lock_connection.execute(
+                    "SELECT pg_advisory_unlock(%s::integer,%s::integer)",
+                    (PHASE4E_ADVISORY_LOCK_NAMESPACE, campaign_id),
+                )
         finally:
             lock_connection.execute(
                 "SELECT pg_advisory_unlock(%s::integer,%s::integer)",
-                (PHASE4E_ADVISORY_LOCK_NAMESPACE, campaign_id),
+                (PHASE4E_ADVISORY_LOCK_NAMESPACE, PHASE4E_GLOBAL_SUBMISSION_LOCK_ID),
             )
