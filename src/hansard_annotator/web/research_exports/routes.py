@@ -24,6 +24,7 @@ from hansard_annotator.web.research_exports.canonical_ai import (
 )
 from hansard_annotator.web.research_exports.service import (
     ResearchDownload,
+    ResearchFileDownload,
     ReviewArtifact,
     export_catalog,
     prediction_export,
@@ -76,9 +77,23 @@ async def download_predictions(
 ) -> Response:
     await enforce_csrf(request, principal, settings)
     try:
-        return _download(prediction_export(settings, principal, run_id))
+        export = await run_in_threadpool(prediction_export, settings, principal, run_id)
+        if not isinstance(export, ResearchFileDownload):
+            raise TypeError("prediction export did not produce a file-backed result")
+        return FileResponse(
+            export.path,
+            media_type=export.media_type,
+            filename=export.filename,
+            headers={
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+                "X-Exported-At": datetime.now(UTC).isoformat(),
+            },
+        )
     except (LookupError, PermissionError, ValueError) as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
+    except OSError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
 
 
 @router.post("/canonical-ai/{corpus_id}.zip")

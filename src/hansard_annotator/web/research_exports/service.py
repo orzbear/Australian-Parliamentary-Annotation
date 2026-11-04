@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
+import os
+import shutil
 import tempfile
 import zipfile
 from dataclasses import dataclass
@@ -41,6 +44,13 @@ class ResearchDownload:
     filename: str
     media_type: str
     content: bytes
+
+
+@dataclass(frozen=True)
+class ResearchFileDownload:
+    filename: str
+    media_type: str
+    path: Path
 
 
 def _require_researcher(principal: Principal) -> None:
@@ -113,201 +123,262 @@ def export_catalog(settings: WebSettings, principal: Principal) -> dict[str, Any
 
 def prediction_export(
     settings: WebSettings, principal: Principal, run_public_id: str
-) -> ResearchDownload:
+) -> ResearchFileDownload:
     _require_researcher(principal)
+    settings.export_work_root.mkdir(parents=True, exist_ok=True)
     with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
         connection.execute("SET TRANSACTION READ ONLY")
         run = connection.execute(
             """
-            SELECT id,public_id,prediction_task,provider,configured_model,returned_model,prompt_version,
+            SELECT id,public_id,prediction_task,provider,configured_model,prompt_version,
                    prompt_sha256,canonical_schema_sha256,prediction_contract_sha256,
                    provider_schema_sha256,generation_config,execution_mode,record_set_sha256,
-                   artifact_sha256,provider_job_id,imported_at
+                   artifact_sha256,provider_job_id,imported_at,valid_count
             FROM model_prediction_runs WHERE public_id::text=%s
             """,
             (run_public_id,),
         ).fetchone()
         if run is None:
             raise LookupError("model prediction run not found")
-        rows = connection.execute(
-            """
-            SELECT prediction.public_id AS prediction_id,prediction.record_id,
-                   prediction.speaker_turn_id,prediction.prediction_task,
-                   prediction.prediction_values,turn.turn_key,turn.speech_date,turn.chamber,
-                   turn.speaker_name_raw,prediction.is_non_policy,
-                   prediction.primary_australian_domain,
-                   prediction.secondary_australian_domains,prediction.reasoning,
-                   prediction.returned_model,prediction.created_at
-            FROM model_predictions prediction
-            JOIN speaker_turns turn ON turn.id=prediction.speaker_turn_id
-            WHERE prediction.run_id=%s ORDER BY prediction.record_id,prediction.id
-            """,
-            (run["id"],),
-        ).fetchall()
-    task = run["prediction_task"]
-    if task not in {"policy", "hostility"}:
-        raise ValueError(f"unsupported prediction task for CSV export: {task!r}")
+        task = run["prediction_task"]
+        if task not in {"policy", "hostility"}:
+            raise ValueError(f"unsupported prediction task for CSV export: {task!r}")
 
-    output = io.StringIO(newline="")
-    metadata_fields = [
-        "run_id",
-        "provider",
-        "configured_model",
-        "prompt_version",
-        "prompt_sha256",
-        "canonical_schema_sha256",
-        "prediction_contract_sha256",
-        "provider_schema_sha256",
-        "generation_config",
-        "execution_mode",
-        "record_set_sha256",
-        "artifact_sha256",
-        "provider_job_id",
-        "run_imported_at",
-        "prediction_id",
-        "record_id",
-        "speaker_turn_id",
-        "turn_key",
-        "speech_date",
-        "chamber",
-        "speaker_name_raw",
-    ]
-    policy_fields = [
-        "is_non_policy",
-        "primary_australian_domain",
-        "secondary_australian_domains",
-    ]
-    hostility_fields = [
-        "prediction_task",
-        "hostility_present",
-        "target",
-        "evidence_spans",
-        "partisan_hostility",
-    ]
-    trailing_fields = [
-        "reasoning",
-        "returned_model",
-        "created_at",
-    ]
-    fields = metadata_fields + (policy_fields if task == "policy" else hostility_fields) + trailing_fields
-    writer = csv.DictWriter(output, fieldnames=fields, lineterminator="\n")
-    writer.writeheader()
-    for raw in rows:
-        row = dict(raw)
-        if row["prediction_task"] != task:
-            raise ValueError(
-                f"prediction {row['prediction_id']} task does not match its run task"
+        source_identity = {
+            "export_version": 1,
+            "run_id": int(run["id"]),
+            "run_public_id": str(run["public_id"]),
+            "prediction_task": task,
+            "artifact_sha256": str(run["artifact_sha256"]),
+            "record_set_sha256": str(run["record_set_sha256"]),
+            "valid_count": int(run["valid_count"]),
+        }
+        source_sha256 = hashlib.sha256(
+            json.dumps(source_identity, sort_keys=True, separators=(",", ":")).encode(
+                "utf-8"
             )
-        values = row["prediction_values"]
-        if not isinstance(values, dict):
-            raise ValueError(f"prediction {row['prediction_id']} values are not a JSON object")
-        if task == "hostility":
-            if any(
-                row[field] is not None
-                for field in (
-                    "is_non_policy",
-                    "primary_australian_domain",
-                    "secondary_australian_domains",
-                )
-            ):
-                raise ValueError(
-                    f"prediction {row['prediction_id']} has policy fields for a hostility task"
-                )
-            if set(values) != {"hostility_present", "target", "evidence_spans"}:
-                raise ValueError(
-                    f"prediction {row['prediction_id']} has invalid hostility values"
-                )
-            presence = values["hostility_present"]
-            target = values["target"]
-            spans = values["evidence_spans"]
-            if presence not in PRESENCE_CODES or target not in MODEL_TARGET_CODES:
-                raise ValueError(
-                    f"prediction {row['prediction_id']} has invalid hostility label or target"
-                )
-            if not isinstance(spans, list) or any(
-                not isinstance(span, dict)
-                or set(span) != {"start_offset", "end_offset", "text"}
-                or not isinstance(span.get("start_offset"), int)
-                or isinstance(span.get("start_offset"), bool)
-                or not isinstance(span.get("end_offset"), int)
-                or isinstance(span.get("end_offset"), bool)
-                or span["start_offset"] < 0
-                or span["end_offset"] <= span["start_offset"]
-                or not isinstance(span.get("text"), str)
-                or not span["text"]
-                for span in spans
-            ):
-                raise ValueError(
-                    f"prediction {row['prediction_id']} has invalid hostility evidence spans"
-                )
-            if (presence == "NO" and (target != "N/A" or spans)) or (
-                presence != "NO" and (target == "N/A" or not spans)
-            ):
-                raise ValueError(
-                    f"prediction {row['prediction_id']} has inconsistent hostility values"
-                )
-            row.update(
-                prediction_task=task,
-                hostility_present=presence,
-                target=target,
-                evidence_spans=spans,
-                partisan_hostility=partisan_hostility(values),
+        ).hexdigest()
+        cache_stem = f"ai-predictions-{int(run['id'])}-{source_sha256}"
+        output_path = settings.export_work_root / f"{cache_stem}.csv"
+        manifest_path = settings.export_work_root / f"{cache_stem}.json"
+        if _verified_prediction_export_cache(
+            output_path, manifest_path, source_identity, source_sha256
+        ):
+            return ResearchFileDownload(
+                f"ai-predictions-{run['public_id']}.csv",
+                "text/csv; charset=utf-8",
+                output_path,
             )
-        else:
-            if (
-                not isinstance(row["is_non_policy"], bool)
-                or not isinstance(row["secondary_australian_domains"], list)
-                or (
-                    row["primary_australian_domain"] is not None
-                    and not isinstance(row["primary_australian_domain"], str)
-                )
-            ):
-                raise ValueError(
-                    f"prediction {row['prediction_id']} has invalid policy fields"
-                )
-            if values and (
-                set(values)
-                != {
-                    "is_non_policy",
-                    "primary_australian_domain",
-                    "secondary_australian_domains",
-                }
-                or values["is_non_policy"] != row["is_non_policy"]
-                or values["primary_australian_domain"]
-                != row["primary_australian_domain"]
-                or values["secondary_australian_domains"]
-                != row["secondary_australian_domains"]
-            ):
-                raise ValueError(
-                    f"prediction {row['prediction_id']} has inconsistent policy values"
-                )
-        row.update(
-            run_id=str(run["public_id"]),
-            provider=run["provider"],
-            configured_model=run["configured_model"],
-            prompt_version=run["prompt_version"],
-            prompt_sha256=run["prompt_sha256"],
-            canonical_schema_sha256=run["canonical_schema_sha256"],
-            prediction_contract_sha256=run["prediction_contract_sha256"],
-            provider_schema_sha256=run["provider_schema_sha256"],
-            generation_config=run["generation_config"],
-            execution_mode=run["execution_mode"],
-            record_set_sha256=run["record_set_sha256"],
-            artifact_sha256=run["artifact_sha256"],
-            provider_job_id=run["provider_job_id"],
-            run_imported_at=run["imported_at"],
+
+        free_bytes = shutil.disk_usage(settings.export_work_root).free
+        if free_bytes < settings.export_min_free_bytes:
+            raise OSError(
+                f"insufficient free disk space in {settings.export_work_root} "
+                f"({free_bytes} bytes available; {settings.export_min_free_bytes} bytes required)"
+            )
+
+        fields = _prediction_export_fields(task)
+        cursor = connection.cursor(name=f"prediction_export_{int(run['id'])}")
+        cursor.itersize = 500
+        cursor.execute(
+            """SELECT prediction.public_id AS prediction_id,prediction.record_id,
+                      prediction.speaker_turn_id,prediction.prediction_task,
+                      prediction.prediction_values,turn.turn_key,turn.speech_date,turn.chamber,
+                      turn.speaker_name_raw,prediction.is_non_policy,
+                      prediction.primary_australian_domain,
+                      prediction.secondary_australian_domains,prediction.reasoning,
+                      prediction.returned_model,prediction.created_at
+               FROM model_predictions prediction
+               JOIN speaker_turns turn ON turn.id=prediction.speaker_turn_id
+               WHERE prediction.run_id=%s ORDER BY prediction.record_id""",
+            (run["id"],),
         )
-        for key, value in tuple(row.items()):
-            if isinstance(value, (list, dict)):
-                row[key] = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-            elif hasattr(value, "isoformat"):
-                row[key] = value.isoformat()
-        writer.writerow({field: row.get(field) for field in fields})
-    return ResearchDownload(
-        f"ai-predictions-{run_public_id}.csv",
-        "text/csv; charset=utf-8",
-        output.getvalue().encode("utf-8"),
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f".{cache_stem}-", suffix=".tmp", dir=settings.export_work_root
+        )
+        temporary_path = Path(temporary_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as output:
+                writer = csv.DictWriter(
+                    output,
+                    fieldnames=fields,
+                    lineterminator="\n",
+                    extrasaction="ignore",
+                )
+                writer.writeheader()
+                row_count = 0
+                for raw in cursor:
+                    row = dict(raw)
+                    _validate_and_prepare_prediction_export_row(row, task, run)
+                    for key in fields:
+                        value = row.get(key)
+                        if isinstance(value, (list, dict)):
+                            row[key] = json.dumps(
+                                value,
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            )
+                        elif value is not None and hasattr(value, "isoformat"):
+                            row[key] = value.isoformat()
+                    writer.writerow(row)
+                    row_count += 1
+                if row_count != int(run["valid_count"]):
+                    raise ValueError(
+                        "prediction row count does not match the run's valid count"
+                    )
+                output.flush()
+                os.fsync(output.fileno())
+            csv_sha256 = _sha256_file(temporary_path)
+            csv_bytes = temporary_path.stat().st_size
+            os.replace(temporary_path, output_path)
+            _write_prediction_export_manifest(
+                manifest_path,
+                {
+                    "source_identity": source_identity,
+                    "source_sha256": source_sha256,
+                    "csv_sha256": csv_sha256,
+                    "csv_bytes": csv_bytes,
+                    "row_count": row_count,
+                },
+            )
+        except Exception:
+            temporary_path.unlink(missing_ok=True)
+            raise
+        finally:
+            cursor.close()
+    return ResearchFileDownload(
+        f"ai-predictions-{run['public_id']}.csv", "text/csv; charset=utf-8", output_path
     )
+
+
+def _prediction_export_fields(task: str) -> list[str]:
+    metadata_fields = [
+        "run_id", "provider", "configured_model", "prompt_version", "prompt_sha256",
+        "canonical_schema_sha256", "prediction_contract_sha256", "provider_schema_sha256",
+        "generation_config", "execution_mode", "record_set_sha256", "artifact_sha256",
+        "provider_job_id", "run_imported_at", "prediction_id", "record_id",
+        "speaker_turn_id", "turn_key", "speech_date", "chamber", "speaker_name_raw",
+    ]
+    task_fields = (
+        ["is_non_policy", "primary_australian_domain", "secondary_australian_domains"]
+        if task == "policy"
+        else ["prediction_task", "hostility_present", "target", "evidence_spans", "partisan_hostility"]
+    )
+    return [*metadata_fields, *task_fields, "reasoning", "returned_model", "created_at"]
+
+
+def _validate_and_prepare_prediction_export_row(
+    row: dict[str, Any], task: str, run: dict[str, Any]
+) -> None:
+    if row["prediction_task"] != task:
+        raise ValueError(f"prediction {row['prediction_id']} task does not match its run task")
+    values = row["prediction_values"]
+    if not isinstance(values, dict):
+        raise ValueError(f"prediction {row['prediction_id']} values are not a JSON object")
+    if task == "hostility":
+        if any(row[field] is not None for field in (
+            "is_non_policy", "primary_australian_domain", "secondary_australian_domains"
+        )):
+            raise ValueError(f"prediction {row['prediction_id']} has policy fields for a hostility task")
+        if set(values) != {"hostility_present", "target", "evidence_spans"}:
+            raise ValueError(f"prediction {row['prediction_id']} has invalid hostility values")
+        presence, target, spans = values["hostility_present"], values["target"], values["evidence_spans"]
+        if presence not in PRESENCE_CODES or target not in MODEL_TARGET_CODES:
+            raise ValueError(f"prediction {row['prediction_id']} has invalid hostility label or target")
+        if not isinstance(spans, list) or any(
+            not isinstance(span, dict)
+            or set(span) != {"start_offset", "end_offset", "text"}
+            or not isinstance(span.get("start_offset"), int)
+            or isinstance(span.get("start_offset"), bool)
+            or not isinstance(span.get("end_offset"), int)
+            or isinstance(span.get("end_offset"), bool)
+            or span["start_offset"] < 0
+            or span["end_offset"] <= span["start_offset"]
+            or not isinstance(span.get("text"), str)
+            or not span["text"]
+            for span in spans
+        ):
+            raise ValueError(f"prediction {row['prediction_id']} has invalid hostility evidence spans")
+        if (presence == "NO" and (target != "N/A" or spans)) or (
+            presence != "NO" and (target == "N/A" or not spans)
+        ):
+            raise ValueError(f"prediction {row['prediction_id']} has inconsistent hostility values")
+        row.update(
+            prediction_task=task,
+            hostility_present=presence,
+            target=target,
+            evidence_spans=spans,
+            partisan_hostility=partisan_hostility(values),
+        )
+    else:
+        if (
+            not isinstance(row["is_non_policy"], bool)
+            or not isinstance(row["secondary_australian_domains"], list)
+            or (row["primary_australian_domain"] is not None
+                and not isinstance(row["primary_australian_domain"], str))
+        ):
+            raise ValueError(f"prediction {row['prediction_id']} has invalid policy fields")
+        if values and (
+            set(values) != {"is_non_policy", "primary_australian_domain", "secondary_australian_domains"}
+            or values["is_non_policy"] != row["is_non_policy"]
+            or values["primary_australian_domain"] != row["primary_australian_domain"]
+            or values["secondary_australian_domains"] != row["secondary_australian_domains"]
+        ):
+            raise ValueError(f"prediction {row['prediction_id']} has inconsistent policy values")
+    row.update(
+        run_id=str(run["public_id"]), provider=run["provider"],
+        configured_model=run["configured_model"], prompt_version=run["prompt_version"],
+        prompt_sha256=run["prompt_sha256"], canonical_schema_sha256=run["canonical_schema_sha256"],
+        prediction_contract_sha256=run["prediction_contract_sha256"],
+        provider_schema_sha256=run["provider_schema_sha256"],
+        generation_config=run["generation_config"], execution_mode=run["execution_mode"],
+        record_set_sha256=run["record_set_sha256"], artifact_sha256=run["artifact_sha256"],
+        provider_job_id=run["provider_job_id"], run_imported_at=run["imported_at"],
+    )
+
+
+def _verified_prediction_export_cache(
+    output_path: Path, manifest_path: Path,
+    source_identity: dict[str, Any], source_sha256: str,
+) -> bool:
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        return (
+            output_path.is_file()
+            and manifest.get("source_identity") == source_identity
+            and manifest.get("source_sha256") == source_sha256
+            and manifest.get("row_count") == source_identity["valid_count"]
+            and manifest.get("csv_bytes") == output_path.stat().st_size
+            and manifest.get("csv_sha256") == _sha256_file(output_path)
+        )
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return False
+
+
+def _write_prediction_export_manifest(path: Path, manifest: dict[str, Any]) -> None:
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}-", suffix=".tmp", dir=path.parent
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as output:
+            json.dump(manifest, output, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary_path, path)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def provider_refusal_export(

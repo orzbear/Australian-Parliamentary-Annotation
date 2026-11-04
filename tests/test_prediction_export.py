@@ -1,19 +1,31 @@
 from __future__ import annotations
 
+import asyncio
 import csv
+import hashlib
 import io
 import json
+import os
+import threading
+import time
+from collections.abc import Iterable
+from dataclasses import replace
 from datetime import UTC, datetime
-from typing import Any
+from pathlib import Path
+from typing import Any, cast
 from uuid import UUID
 
+import psutil
 import pytest
+from fastapi.responses import FileResponse
 from fastapi.routing import APIRoute
+from starlette.requests import Request
 
 from hansard_annotator.db.config import DatabaseSettings
 from hansard_annotator.web.auth.models import Principal
 from hansard_annotator.web.config import WebSettings
 from hansard_annotator.web.dependencies import require_admin
+from hansard_annotator.web.research_exports import routes as export_routes
 from hansard_annotator.web.research_exports import service as export_service
 from hansard_annotator.web.research_exports.routes import router as export_router
 
@@ -109,6 +121,7 @@ def _run(task: str) -> dict[str, Any]:
         "artifact_sha256": "f" * 64,
         "provider_job_id": "batches/test",
         "imported_at": datetime(2026, 11, 2, tzinfo=UTC),
+        "valid_count": 1,
     }
 
 
@@ -146,7 +159,7 @@ class _Result:
 
 
 class _ReadOnlyConnection:
-    def __init__(self, run: dict[str, Any], predictions: list[dict[str, Any]]) -> None:
+    def __init__(self, run: dict[str, Any], predictions: Iterable[dict[str, Any]]) -> None:
         self.run = run
         self.predictions = predictions
         self.statements: list[str] = []
@@ -164,32 +177,70 @@ class _ReadOnlyConnection:
             return _Result()
         if "FROM MODEL_PREDICTION_RUNS" in normalized:
             return _Result(one=self.run)
-        if "FROM MODEL_PREDICTIONS" in normalized:
-            return _Result(many=self.predictions)
         raise AssertionError(f"unexpected (possibly mutating) SQL: {statement}")
+
+    def cursor(self, *, name: str) -> _PredictionCursor:
+        assert name.startswith("prediction_export_")
+        return _PredictionCursor(self)
+
+
+class _PredictionCursor:
+    def __init__(self, connection: _ReadOnlyConnection) -> None:
+        self.connection = connection
+        self.itersize = 0
+        self.rows: Any = iter(())
+        self.closed = False
+
+    def execute(self, statement: str, parameters: object) -> None:
+        self.connection.statements.append(statement)
+        assert "ORDER BY prediction.record_id" in statement
+        assert "turn.text_clean" not in statement
+        assert "turn.text_raw" not in statement
+        assert isinstance(parameters, tuple)
+        assert len(parameters) == 1
+        self.rows = iter(self.connection.predictions)
+
+    def __iter__(self) -> _PredictionCursor:
+        assert self.itersize == 500
+        return self
+
+    def __next__(self) -> dict[str, Any]:
+        return next(self.rows)
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def _export(
     monkeypatch: pytest.MonkeyPatch,
     run: dict[str, Any],
     predictions: list[dict[str, Any]],
+    tmp_path: Path,
 ) -> tuple[bytes, _ReadOnlyConnection]:
     connection = _ReadOnlyConnection(run, predictions)
     monkeypatch.setattr(export_service.psycopg, "connect", lambda *_args, **_kwargs: connection)
-    download = export_service.prediction_export(_settings(), _principal(), "run-public-id")
+    settings = replace(
+        _settings(),
+        export_work_root=tmp_path,
+        export_min_free_bytes=256 * 1024 * 1024,
+    )
+    download = export_service.prediction_export(settings, _principal(), "run-public-id")
     assert download.filename == "ai-predictions-run-public-id.csv"
-    return download.content, connection
+    return download.path.read_bytes(), connection
 
 
 def test_policy_export_header_and_values_remain_byte_compatible(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     values = {
         "is_non_policy": False,
         "primary_australian_domain": "AU01",
         "secondary_australian_domains": ["AU02"],
     }
-    content, connection = _export(monkeypatch, _run("policy"), [_prediction("policy", values)])
+    content, connection = _export(
+        monkeypatch, _run("policy"), [_prediction("policy", values)], tmp_path
+    )
     rows = list(csv.DictReader(io.StringIO(content.decode("utf-8"))))
     assert content.splitlines()[0].decode() == ",".join(POLICY_FIELDS)
     assert list(rows[0]) == POLICY_FIELDS
@@ -244,13 +295,14 @@ def test_policy_export_header_and_values_remain_byte_compatible(
 )
 def test_hostility_export_serializes_structured_values_without_policy_columns(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
     presence: str,
     target: str,
     spans: bool,
     expected_partisan: str,
 ) -> None:
-    speech = 'The words are "liars, cruel\nand false".'
-    evidence = '"liars, cruel\nand false"'
+    speech = "The words are \u2018liars, cruel\nand false\u2019 — naïve."
+    evidence = "\u2018liars, cruel\nand false\u2019"
     start = speech.index(evidence)
     evidence_spans = (
         [{"start_offset": start, "end_offset": start + len(evidence), "text": evidence}]
@@ -263,7 +315,7 @@ def test_hostility_export_serializes_structured_values_without_policy_columns(
         "evidence_spans": evidence_spans,
     }
     content, connection = _export(
-        monkeypatch, _run("hostility"), [_prediction("hostility", values)]
+        monkeypatch, _run("hostility"), [_prediction("hostility", values)], tmp_path
     )
     text = content.decode("utf-8")
     rows = list(csv.DictReader(io.StringIO(text)))
@@ -290,6 +342,173 @@ def test_hostility_export_serializes_structured_values_without_policy_columns(
         cell = io.StringIO(newline="")
         csv.writer(cell, lineterminator="").writerow([encoded_evidence])
         assert cell.getvalue() in text
+
+
+def test_full_corpus_hostility_export_streams_rows_and_reuses_verified_cache(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    row_count = 116_031
+    run = _run("hostility")
+    run["valid_count"] = row_count
+    timestamp = datetime(2026, 11, 1, tzinfo=UTC)
+
+    def predictions() -> Iterable[dict[str, Any]]:
+        for index in range(row_count):
+            yield {
+                "prediction_id": f"prediction-{index:06d}",
+                "record_id": f"turn:{index:06d}",
+                "speaker_turn_id": index + 1,
+                "prediction_task": "hostility",
+                "prediction_values": {
+                    "hostility_present": "NO",
+                    "target": "N/A",
+                    "evidence_spans": [],
+                },
+                "turn_key": f"key-{index:06d}",
+                "speech_date": "2025-01-01",
+                "chamber": "House",
+                "speaker_name_raw": "Speaker",
+                "is_non_policy": None,
+                "primary_australian_domain": None,
+                "secondary_australian_domains": None,
+                "reasoning": "No hostility.",
+                "returned_model": "gemini-2.5-flash",
+                "created_at": timestamp,
+            }
+
+    connection = _ReadOnlyConnection(run, predictions())
+    monkeypatch.setattr(export_service.psycopg, "connect", lambda *_args, **_kwargs: connection)
+    settings = replace(
+        _settings(),
+        export_work_root=tmp_path,
+        export_min_free_bytes=256 * 1024 * 1024,
+    )
+    process = psutil.Process(os.getpid())
+    baseline_rss = process.memory_info().rss
+    peak_rss = [baseline_rss]
+    stop = threading.Event()
+
+    def _sample_rss() -> None:
+        while not stop.is_set():
+            peak_rss[0] = max(peak_rss[0], process.memory_info().rss)
+            time.sleep(0.01)
+
+    sampler = threading.Thread(target=_sample_rss, daemon=True)
+    sampler.start()
+    started = time.perf_counter()
+    export = export_service.prediction_export(settings, _principal(), "run-public-id")
+    elapsed = time.perf_counter() - started
+    stop.set()
+    sampler.join()
+    peak_rss[0] = max(peak_rss[0], process.memory_info().rss)
+    digest = hashlib.sha256(export.path.read_bytes()).hexdigest()
+
+    assert export.path.stat().st_size > 10_000_000
+    assert connection.statements[0].lstrip().upper().startswith("SET TRANSACTION READ ONLY")
+    assert len(connection.statements) == 3
+    assert all(
+        statement.lstrip().upper().startswith(("SET TRANSACTION READ ONLY", "SELECT"))
+        for statement in connection.statements
+    )
+    with export.path.open(encoding="utf-8", newline="") as source:
+        reader = csv.DictReader(source)
+        assert reader.fieldnames == HOSTILITY_FIELDS
+        seen = 0
+        for row in reader:
+            assert row["record_id"] == f"turn:{seen:06d}"
+            assert row["partisan_hostility"] == "False"
+            seen += 1
+    assert seen == row_count
+    assert peak_rss[0] - baseline_rss < 96 * 1024 * 1024
+    assert elapsed > 0
+
+    rebuild_root = tmp_path / "independent-rebuild"
+    rebuild_root.mkdir()
+    rebuilt_connection = _ReadOnlyConnection(run, predictions())
+    monkeypatch.setattr(
+        export_service.psycopg, "connect", lambda *_args, **_kwargs: rebuilt_connection
+    )
+    rebuilt = export_service.prediction_export(
+        replace(settings, export_work_root=rebuild_root),
+        _principal(),
+        "run-public-id",
+    )
+    assert hashlib.sha256(rebuilt.path.read_bytes()).hexdigest() == digest
+
+    # The immutable run identity and verified CSV digest permit cache reuse
+    # without opening the prediction cursor or materialising rows.
+    cached_connection = _ReadOnlyConnection(run, iter(()))
+    monkeypatch.setattr(
+        export_service.psycopg, "connect", lambda *_args, **_kwargs: cached_connection
+    )
+    cached = export_service.prediction_export(settings, _principal(), "run-public-id")
+    assert cached.path == export.path
+    assert hashlib.sha256(cached.path.read_bytes()).hexdigest() == digest
+    assert len(cached_connection.statements) == 2
+    assert not any("MODEL_PREDICTIONS" in statement.upper() for statement in cached_connection.statements)
+    print(
+        "Prediction export 116,031 rows: "
+        f"peak_rss_delta={peak_rss[0] - baseline_rss} bytes, "
+        f"elapsed={elapsed:.2f}s, bytes={export.path.stat().st_size}, sha256={digest}"
+    )
+
+
+def test_interrupted_prediction_export_does_not_publish_partial_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    run = _run("hostility")
+    run["valid_count"] = 2
+    good = _prediction(
+        "hostility",
+        {"hostility_present": "NO", "target": "N/A", "evidence_spans": []},
+    )
+    bad = {**_prediction("policy", {}), "record_id": "turn:bad-task"}
+    connection = _ReadOnlyConnection(run, [good, bad])
+    monkeypatch.setattr(export_service.psycopg, "connect", lambda *_args, **_kwargs: connection)
+    settings = replace(
+        _settings(),
+        export_work_root=tmp_path,
+        export_min_free_bytes=256 * 1024 * 1024,
+    )
+    with pytest.raises(ValueError, match="task does not match"):
+        export_service.prediction_export(settings, _principal(), "run-public-id")
+    assert not list(tmp_path.glob("*.csv"))
+    assert not list(tmp_path.glob("*.json"))
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_prediction_export_rebuilds_cache_with_invalid_checksum(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    values = {
+        "is_non_policy": False,
+        "primary_australian_domain": "AU01",
+        "secondary_australian_domains": ["AU02"],
+    }
+    settings = replace(
+        _settings(),
+        export_work_root=tmp_path,
+        export_min_free_bytes=256 * 1024 * 1024,
+    )
+    first_connection = _ReadOnlyConnection(
+        _run("policy"), [_prediction("policy", values)]
+    )
+    monkeypatch.setattr(
+        export_service.psycopg, "connect", lambda *_args, **_kwargs: first_connection
+    )
+    first = export_service.prediction_export(settings, _principal(), "run-public-id")
+    expected = first.path.read_bytes()
+    first.path.write_text("corrupt", encoding="utf-8")
+
+    second_connection = _ReadOnlyConnection(
+        _run("policy"), [_prediction("policy", values)]
+    )
+    monkeypatch.setattr(
+        export_service.psycopg, "connect", lambda *_args, **_kwargs: second_connection
+    )
+    rebuilt = export_service.prediction_export(settings, _principal(), "run-public-id")
+    assert rebuilt.path.read_bytes() == expected
+    assert any("ORDER BY prediction.record_id" in item for item in second_connection.statements)
 
 
 @pytest.mark.parametrize(
@@ -323,6 +542,7 @@ def test_hostility_export_serializes_structured_values_without_policy_columns(
 )
 def test_export_rejects_unknown_or_inconsistent_task_data(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
     run_task: str,
     row_task: str,
     values: dict[str, Any],
@@ -336,8 +556,13 @@ def test_export_rejects_unknown_or_inconsistent_task_data(
         }
     connection = _ReadOnlyConnection(_run(run_task), [_prediction(row_task, values)])
     monkeypatch.setattr(export_service.psycopg, "connect", lambda *_args, **_kwargs: connection)
+    settings = replace(
+        _settings(),
+        export_work_root=tmp_path,
+        export_min_free_bytes=256 * 1024 * 1024,
+    )
     with pytest.raises(ValueError):
-        export_service.prediction_export(_settings(), _principal(), "run-public-id")
+        export_service.prediction_export(settings, _principal(), "run-public-id")
 
 
 def test_export_permission_and_route_authorization_remain_intact(
@@ -355,3 +580,40 @@ def test_export_permission_and_route_authorization_remain_intact(
         if isinstance(route, APIRoute) and route.path == "/exports/predictions/{run_id}.csv"
     )
     assert any(dependency.call is require_admin for dependency in route.dependant.dependencies)
+
+
+def test_prediction_export_route_returns_file_response_without_buffering(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    connection = _ReadOnlyConnection(
+        _run("policy"),
+        [
+            _prediction(
+                "policy",
+                {
+                    "is_non_policy": False,
+                    "primary_australian_domain": "AU01",
+                    "secondary_australian_domains": ["AU02"],
+                },
+            )
+        ],
+    )
+    monkeypatch.setattr(export_service.psycopg, "connect", lambda *_args, **_kwargs: connection)
+
+    async def _skip_csrf(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(export_routes, "enforce_csrf", _skip_csrf)
+    settings = replace(
+        _settings(),
+        export_work_root=tmp_path,
+        export_min_free_bytes=256 * 1024 * 1024,
+    )
+    response = asyncio.run(
+        export_routes.download_predictions(
+            cast(Request, object()), "run-public-id", settings, _principal()
+        )
+    )
+    assert isinstance(response, FileResponse)
+    assert Path(response.path) == next(tmp_path.glob("*.csv"))
+    assert not hasattr(response, "body")
