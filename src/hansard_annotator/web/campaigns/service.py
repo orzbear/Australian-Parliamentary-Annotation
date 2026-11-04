@@ -7,7 +7,7 @@ import json
 import math
 import os
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -34,7 +34,6 @@ from hansard_annotator.llm_eval.import_predictions import (
     inspect_prediction_artifact,
     iter_prediction_artifact,
     iter_terminal_invalid_artifact,
-    load_prediction_artifact,
 )
 from hansard_annotator.llm_eval.operations import (
     APPROVED_PRODUCTION_GENERATION,
@@ -103,6 +102,8 @@ GEMINI_BATCH_SCHEMA_SHA256 = "980b0ed6d6002a8eadd326f84942ba60dcdf8f2abd9e70ea6a
 PAID_CONFIRMATION = "START AI CAMPAIGN"
 RECOVERY_CONFIRMATION = "RETRY INVALID RECORDS"
 MAX_CAMPAIGN_RECOVERY_ATTEMPTS = 3
+CAMPAIGN_VALIDATION_BATCH_SIZE = 500
+CAMPAIGN_UNRESOLVED_BATCH_SIZE = 200
 EVIDENCE_RECOVERY_CONFIRMATION = "REPAIR HOSTILITY EVIDENCE ONLY"
 PARTIAL_IMPORT_CONFIRMATION = "IMPORT VALID RECORDS"
 PRODUCTION_GENERATION_CONFIG = APPROVED_PRODUCTION_GENERATION
@@ -1718,8 +1719,8 @@ def get_campaign(
 
 def campaign_unresolved_records(
     settings: WebSettings, principal: Principal, public_id: str
-) -> list[dict[str, Any]]:
-    """Export current unresolved results with canonical turn references and lineage."""
+) -> Iterable[dict[str, Any]]:
+    """Stream unresolved results with canonical turn references and lineage."""
     _require_admin(principal)
     with psycopg.connect(settings.database.psycopg_url, row_factory=dict_row) as connection:
         row = connection.execute(
@@ -1729,91 +1730,219 @@ def campaign_unresolved_records(
         if row is None:
             raise LookupError("AI annotation campaign not found")
         campaign = dict(row)
-        if campaign.get("model_prediction_run_id") is not None:
-            values = connection.execute(
-                """SELECT outcome.public_id::text AS prediction_id,
-                          outcome.record_id,turn.turn_key,turn.speech_date,
-                          turn.speaker_name_raw,
-                          COALESCE(NULLIF(turn.text_clean,''),turn.text_raw) AS canonical_text,
-                          outcome.resolution_reason AS failure_category,
-                          outcome.outcome_provenance,latest.review_status
-                   FROM model_prediction_abstentions outcome
-                   JOIN speaker_turns turn ON turn.id=outcome.speaker_turn_id
-                   LEFT JOIN LATERAL (
-                     SELECT review_status FROM model_prediction_outcome_reviews review
-                     WHERE review.abstention_id=outcome.id
-                     ORDER BY review.reviewed_at DESC,review.id DESC LIMIT 1
-                   ) latest ON true
-                   WHERE outcome.run_id=%s AND outcome.resolution_type='INVALID_OUTPUT'
-                     AND latest.review_status IS DISTINCT FROM
-                       'human_annotated_after_ai_failure'
-                   ORDER BY outcome.record_id""",
-                (campaign["model_prediction_run_id"],),
-            ).fetchall()
-            recovery_history = _campaign_recovery_attempt_export_history(
-                connection, int(campaign["id"])
+        campaign_id = int(campaign["id"])
+        if campaign.get("model_prediction_run_id") is None:
+            if not campaign.get("artifact_reference"):
+                return iter(())
+            directory = _current_effective_artifact_directory(
+                campaign, _collected_recoveries(connection, campaign_id)
             )
-            output: list[dict[str, Any]] = []
-            for value in values:
-                item = dict(value)
-                provenance = item.get("outcome_provenance")
-                provenance = provenance if isinstance(provenance, dict) else {}
-                item.update(
-                    reason=provenance.get("validation_error")
-                    or provenance.get("provider_error"),
-                    attempt_count=int(provenance.get("attempt_count") or 1),
-                    attempt_history=recovery_history.get(
-                        str(item["record_id"]),
-                        provenance.get("recovery_attempt_history", []),
-                    ),
-                    terminal=True,
-                )
-                item.pop("outcome_provenance", None)
-                item.pop("review_status", None)
-                output.append(item)
-            return output
+        else:
+            directory = None
 
-        if not campaign.get("artifact_reference"):
-            return []
-        recoveries = _collected_recoveries(connection, int(campaign["id"]))
-        directory = _current_effective_artifact_directory(campaign, recoveries)
-        turns = {
-            str(value["record_id"]): dict(value)
-            for value in connection.execute(
-                """SELECT record.record_id,turn.turn_key,turn.speech_date,
-                          turn.speaker_name_raw,
-                          COALESCE(NULLIF(turn.text_clean,''),turn.text_raw) AS canonical_text
-                   FROM ai_annotation_campaign_records record
-                   JOIN speaker_turns turn ON turn.id=record.speaker_turn_id
-                   WHERE record.campaign_id=%s""",
-                (campaign["id"],),
-            ).fetchall()
-        }
-        history = _campaign_recovery_attempt_export_history(
-            connection, int(campaign["id"])
-        )
-        output = []
-        for prediction in iter_jsonl(directory / "predictions.jsonl"):
-            if prediction.get("status") not in {"invalid", "provider_failure", "missing"}:
-                continue
-            record_id = prediction.get("record_id")
-            turn = turns.get(str(record_id))
-            if not turn:
-                continue
-            attempt_count = len(history.get(str(record_id), [])) + 1
-            output.append(
-                {
-                    **turn,
-                    "failure_category": prediction.get("failure_category")
-                    or prediction.get("status"),
-                    "reason": prediction.get("validation_error")
-                    or prediction.get("provider_error"),
-                    "attempt_count": attempt_count,
-                    "attempt_history": history.get(str(record_id), []),
-                    "terminal": attempt_count >= MAX_CAMPAIGN_RECOVERY_ATTEMPTS,
-                }
+    def _stream() -> Iterator[dict[str, Any]]:
+        with psycopg.connect(
+            settings.database.psycopg_url, row_factory=dict_row
+        ) as stream_connection:
+            if campaign.get("model_prediction_run_id") is not None:
+                yield from _iter_imported_unresolved_records(
+                    stream_connection,
+                    campaign_id,
+                    int(campaign["model_prediction_run_id"]),
+                )
+                return
+            assert directory is not None
+            yield from _iter_artifact_unresolved_records(
+                stream_connection, campaign_id, directory
             )
-        return output
+
+    return _stream()
+
+
+def _iter_artifact_unresolved_records(
+    connection: psycopg.Connection[dict[str, Any]], campaign_id: int, directory: Path
+) -> Iterator[dict[str, Any]]:
+    batch: list[dict[str, Any]] = []
+    for prediction in iter_jsonl(directory / "predictions.jsonl"):
+        if prediction.get("status") not in {"invalid", "provider_failure", "missing"}:
+            continue
+        batch.append(prediction)
+        if len(batch) >= CAMPAIGN_UNRESOLVED_BATCH_SIZE:
+            yield from _export_unresolved_artifact_batch(connection, campaign_id, batch)
+            batch.clear()
+    if batch:
+        yield from _export_unresolved_artifact_batch(connection, campaign_id, batch)
+
+
+def _export_unresolved_artifact_batch(
+    connection: psycopg.Connection[dict[str, Any]],
+    campaign_id: int,
+    predictions: Sequence[dict[str, Any]],
+) -> Iterator[dict[str, Any]]:
+    record_ids = [str(row["record_id"]) for row in predictions]
+    turns = _campaign_turns_by_record_ids(connection, campaign_id, record_ids)
+    history = _campaign_recovery_attempt_export_history(
+        connection, campaign_id, record_ids=record_ids
+    )
+    for prediction in predictions:
+        record_id = str(prediction["record_id"])
+        turn = turns.get(record_id)
+        if turn is None:
+            continue
+        attempt_history = history.get(record_id, [])
+        attempt_count = len(attempt_history) + 1
+        yield {
+            **turn,
+            "failure_category": prediction.get("failure_category")
+            or prediction.get("status"),
+            "reason": prediction.get("validation_error")
+            or prediction.get("provider_error"),
+            "attempt_count": attempt_count,
+            "attempt_history": attempt_history,
+            "terminal": attempt_count >= MAX_CAMPAIGN_RECOVERY_ATTEMPTS,
+        }
+
+
+def _iter_imported_unresolved_records(
+    connection: psycopg.Connection[dict[str, Any]], campaign_id: int, run_id: int
+) -> Iterator[dict[str, Any]]:
+    cursor = connection.cursor(name=f"campaign_unresolved_{campaign_id}")
+    cursor.itersize = CAMPAIGN_UNRESOLVED_BATCH_SIZE
+    cursor.execute(
+        """SELECT outcome.public_id::text AS prediction_id,
+                  outcome.record_id,turn.turn_key,turn.speech_date,
+                  turn.speaker_name_raw,
+                  COALESCE(NULLIF(turn.text_clean,''),turn.text_raw,'') AS canonical_text,
+                  outcome.resolution_reason AS failure_category,
+                  outcome.outcome_provenance,latest.review_status
+           FROM model_prediction_abstentions outcome
+           JOIN speaker_turns turn ON turn.id=outcome.speaker_turn_id
+           LEFT JOIN LATERAL (
+             SELECT review_status FROM model_prediction_outcome_reviews review
+             WHERE review.abstention_id=outcome.id
+             ORDER BY review.reviewed_at DESC,review.id DESC LIMIT 1
+           ) latest ON true
+           WHERE outcome.run_id=%s AND outcome.resolution_type='INVALID_OUTPUT'
+             AND latest.review_status IS DISTINCT FROM
+               'human_annotated_after_ai_failure'
+           ORDER BY outcome.record_id""",
+        (run_id,),
+    )
+    while values := cursor.fetchmany(CAMPAIGN_UNRESOLVED_BATCH_SIZE):
+        record_ids = [str(value["record_id"]) for value in values]
+        recovery_history = _campaign_recovery_attempt_export_history(
+            connection, campaign_id, record_ids=record_ids
+        )
+        for value in values:
+            item = dict(value)
+            provenance = item.get("outcome_provenance")
+            provenance = provenance if isinstance(provenance, dict) else {}
+            record_id = str(item["record_id"])
+            item.update(
+                reason=provenance.get("validation_error")
+                or provenance.get("provider_error"),
+                attempt_count=int(provenance.get("attempt_count") or 1),
+                attempt_history=recovery_history.get(
+                    record_id, provenance.get("recovery_attempt_history", [])
+                ),
+                terminal=True,
+            )
+            item.pop("outcome_provenance", None)
+            item.pop("review_status", None)
+            yield item
+
+
+def _campaign_turns_by_record_ids(
+    connection: psycopg.Connection[dict[str, Any]],
+    campaign_id: int,
+    record_ids: Sequence[str],
+) -> dict[str, dict[str, Any]]:
+    if not record_ids:
+        return {}
+    return {
+        str(row["record_id"]): dict(row)
+        for row in connection.execute(
+            """SELECT record.record_id,turn.turn_key,turn.speech_date,
+                      turn.speaker_name_raw,
+                      COALESCE(NULLIF(turn.text_clean,''),turn.text_raw,'') AS canonical_text
+               FROM ai_annotation_campaign_records record
+               JOIN speaker_turns turn ON turn.id=record.speaker_turn_id
+               WHERE record.campaign_id=%s AND record.record_id=ANY(%s)""",
+            (campaign_id, list(record_ids)),
+        ).fetchall()
+    }
+
+
+def _canonical_texts_for_record_ids(
+    connection: psycopg.Connection[dict[str, Any]],
+    campaign_id: int,
+    record_ids: Sequence[str],
+) -> dict[str, str]:
+    if not record_ids:
+        return {}
+    rows = connection.execute(
+        """SELECT record.record_id,
+                  COALESCE(NULLIF(turn.text_clean,''),turn.text_raw,'') AS canonical_text
+           FROM ai_annotation_campaign_records record
+           JOIN speaker_turns turn ON turn.id=record.speaker_turn_id
+           WHERE record.campaign_id=%s AND record.record_id=ANY(%s)""",
+        (campaign_id, list(record_ids)),
+    ).fetchall()
+    return {str(row["record_id"]): str(row["canonical_text"] or "") for row in rows}
+
+
+def _validate_hostility_artifact_evidence(
+    connection: psycopg.Connection[dict[str, Any]],
+    campaign_id: int,
+    directory: Path,
+    prompt_version: str,
+) -> None:
+    batch: list[dict[str, Any]] = []
+    for prediction_row in iter_prediction_artifact(directory, prediction_task="hostility"):
+        batch.append(prediction_row)
+        if len(batch) >= CAMPAIGN_VALIDATION_BATCH_SIZE:
+            _validate_hostility_prediction_batch(
+                connection, campaign_id, batch, prompt_version
+            )
+            batch.clear()
+    if batch:
+        _validate_hostility_prediction_batch(connection, campaign_id, batch, prompt_version)
+
+
+def _validate_hostility_prediction_batch(
+    connection: psycopg.Connection[dict[str, Any]],
+    campaign_id: int,
+    predictions: Sequence[dict[str, Any]],
+    prompt_version: str,
+) -> None:
+    record_ids = [str(row["record_id"]) for row in predictions]
+    canonical_text_by_id = _canonical_texts_for_record_ids(
+        connection, campaign_id, record_ids
+    )
+    for prediction_row in predictions:
+        record_id = str(prediction_row["record_id"])
+        canonical_text = canonical_text_by_id.get(record_id)
+        if canonical_text is None:
+            raise CampaignError(f"prediction {record_id} has no canonical speech record")
+        try:
+            adapt_hostility_prediction(
+                prediction_row["prediction"], canonical_text, prompt_version
+            )
+        except (TypeError, ValueError) as error:
+            raise CampaignError(
+                f"prediction {record_id} field prediction.evidence_spans: {error}"
+            ) from error
+
+
+def _terminal_invalid_record_ids(directory: Path, prediction_task: str) -> set[str]:
+    return {
+        str(row["record_id"])
+        for row in iter_terminal_invalid_artifact(
+            directory,
+            prediction_task=prediction_task,
+            require_recovery_lineage=False,
+        )
+    }
 
 
 def plan_campaign(
@@ -2867,11 +2996,20 @@ def _collected_recoveries(
 
 
 def _terminal_recovery_history(
-    connection: psycopg.Connection[dict[str, Any]], campaign_id: int
+    connection: psycopg.Connection[dict[str, Any]],
+    campaign_id: int,
+    *,
+    record_ids: set[str] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """Resolve terminal-invalid provenance from append-only recovery records and artifacts."""
+    if record_ids is not None and not record_ids:
+        return {}
+    filter_sql = " AND campaign_record.record_id=ANY(%s)" if record_ids is not None else ""
+    parameters: tuple[Any, ...] = (
+        (campaign_id, sorted(record_ids)) if record_ids is not None else (campaign_id,)
+    )
     rows = connection.execute(
-        """
+        f"""
         SELECT campaign_record.record_id,recovery.attempt_number,
                recovery.public_id::text AS recovery_id,recovery.provider_job_id,
                COALESCE(recovery.operational_metadata->>'recovery_mode',
@@ -2882,27 +3020,41 @@ def _terminal_recovery_history(
           ON recovery_record.recovery_id=recovery.id
         JOIN ai_annotation_campaign_records campaign_record
           ON campaign_record.id=recovery_record.campaign_record_id
-        WHERE recovery.campaign_id=%s AND recovery.status='COLLECTED'
+        WHERE recovery.campaign_id=%s AND recovery.status='COLLECTED'{filter_sql}
         ORDER BY campaign_record.record_id,recovery.attempt_number
         """,
-        (campaign_id,),
+        parameters,
     ).fetchall()
+    wanted_by_reference: dict[str, set[str]] = {}
+    for row in rows:
+        reference = row.get("artifact_reference")
+        if isinstance(reference, str) and reference:
+            wanted_by_reference.setdefault(reference, set()).add(str(row["record_id"]))
+    recovered_by_reference: dict[str, dict[str, dict[str, Any]]] = {}
+    for reference, wanted in wanted_by_reference.items():
+        matched: dict[str, dict[str, Any]] = {}
+        try:
+            for value in iter_jsonl(Path(reference) / "predictions.jsonl"):
+                record_id = value.get("record_id")
+                if isinstance(record_id, str) and record_id in wanted:
+                    # Preserve duplicate detection without retaining duplicate payloads.
+                    if record_id in matched:
+                        matched[record_id] = {"__duplicate__": True}
+                    else:
+                        matched[record_id] = value
+        except OSError:
+            pass
+        recovered_by_reference[reference] = matched
     history: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         record_id = str(row["record_id"])
         reference = row.get("artifact_reference")
         if not isinstance(reference, str) or not reference:
             raise CampaignError("terminal invalid outcome has incomplete recovery lineage")
-        try:
-            matching = [
-                value for value in iter_jsonl(Path(reference) / "predictions.jsonl")
-                if value.get("record_id") == record_id
-            ]
-        except OSError:
-            matching = []
-        recovered = matching[0] if len(matching) == 1 else {}
+        recovered = recovered_by_reference.get(reference, {}).get(record_id, {})
+        duplicate = recovered.get("__duplicate__") is True
         lineage_consistent = (
-            len(matching) == 1
+            bool(recovered) and not duplicate
             and recovered.get("recovery_attempt_number") == int(row["attempt_number"])
             and recovered.get("recovery_provider_job_id") == row["provider_job_id"]
             and recovered.get("original_validation_error")
@@ -2929,10 +3081,19 @@ def _terminal_recovery_history(
 
 
 def _campaign_recovery_attempt_export_history(
-    connection: psycopg.Connection[dict[str, Any]], campaign_id: int
+    connection: psycopg.Connection[dict[str, Any]],
+    campaign_id: int,
+    *,
+    record_ids: Sequence[str] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
+    if record_ids is not None and not record_ids:
+        return {}
+    filter_sql = " AND campaign_record.record_id=ANY(%s)" if record_ids is not None else ""
+    parameters: tuple[Any, ...] = (
+        (campaign_id, list(record_ids)) if record_ids is not None else (campaign_id,)
+    )
     rows = connection.execute(
-        """SELECT campaign_record.record_id,recovery.attempt_number,
+        f"""SELECT campaign_record.record_id,recovery.attempt_number,
                   recovery.public_id::text AS recovery_id,recovery.provider_job_id,
                   recovery.status,recovery.artifact_reference,
                   recovery.operational_metadata->>'recovery_mode' AS recovery_mode,
@@ -2942,9 +3103,9 @@ def _campaign_recovery_attempt_export_history(
              ON recovery_record.recovery_id=recovery.id
            JOIN ai_annotation_campaign_records campaign_record
              ON campaign_record.id=recovery_record.campaign_record_id
-           WHERE recovery.campaign_id=%s
+           WHERE recovery.campaign_id=%s{filter_sql}
            ORDER BY campaign_record.record_id,recovery.attempt_number""",
-        (campaign_id,),
+        parameters,
     ).fetchall()
     history: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
@@ -4394,46 +4555,28 @@ def validate_campaign(
             "provider_schema_sha256": configuration.provider_schema_sha256,
             "execution_mode": configuration.execution_mode,
         }
-        if campaign.get("orchestration_mode") == "CHUNKED":
-            summary, row_count, _artifact_hash = inspect_prediction_artifact(
-                directory, prediction_task=configuration.prediction_task,
-                expected_configuration=expected,
-            )
-        else:
-            summary, rows, _artifact_hash = load_prediction_artifact(
-                directory, prediction_task=configuration.prediction_task,
-                expected_configuration=expected,
-            )
-            row_count = len(rows)
+        summary, row_count, _artifact_hash = inspect_prediction_artifact(
+            directory,
+            prediction_task=configuration.prediction_task,
+            expected_configuration=expected,
+        )
         if configuration.prediction_task == "hostility":
-            canonical_text_by_id = {
-                str(record["record_id"]): str(record["speech"].get("text") or "")
-                for record in _records_for_campaign(connection, int(campaign["id"]))
-            }
-            for prediction_row in iter_prediction_artifact(
-                directory, prediction_task="hostility"
-            ):
-                record_id = str(prediction_row["record_id"])
-                canonical_text = canonical_text_by_id.get(record_id)
-                if canonical_text is None:
-                    raise CampaignError(
-                        f"prediction {record_id} has no canonical speech record"
-                    )
-                try:
-                    adapt_hostility_prediction(
-                        prediction_row["prediction"],
-                        canonical_text,
-                        configuration.prompt_version,
-                    )
-                except (TypeError, ValueError) as error:
-                    raise CampaignError(
-                        f"prediction {record_id} field prediction.evidence_spans: {error}"
-                    ) from error
+            _validate_hostility_artifact_evidence(
+                connection,
+                int(campaign["id"]),
+                directory,
+                configuration.prompt_version,
+            )
         coverage = summary["coverage"]
         valid_count = int(coverage.get("valid_structured_predictions") or 0)
         refusal_count = int(coverage.get("provider_refused") or 0)
+        terminal_record_ids = _terminal_invalid_record_ids(
+            directory, configuration.prediction_task
+        )
         recovery_history = (
-            _terminal_recovery_history(connection, int(campaign["id"]))
+            _terminal_recovery_history(
+                connection, int(campaign["id"]), record_ids=terminal_record_ids
+            )
             if configuration.prediction_task == "hostility"
             else None
         )
@@ -4522,8 +4665,11 @@ def import_campaign(
             "provider_schema_sha256": configuration.provider_schema_sha256,
             "execution_mode": configuration.execution_mode,
         }
+        terminal_record_ids = _terminal_invalid_record_ids(
+            artifact, configuration.prediction_task
+        )
         terminal_recovery_history = _terminal_recovery_history(
-            connection, int(campaign["id"])
+            connection, int(campaign["id"]), record_ids=terminal_record_ids
         )
         result = import_predictions(
             artifact, settings.database, dry_run=False,
