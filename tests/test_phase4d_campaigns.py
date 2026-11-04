@@ -1242,7 +1242,7 @@ def test_phase4d_services_reuse_phase4b_and_phase4c_instead_of_parallel_algorith
         "validate_production_plan",
         "parse_batch_status",
         "collect_inline_batch",
-        "load_prediction_artifact",
+        "inspect_prediction_artifact",
         "import_predictions",
     ):
         assert reused in campaign_service

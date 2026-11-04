@@ -5,11 +5,12 @@ from __future__ import annotations
 import csv
 import io
 import json
+from collections.abc import Iterable
 from decimal import Decimal
 from typing import Annotated, cast
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
-from fastapi.responses import JSONResponse, RedirectResponse, Response
+from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.templating import Jinja2Templates
 
 from hansard_annotator.web.auth.models import Principal
@@ -224,41 +225,45 @@ def campaign_unresolved_export(
         records = campaign_unresolved_records(settings, principal, campaign_id)
     except (CampaignError, LookupError, PermissionError) as error:
         raise _http_error(error) from error
-    output = io.StringIO(newline="")
-    writer = csv.writer(output, lineterminator="\r\n")
-    writer.writerow(
-        (
-            "prediction_id",
-            "record_id",
-            "turn_key",
-            "speech_date",
-            "speaker",
-            "canonical_text",
-            "failure_category",
-            "reason",
-            "attempt_count",
-            "terminal",
-            "attempt_history_json",
-        )
+    header = (
+        "prediction_id",
+        "record_id",
+        "turn_key",
+        "speech_date",
+        "speaker",
+        "canonical_text",
+        "failure_category",
+        "reason",
+        "attempt_count",
+        "terminal",
+        "attempt_history_json",
     )
-    for record in records:
-        writer.writerow(
-            (
-                record.get("prediction_id"),
-                record.get("record_id"),
-                record.get("turn_key"),
-                record.get("speech_date"),
-                record.get("speaker_name_raw"),
-                record.get("canonical_text"),
-                record.get("failure_category"),
-                record.get("reason"),
-                record.get("attempt_count"),
-                record.get("terminal"),
-                json.dumps(record.get("attempt_history", []), ensure_ascii=False, sort_keys=True),
+
+    def _csv_stream() -> Iterable[str]:
+        yield _csv_line(header)
+        for record in records:
+            yield _csv_line(
+                (
+                    record.get("prediction_id"),
+                    record.get("record_id"),
+                    record.get("turn_key"),
+                    record.get("speech_date"),
+                    record.get("speaker_name_raw"),
+                    record.get("canonical_text"),
+                    record.get("failure_category"),
+                    record.get("reason"),
+                    record.get("attempt_count"),
+                    record.get("terminal"),
+                    json.dumps(
+                        record.get("attempt_history", []),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                )
             )
-        )
-    return Response(
-        output.getvalue(),
+
+    return StreamingResponse(
+        _csv_stream(),
         media_type="text/csv; charset=utf-8",
         headers={
             "Content-Disposition": f'attachment; filename="{campaign_id}-unresolved.csv"',
@@ -266,6 +271,12 @@ def campaign_unresolved_export(
             "X-Content-Type-Options": "nosniff",
         },
     )
+
+
+def _csv_line(values: Iterable[object]) -> str:
+    output = io.StringIO(newline="")
+    csv.writer(output, lineterminator="\r\n").writerow(values)
+    return output.getvalue()
 
 
 @router.post("/{campaign_id}/delete")

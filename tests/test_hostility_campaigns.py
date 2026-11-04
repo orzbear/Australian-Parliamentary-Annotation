@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import csv
 import hashlib
 import inspect
@@ -373,7 +374,10 @@ def test_unresolved_export_includes_canonical_text_and_prior_attempts(
         "campaign-public-id", _settings(), _principal(admin=True)
     )
 
-    rendered = response.body.decode("utf-8")
+    async def _read_body() -> bytes:
+        return "".join([chunk async for chunk in response.body_iterator]).encode("utf-8")
+
+    rendered = asyncio.run(_read_body()).decode("utf-8")
     assert response.media_type == "text/csv; charset=utf-8"
     assert "turn:key-1" in rendered
     assert "Exact canonical speech." in rendered
@@ -509,6 +513,22 @@ def test_partial_campaign_import_resumes_idempotently_and_blocks_later_recovery(
         "artifact_reference": str(tmp_path / "artifact"),
     }
     (tmp_path / "artifact").mkdir()
+    (tmp_path / "artifact" / "predictions.jsonl").write_text(
+        "".join(
+            json.dumps(
+                {
+                    "record_id": f"turn:invalid-{index}",
+                    "status": "invalid",
+                    "prediction": None,
+                    "validation_error": "evidence did not resolve",
+                    "provider_response": {"candidates": []},
+                }
+            )
+            + "\n"
+            for index in range(3)
+        ),
+        encoding="utf-8",
+    )
 
     class _Result:
         def __init__(self, value: Any = None, values: list[Any] | None = None) -> None:
@@ -1745,6 +1765,16 @@ def test_hostility_collection_validation_and_import_use_hostility_adapter(
     monkeypatch.setattr(
         "hansard_annotator.web.campaigns.service._records_for_campaign",
         lambda *_args: records,
+    )
+    monkeypatch.setattr(
+        "hansard_annotator.web.campaigns.service._canonical_texts_for_record_ids",
+        lambda _connection, _campaign_id, record_ids: {
+            record_id: cast(
+                dict[str, Any],
+                records[int(record_id.rsplit("-", 1)[1])]["speech"],
+            )["text"]
+            for record_id in record_ids
+        },
     )
 
     collected = collect_campaign(
